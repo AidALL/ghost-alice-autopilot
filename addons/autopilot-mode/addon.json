@@ -5,6 +5,11 @@
     { "name": "autopilot-mode", "source": "skill", "skill_dir": "skill" }
   ],
   "platforms": ["claude", "codex"],
-  "depends_on_core": ["task-router", "verification-before-completion"],
-  "secrets": []
+  "depends_on_core": [
+    "session-intent-analyzer",
+    "task-router",
+    "verification-before-completion"
+  ],
+  "secrets": [],
+  "privileged_adapters": ["autopilot-mode"]
 }

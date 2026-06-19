@@ -1,65 +1,100 @@
-<div align="center">
-
 # ghost-alice-autopilot
 
-Claude Code와 Codex CLI를 위한 검증-게이트 자율 작업 드레인.
+승인된 자율 연속 실행을 위한 공식 Ghost-ALICE 애드온.
 
-Language: [🇺🇸 English](./README.md) | 🇰🇷 한국어
+Language: [English](./README.md) | Korean
 
-</div>
+`autopilot-mode`는 Ghost-ALICE P6 privileged adapter를 설치하는 애드온이다. 에이전트 stop 이벤트 이후 다음 승인 작업을 이어가지만, 프로젝트 로컬 approved-run 상태가 사용자의 명시적 자율 실행 승인을 담고 있을 때만 동작한다.
 
-`autopilot-mode`는 [Ghost-ALICE OS](https://github.com/AidALL/ghost-alice)의 첫 공식 애드온이다. 에이전트가 매 턴 이후 다음 큐 작업을 자동으로 이어받게 한다. 단, 그 턴이 Ghost-ALICE 완료 게이트를 통과했을 때만 발동한다. 검증 게이트 위에 올라타는 자율성 증폭기이며, 게이트를 약화시키지 않는다.
-
-이 애드온은 완전히 자기완결적이다. Ghost-ALICE 코어나 그 인스톨러를 수정하지 않는다. 스킬은 코어가 설치하고, 훅 라이프사이클은 이 애드온이 자체적으로 제공한다.
-
-## 안전한 이유 (검증 락)
-
-오토파일럿은 Ghost-ALICE 검증 게이트가 그 정지를 유효한 완료 주장으로 허용할 때만 전진한다. Stop 훅은 코어 게이트의 검증 함수(`completion_check_validator.validate_completion_text`)와 transcript 헬퍼를 그대로 가져다 쓴다. 따라서 "검증됨"의 정의가 게이트와 동일하며, 문자열 대용물이 아니다. 코어 게이트 로직을 import하지 못하면 전진을 거부한다(fail-safe). 검증 Stop 훅과 오토파일럿 Stop 훅은 상호배타다. 완료블록이 무효면 게이트가 막고, 유효할 때만 오토파일럿이 발동한다.
+이 저장소는 애드온 패키지를 소유한다. Ghost-ALICE 코어는 installer policy, privileged adapter allowlist, hook marker, runner namespace, hook install/remove 동작을 소유한다.
 
 ## 요구사항
 
-- [Ghost-ALICE OS](https://github.com/AidALL/ghost-alice) 코어 설치(이 애드온은 `~/ghost-alice/_shared`의 코어 검증 게이트를 import한다).
+- P6 privileged adapter를 지원하는 Ghost-ALICE 코어.
 - Python 3.11+.
-- Claude Code 그리고/또는 Codex CLI(Codex 훅은 v0.114+).
+- Ghost-ALICE 코어 인스톨러로 설치된 Claude Code 또는 Codex hook.
 
 ## 설치
 
-두 단계다. 먼저 Ghost-ALICE 코어 인스톨러로 스킬을 설치하고, 이 레포의 스크립트로 훅을 배선한다.
+Ghost-ALICE 코어 인스톨러로 설치한다. P6에서는 별도 애드온 hook installer를 실행하지 않는다.
 
 ```bash
-# 1) 스킬 설치 (코어 인스톨러; install-state에 기록됨)
 bash <ghost-alice>/install.sh --addon-source /path/to/ghost-alice-autopilot --platform claude
-
-# 2) 오토파일럿 Stop + UserPromptSubmit 훅 배선 (이 레포)
-bash install-hooks.sh --platform claude
 ```
 
-Codex는 `claude`를 `codex`로 바꾸고, `--platform`을 생략하면 감지된 모든 플랫폼을 대상으로 한다. 훅은 세션 시작 시 로드되므로 새 세션부터 적용된다.
+Codex는 `--platform codex`를 사용한다. 코어 인스톨러가 이 저장소의 `addons-manifest.json`을 읽고 skill을 설치하며, core-owned `[adapter:autopilot-mode] continue` hook을 배선한다.
 
-## 프로젝트에서 켜기
+## 런타임 활성화
 
-오토파일럿은 cwd-게이팅이다. 현재 프로젝트에 큐 파일이 없으면 완전히 inert다.
+설치만으로는 동작하지 않는다. 실행을 활성화하려면 프로젝트에 승인 상태를 만든다.
+
+```text
+<project>/.autopilot/
+  approved-run.json
+  tasks.jsonl
+```
+
+`approved-run.json`은 명시적 GO 경계를 담아야 한다.
+
+```json
+{
+  "schema_version": "autopilot-run.v1",
+  "run_id": "run-1",
+  "approved": true,
+  "status": "running",
+  "scope": {"summary": "승인된 작업 범위"},
+  "budget": {"remaining_steps": 3},
+  "allowed_surfaces": ["src/...", "tests/..."],
+  "stop_conditions": ["budget_exhausted", "user_stop"],
+  "approval_evidence": {"decision": "GO", "source": "user-confirmation"}
+}
+```
+
+`tasks.jsonl`은 durable source of truth다. adapter는 task status와 dependency에서 ready queue를 파생하며, 파일에서 줄을 pop하지 않는다.
+
+일시정지:
 
 ```bash
-mkdir -p .autopilot
-printf '%s\n' '{"task":"첫 작업"}' '{"task":"둘째 작업"}' > .autopilot/queue.jsonl
+touch .autopilot/OFF
 ```
 
-상태는 `<project>/.autopilot/` 아래에 있다.
+재개:
 
-| 파일 | 역할 |
-|---|---|
-| `queue.jsonl` | 작업 목록, 한 줄에 하나(`{"task":"..."}` 또는 평문). 존재 = opt-in. |
-| `OFF` | 존재하면 오토파일럿 일시정지(큐는 보존). |
-| `inject_count` | 현재 배치의 자동 주입 카운터. 새 유저 입력마다 리셋. |
+```bash
+rm .autopilot/OFF
+```
 
-일시정지: `touch .autopilot/OFF`. 재개: `rm .autopilot/OFF`. 배치당 상한: `MAX_INJECTIONS`(기본 25). `.autopilot/queue.jsonl`이 없으면 훅은 완전히 inert다.
+중지는 `approved-run.json`의 `status`를 `stopped`로 바꾸거나, `approved`를 false로 바꾸거나, `budget.remaining_steps`를 0으로 만들거나, `approved-run.json`을 제거하여 수행한다.
+
+## Adapter 동작
+
+- 인자를 받지 않는다.
+- 기본 run directory는 `<cwd>/.autopilot/`이다.
+- `GHOST_ALICE_AUTOPILOT_RUN_DIR`로 명시적 run directory를 지정할 수 있다.
+- `consistency-decision.json`이 있으면 소비한다.
+- `events.jsonl` 감사 기록을 쓴다.
+- no-op payload 또는 다음 work-item continuation message만 출력한다.
 
 ## 제거
 
+Ghost-ALICE 코어 uninstall 경로를 사용한다.
+
 ```bash
-bash uninstall-hooks.sh --platform claude                     # 훅 제거 (이 레포)
-bash <ghost-alice>/install.sh --uninstall --platform claude   # 스킬 제거 (코어 인스톨러)
+bash <ghost-alice>/install.sh --uninstall --platform claude
+```
+
+코어 uninstaller가 managed adapter hook을 제거하고, addon-owned 파일은 코어 addon uninstall policy에 따라 보존한다.
+
+## 구조
+
+```text
+addons-manifest.json
+addons/autopilot-mode/
+  addon.json
+  skill/SKILL.md
+  skill/adapters/autopilot_mode.py
+  skill/adapters/autopilot_state.py
+tests/
 ```
 
 ## 라이선스

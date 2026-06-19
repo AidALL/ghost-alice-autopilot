@@ -1,81 +1,100 @@
-<div align="center">
-
 # ghost-alice-autopilot
 
-Verification-gated autonomous task-drain for Claude Code and Codex CLI.
+Official Ghost-ALICE addon for approved autonomous continuation.
 
-Language: 🇺🇸 English | [🇰🇷 한국어](./README_ko.md)
+Language: English | [Korean](./README_ko.md)
 
-</div>
+`autopilot-mode` installs a Ghost-ALICE P6 privileged adapter. The adapter continues the next approved work item after an agent stop event, but only when project-local approved-run state says the user has explicitly allowed the autonomous run.
 
-`autopilot-mode` is the first official [Ghost-ALICE OS](https://github.com/AidALL/ghost-alice) addon. It makes the agent keep pulling the next queued task after each turn, with no manual nudging — but only when that turn passed the Ghost-ALICE completion gate. It is an autonomy amplifier that rides on the verification gate; it never weakens it.
-
-This addon is fully self-contained: it does not modify the Ghost-ALICE core or its installer. The core installs the skill; this addon ships its own hook lifecycle.
-
-## Why it is safe (the verification lock)
-
-The autopilot advances only when the Ghost-ALICE verification gate would itself allow the stop for a valid completion claim. The Stop hook imports the core gate's own validator (`completion_check_validator.validate_completion_text`) and transcript helpers, so its definition of "verified" is identical to the gate's, never a substring proxy. If it cannot import the core gate logic, it refuses to advance (fails safe). The verification Stop hook and the autopilot Stop hook are mutually exclusive: the gate blocks on an invalid completion-check, the autopilot fires only on a valid one.
+This repository owns the addon package. The Ghost-ALICE core owns installer policy, privileged adapter allowlists, hook markers, runner namespaces, and hook install/remove behavior.
 
 ## Requirements
 
-- [Ghost-ALICE OS](https://github.com/AidALL/ghost-alice) core installed (this addon imports the core verification gate from `~/ghost-alice/_shared`).
+- Ghost-ALICE core with P6 privileged adapter support.
 - Python 3.11+.
-- Claude Code and/or Codex CLI (v0.114+ for Codex hooks).
+- Claude Code and/or Codex hooks installed by the Ghost-ALICE core installer.
 
 ## Install
 
-Two steps. First install the skill with the Ghost-ALICE core installer, then wire the hooks with this repo's script.
+Install through the Ghost-ALICE core installer. Do not run a separate addon hook installer for P6.
 
 ```bash
-# 1) install the skill (core installer; records it in install-state)
 bash <ghost-alice>/install.sh --addon-source /path/to/ghost-alice-autopilot --platform claude
-
-# 2) wire the autopilot Stop + UserPromptSubmit hooks (this repo)
-bash install-hooks.sh --platform claude
 ```
 
-Replace `claude` with `codex` for Codex, or omit `--platform` to target every detected platform. Hooks load at session start, so they take effect in new sessions.
+Use `--platform codex` for Codex. The core installer reads this repo's `addons-manifest.json`, installs the skill, and wires the core-owned `[adapter:autopilot-mode] continue` hook.
 
-## Turn it on in a project
+## Runtime Activation
 
-The autopilot is cwd-gated: inert unless the current project carries a queue file.
+Installation is inert by default. To activate a run, create approved state in the project:
+
+```text
+<project>/.autopilot/
+  approved-run.json
+  tasks.jsonl
+```
+
+`approved-run.json` must contain an explicit GO boundary:
+
+```json
+{
+  "schema_version": "autopilot-run.v1",
+  "run_id": "run-1",
+  "approved": true,
+  "status": "running",
+  "scope": {"summary": "Approved work scope"},
+  "budget": {"remaining_steps": 3},
+  "allowed_surfaces": ["src/...", "tests/..."],
+  "stop_conditions": ["budget_exhausted", "user_stop"],
+  "approval_evidence": {"decision": "GO", "source": "user-confirmation"}
+}
+```
+
+`tasks.jsonl` is the durable source of truth. The adapter derives the ready queue from task status and dependencies; it never pops lines from the file.
+
+Pause a run with:
 
 ```bash
-mkdir -p .autopilot
-printf '%s\n' '{"task":"first task"}' '{"task":"second task"}' > .autopilot/queue.jsonl
+touch .autopilot/OFF
 ```
 
-State lives under `<project>/.autopilot/`:
+Resume with:
 
-| File | Role |
-|---|---|
-| `queue.jsonl` | Task list, one per line (`{"task":"..."}` or plain text). Presence = opt-in. |
-| `OFF` | If present, autopilot is paused (without deleting the queue). |
-| `inject_count` | Auto-injection counter for the current batch; reset on each new user prompt. |
+```bash
+rm .autopilot/OFF
+```
 
-Pause: `touch .autopilot/OFF`. Resume: `rm .autopilot/OFF`. Cap: `MAX_INJECTIONS` per batch (default 25). No `.autopilot/queue.jsonl` means the hook is fully inert.
+Stop by setting `approved-run.json` `status` to `stopped`, setting `approved` to false, exhausting `budget.remaining_steps`, or removing `approved-run.json`.
+
+## Adapter Behavior
+
+- Accepts no arguments.
+- Defaults to `<cwd>/.autopilot/`.
+- Supports `GHOST_ALICE_AUTOPILOT_RUN_DIR` for an explicit run directory.
+- Consumes `consistency-decision.json` when present.
+- Writes `events.jsonl` audit records.
+- Emits either a no-op payload or the next work-item continuation message.
 
 ## Uninstall
 
+Use the Ghost-ALICE core uninstall path:
+
 ```bash
-bash uninstall-hooks.sh --platform claude              # remove the hooks (this repo)
-bash <ghost-alice>/install.sh --uninstall --platform claude   # remove the skill (core installer)
+bash <ghost-alice>/install.sh --uninstall --platform claude
 ```
+
+The core uninstaller removes the managed adapter hook and preserves addon-owned files according to the core addon uninstall policy.
 
 ## Layout
 
-```
-addons-manifest.json            # Ghost-ALICE addon manifest (manifest_version 1)
+```text
+addons-manifest.json
 addons/autopilot-mode/
-  addon.json                    # addon metadata (depends_on_core: verification-before-completion)
-  skill/SKILL.md                # the skill (operator interface)
-  skill/scripts/                # the hook engine
-    autopilot_stop_hook.py      # gate-locked Stop hook
-    reset_inject_count.py       # UserPromptSubmit budget reset
-install-hooks.sh                # self-contained hook installer (this repo)
-uninstall-hooks.sh              # self-contained hook remover (this repo)
-scripts/manage_hooks.py         # idempotent, marker-based hook wiring (no core dependency)
-tests/                          # addon tests
+  addon.json
+  skill/SKILL.md
+  skill/adapters/autopilot_mode.py
+  skill/adapters/autopilot_state.py
+tests/
 ```
 
 ## License
