@@ -3,7 +3,7 @@ name: autopilot-mode
 description: "Use after the user explicitly approves a Ghost-ALICE autonomous run and wants verified work items continued by the P6 privileged adapter."
 compatibility:
   - "Python 3.11+ standard library"
-  - "Ghost-ALICE core with P6 privileged adapter support"
+  - "Ghost-ALICE core 0.1.3+ with P6 privileged adapter support"
   - "Claude Code or Codex hooks installed by the Ghost-ALICE core installer"
 ---
 
@@ -103,9 +103,23 @@ prompt:
 
 Use the Ghost-ALICE core installer. This addon does not install hooks directly.
 
+Local checkout:
+
 ```bash
-bash <ghost-alice>/install.sh --addon-source <this-repo> --platform claude
-bash <ghost-alice>/install.sh --uninstall --platform claude
+bash <ghost-alice>/install.sh --platform claude --addon-source <this-repo>
+```
+
+Git URL source:
+
+```bash
+bash <ghost-alice>/install.sh --platform claude \
+  --addon-source https://github.com/AidALL/ghost-alice-autopilot.git
+```
+
+Remove only this addon:
+
+```bash
+bash <ghost-alice>/install.sh --platform claude --uninstall --addon autopilot-mode
 ```
 
 The addon manifest requests `privileged_adapters: ["autopilot-mode"]`. The core-owned privileged adapter allowlist chooses the event, marker, runner namespace, and adapter script path.

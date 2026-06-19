@@ -4,88 +4,186 @@ Official Ghost-ALICE addon for approved autonomous continuation.
 
 Language: English | [Korean](./README_ko.md)
 
-`autopilot-mode` installs a Ghost-ALICE P6 privileged adapter. The adapter continues the next approved work item after an agent stop event, but only when project-local approved-run state says the user has explicitly allowed the autonomous run.
+`autopilot-mode` lets Ghost-ALICE continue an approved run one work item at a time. After an agent stop event, it reads the project's `.autopilot/` state, chooses the next ready item, marks that item as running, and emits the next continuation message.
 
-This repository owns the addon package. The Ghost-ALICE core owns installer policy, privileged adapter allowlists, hook markers, runner namespaces, and hook install/remove behavior.
+## What This Addon Does
 
-## Requirements
+- Installs the `autopilot-mode` skill.
+- Registers the core-owned `[adapter:autopilot-mode] continue` hook through the Ghost-ALICE installer.
+- Reads project-local run state from `.autopilot/`.
+- Emits either a no-op payload or a next-work-item message.
+- Records adapter events in `.autopilot/events.jsonl`.
 
-- Ghost-ALICE core with P6 privileged adapter support.
-- Python 3.11+.
-- Claude Code and/or Codex hooks installed by the Ghost-ALICE core installer.
+It does not decide that a run should start. Session intent analysis, task routing, and the user's explicit GO decision create the approved run state.
 
-## Install
+## How It Works
 
-Install through the Ghost-ALICE core installer. Do not run a separate addon hook installer for P6.
+Runtime loop:
 
-```bash
-bash <ghost-alice>/install.sh --addon-source /path/to/ghost-alice-autopilot --platform claude
-```
+1. The Ghost-ALICE core installer installs this addon and wires the privileged adapter hook.
+2. A project creates `.autopilot/approved-run.json` and `.autopilot/tasks.jsonl` after user approval.
+3. When the agent stops, the adapter reads `.autopilot/`.
+4. If the run is approved, running, within budget, and has a ready task, the adapter marks that task `running`.
+5. The adapter prints a continuation payload with the next work item.
+6. If the run is not approved, paused, stopped, out of budget, or has no ready item, the adapter returns a no-op payload.
 
-Use `--platform codex` for Codex. The core installer reads this repo's `addons-manifest.json`, installs the skill, and wires the core-owned `[adapter:autopilot-mode] continue` hook.
-
-## Runtime Activation
-
-Installation is inert by default. To activate a run, create approved state in the project:
+Default run directory:
 
 ```text
 <project>/.autopilot/
   approved-run.json
   tasks.jsonl
+  consistency-decision.json
+  consistency-decision.applied.json
+  events.jsonl
+  OFF
 ```
 
-`approved-run.json` must contain an explicit GO boundary:
+## Requirements
 
-```json
+- Ghost-ALICE core 0.1.3 or newer with P6 privileged adapter support.
+- Python 3.11+.
+- Claude Code and/or Codex hooks installed by the Ghost-ALICE core installer.
+
+## Install
+
+Local checkout:
+
+```bash
+bash <ghost-alice>/install.sh \
+  --platform claude \
+  --addon-source /path/to/ghost-alice-autopilot
+```
+
+Git URL source:
+
+```bash
+bash <ghost-alice>/install.sh \
+  --platform claude \
+  --addon-source https://github.com/AidALL/ghost-alice-autopilot.git
+```
+
+Development branch or tag:
+
+```bash
+bash <ghost-alice>/install.sh \
+  --platform claude \
+  --addon-source https://github.com/AidALL/ghost-alice-autopilot.git \
+  --addon-tag p6-privileged-adapter
+```
+
+Use `--platform codex` for Codex.
+
+Check install status:
+
+```bash
+bash <ghost-alice>/install.sh --platform claude --status
+```
+
+## Try It
+
+From a project directory, create an approved run:
+
+```bash
+mkdir -p .autopilot
+cat > .autopilot/approved-run.json <<'JSON'
 {
   "schema_version": "autopilot-run.v1",
-  "run_id": "run-1",
+  "run_id": "demo-run",
   "approved": true,
   "status": "running",
-  "scope": {"summary": "Approved work scope"},
-  "budget": {"remaining_steps": 3},
+  "scope": {"summary": "Demo autopilot continuation"},
+  "budget": {"remaining_steps": 2},
   "allowed_surfaces": ["src/...", "tests/..."],
   "stop_conditions": ["budget_exhausted", "user_stop"],
   "approval_evidence": {"decision": "GO", "source": "user-confirmation"}
 }
+JSON
+
+cat > .autopilot/tasks.jsonl <<'JSONL'
+{"id":"unit-1","status":"ready","focus_layer":"micro","depends_on":[],"prompt":"Implement the first approved demo unit.","acceptance_criteria":["the next continuation message names unit-1"],"allowed_surface":["src/..."],"completion":{"state":"not_started","verdict":null,"evidence":[],"completion_check_digest":null,"reopen_target":null},"attempt":0}
+JSONL
 ```
 
-`tasks.jsonl` is the durable source of truth. The adapter derives the ready queue from task status and dependencies; it never pops lines from the file.
+After the next agent stop event, the adapter should emit a continuation message shaped like this:
 
-Pause a run with:
+```text
+[autopilot]
+run: demo-run
+work-item: unit-1
+focus-layer: micro
+allowed-surface:
+- src/...
+acceptance-criteria:
+- the next continuation message names unit-1
+prompt:
+Implement the first approved demo unit.
+```
+
+## Demo Video
+
+Recommended video flow:
+
+1. Install from a local checkout or Git URL.
+2. Create `.autopilot/approved-run.json`.
+3. Create `.autopilot/tasks.jsonl`.
+4. End an agent turn and show the `[autopilot]` continuation message.
+5. Run per-addon uninstall and show the adapter hook is gone.
+
+Add the final asset here when recorded:
+
+```text
+docs/demo/autopilot-mode.mp4
+```
+
+## Pause, Resume, Stop
+
+Pause:
 
 ```bash
 touch .autopilot/OFF
 ```
 
-Resume with:
+Resume:
 
 ```bash
 rm .autopilot/OFF
 ```
 
-Stop by setting `approved-run.json` `status` to `stopped`, setting `approved` to false, exhausting `budget.remaining_steps`, or removing `approved-run.json`.
+Stop by doing any one of these:
 
-## Adapter Behavior
+- set `approved-run.json` `status` to `stopped`
+- set `approved` to false
+- set `budget.remaining_steps` to 0
+- remove `approved-run.json`
 
-- Accepts no arguments.
-- Defaults to `<cwd>/.autopilot/`.
-- Supports `GHOST_ALICE_AUTOPILOT_RUN_DIR` for an explicit run directory.
-- Consumes `consistency-decision.json` when present.
-- Writes `events.jsonl` audit records.
-- Emits either a no-op payload or the next work-item continuation message.
+## Remove
 
-## Uninstall
-
-Use the Ghost-ALICE core uninstall path:
+Remove only this addon:
 
 ```bash
-bash <ghost-alice>/install.sh --uninstall --platform claude
+bash <ghost-alice>/install.sh \
+  --platform claude \
+  --uninstall --addon autopilot-mode
 ```
 
-The core uninstaller removes the managed adapter hook and preserves addon-owned files according to the core addon uninstall policy.
+Use `--platform codex` for Codex.
 
-## Layout
+Full Ghost-ALICE uninstall still uses the core full-uninstall path:
+
+```bash
+bash <ghost-alice>/install.sh --platform claude --uninstall
+```
+
+## Limits And Trust Notes
+
+- Installing the addon is not runtime activation.
+- The adapter accepts no arguments.
+- The adapter only reads `.autopilot/` state and emits a continuation payload.
+- Tool denial, installer policy, privileged adapter allowlists, hook markers, runner namespaces, and hook install/remove behavior are owned by Ghost-ALICE core.
+- This addon package owns the skill content and adapter implementation.
+
+## Repository Layout
 
 ```text
 addons-manifest.json
