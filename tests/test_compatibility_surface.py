@@ -16,6 +16,17 @@ def test_user_facing_install_docs_do_not_reference_deleted_p6_branches() -> None
             assert stale not in text, f"{rel} still references deleted branch/worktree {stale!r}"
 
 
+def test_public_docs_do_not_expose_internal_p6_phase_label() -> None:
+    public_surfaces = (
+        "README.md",
+        "README_ko.md",
+        "addons/autopilot-mode/skill/SKILL.md",
+    )
+    for rel in public_surfaces:
+        text = (REPO_ROOT / rel).read_text(encoding="utf-8")
+        assert "P6" not in text, f"{rel} exposes internal phase label 'P6'"
+
+
 def test_core_repo_auto_discovery_uses_current_main_checkout_not_deleted_worktree() -> None:
     text = (REPO_ROOT / "tests" / "test_privileged_adapter.py").read_text(encoding="utf-8")
     assert ".worktrees" not in text

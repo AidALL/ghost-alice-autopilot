@@ -41,7 +41,7 @@ Language: [English](./README.md) | Korean
 
 ## 요구사항
 
-- P6 privileged adapter를 지원하는 Ghost-ALICE core 0.1.3 이상.
+- privileged adapter를 지원하는 Ghost-ALICE core 0.1.3 이상.
 - Python 3.11+.
 - Ghost-ALICE core installer로 설치된 Claude Code 또는 Codex hook.
 

@@ -41,7 +41,7 @@ Default run directory:
 
 ## Requirements
 
-- Ghost-ALICE core 0.1.3 or newer with P6 privileged adapter support.
+- Ghost-ALICE core 0.1.3 or newer with privileged adapter support.
 - Python 3.11+.
 - Claude Code and/or Codex hooks installed by the Ghost-ALICE core installer.
 

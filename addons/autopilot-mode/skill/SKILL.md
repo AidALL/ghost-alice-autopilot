@@ -1,9 +1,9 @@
 ---
 name: autopilot-mode
-description: "Use after the user explicitly approves a Ghost-ALICE autonomous run and wants verified work items continued by the P6 privileged adapter."
+description: "Use after the user explicitly approves a Ghost-ALICE autonomous run and wants verified work items continued by the privileged adapter."
 compatibility:
   - "Python 3.11+ standard library"
-  - "Ghost-ALICE core 0.1.3+ with P6 privileged adapter support"
+  - "Ghost-ALICE core 0.1.3+ with privileged adapter support"
   - "Claude Code or Codex hooks installed by the Ghost-ALICE core installer"
 ---
 
