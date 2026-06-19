@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -29,7 +30,6 @@ def _candidate_core_repos() -> list[Path]:
     if env_core:
         candidates.append(Path(env_core))
     candidates.extend([
-        REPO_ROOT.parent / "ghost-alice" / ".worktrees" / "p6-autopilot",
         REPO_ROOT.parent / "ghost-alice",
     ])
     return candidates
@@ -222,6 +222,33 @@ class OfficialAutopilotAddonTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 64)
         self.assertIn("accepts no arguments", result.stderr)
+
+    def test_adapter_script_does_not_write_bytecode_into_installed_skill_copy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            installed_skill = root / "skills" / "autopilot-mode"
+            shutil.copytree(
+                AUTOPILOT_SOURCE / "addons" / "autopilot-mode" / "skill",
+                installed_skill,
+                ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+            )
+            run_dir = root / "run"
+            _write_approved_run(run_dir, [_work_item("next")])
+            script = installed_skill / "adapters" / "autopilot_mode.py"
+            env = os.environ.copy()
+            env.pop("PYTHONDONTWRITEBYTECODE", None)
+            env["GHOST_ALICE_AUTOPILOT_RUN_DIR"] = str(run_dir)
+
+            result = subprocess.run(
+                [sys.executable, str(script)],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertFalse((installed_skill / "adapters" / "__pycache__").exists())
 
 
 if __name__ == "__main__":

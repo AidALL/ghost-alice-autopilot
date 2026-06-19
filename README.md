@@ -45,6 +45,8 @@ Default run directory:
 - Python 3.11+.
 - Claude Code and/or Codex hooks installed by the Ghost-ALICE core installer.
 
+Do not install this addon with Ghost-ALICE core older than 0.1.3. Older core installers may copy the skill without wiring the privileged adapter; that install is inert and should be removed before upgrading.
+
 ## Install
 
 Local checkout:
@@ -61,15 +63,6 @@ Git URL source:
 bash <ghost-alice>/install.sh \
   --platform claude \
   --addon-source https://github.com/AidALL/ghost-alice-autopilot.git
-```
-
-Development branch or tag:
-
-```bash
-bash <ghost-alice>/install.sh \
-  --platform claude \
-  --addon-source https://github.com/AidALL/ghost-alice-autopilot.git \
-  --addon-tag p6-privileged-adapter
 ```
 
 Use `--platform codex` for Codex.

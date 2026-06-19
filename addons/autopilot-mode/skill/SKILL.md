@@ -14,6 +14,7 @@ autopilot-mode is a Ghost-ALICE addon for approved autonomous continuation. The 
 ## Critical Rules
 
 - Installation is not runtime activation. Installing this addon only registers a privileged adapter hook. The adapter is a no-op until an approved run state exists.
+- Ghost-ALICE core must be 0.1.3 or newer. Older core installers may copy this skill without wiring the privileged adapter; that install is inert and should be removed before upgrading.
 - The adapter accepts no arguments. Any argv value is rejected with exit code 64.
 - The adapter reads project-local state from `<cwd>/.autopilot/` by default. `GHOST_ALICE_AUTOPILOT_RUN_DIR` can point at a different run directory.
 - Runtime activation requires `approved-run.json` with `approved: true`, `status: "running"`, a positive `budget.remaining_steps`, non-empty `scope`, non-empty `allowed_surfaces`, non-empty `stop_conditions`, and non-empty `approval_evidence`.

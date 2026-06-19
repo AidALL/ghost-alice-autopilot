@@ -7,6 +7,8 @@ import json
 import sys
 from pathlib import Path
 
+sys.dont_write_bytecode = True
+
 
 def _load_autopilot_state():
     adapter_dir = Path(__file__).resolve().parent
