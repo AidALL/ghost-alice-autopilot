@@ -173,6 +173,74 @@ class OfficialAutopilotAddonTest(unittest.TestCase):
         self.assertIn("work-item: next", payload["systemMessage"])
         self.assertIn("Do next", payload["systemMessage"])
 
+    def test_adapter_script_formats_codex_stop_continuation_payload(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run"
+            _write_approved_run(run_dir, [_work_item("next")])
+            script = (
+                AUTOPILOT_SOURCE
+                / "addons"
+                / "autopilot-mode"
+                / "skill"
+                / "adapters"
+                / "autopilot_mode.py"
+            )
+            env = os.environ.copy()
+            env["GHOST_ALICE_AUTOPILOT_RUN_DIR"] = str(run_dir)
+
+            result = subprocess.run(
+                [sys.executable, str(script)],
+                input=json.dumps({
+                    "hook_event_name": "Stop",
+                    "cwd": str(Path(tmp)),
+                    "model": "gpt-5.5",
+                    "permission_mode": "bypassPermissions",
+                }),
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            payload = json.loads(result.stdout)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(payload["decision"], "block")
+        self.assertIn("work-item: next", payload["reason"])
+        self.assertEqual(payload["systemMessage"], payload["reason"])
+
+    def test_adapter_script_keeps_codex_stop_noop_non_blocking(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            script = (
+                AUTOPILOT_SOURCE
+                / "addons"
+                / "autopilot-mode"
+                / "skill"
+                / "adapters"
+                / "autopilot_mode.py"
+            )
+            env = os.environ.copy()
+            env["GHOST_ALICE_AUTOPILOT_RUN_DIR"] = str(Path(tmp) / "missing-run")
+
+            result = subprocess.run(
+                [sys.executable, str(script)],
+                input=json.dumps({
+                    "hook_event_name": "Stop",
+                    "cwd": str(Path(tmp)),
+                    "model": "gpt-5.5",
+                    "permission_mode": "bypassPermissions",
+                }),
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            payload = json.loads(result.stdout)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(payload["continue"])
+        self.assertNotIn("decision", payload)
+        self.assertEqual(payload["systemMessage"], "")
+
     def test_adapter_script_defaults_to_project_autopilot_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp) / "project"
@@ -202,6 +270,43 @@ class OfficialAutopilotAddonTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(payload["continue"])
         self.assertIn("work-item: next", payload["systemMessage"])
+
+    def test_adapter_script_uses_stop_hook_cwd_when_runner_cwd_differs(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "project"
+            runner_cwd = Path(tmp) / "runner-cwd"
+            run_dir = project / ".autopilot"
+            runner_cwd.mkdir(parents=True)
+            _write_approved_run(run_dir, [_work_item("next")])
+            script = (
+                AUTOPILOT_SOURCE
+                / "addons"
+                / "autopilot-mode"
+                / "skill"
+                / "adapters"
+                / "autopilot_mode.py"
+            )
+            env = os.environ.copy()
+            env.pop("GHOST_ALICE_AUTOPILOT_RUN_DIR", None)
+            env.pop("GHOST_ALICE_AUTOPILOT_CWD", None)
+
+            result = subprocess.run(
+                [sys.executable, str(script)],
+                cwd=runner_cwd,
+                input=json.dumps({
+                    "hook_event_name": "Stop",
+                    "cwd": str(project),
+                }),
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            payload = json.loads(result.stdout)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(payload["decision"], "block")
+        self.assertIn("work-item: next", payload["reason"])
 
     def test_adapter_script_rejects_arguments(self):
         script = (

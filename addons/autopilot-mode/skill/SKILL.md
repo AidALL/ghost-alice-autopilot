@@ -15,6 +15,7 @@ autopilot-mode is a Ghost-ALICE addon for approved autonomous continuation. The 
 
 - Installation is not runtime activation. Installing this addon only registers a privileged adapter hook. The adapter is a no-op until an approved run state exists.
 - Ghost-ALICE core must be 0.1.3 or newer. Older core installers may copy this skill without wiring the privileged adapter; that install is inert and should be removed before upgrading.
+- After session intent and task routing identify an explicit user GO decision, use `scripts/autopilot_start_run.py` to create the approved run state before expecting Stop continuation.
 - The adapter accepts no arguments. Any argv value is rejected with exit code 64.
 - The adapter reads project-local state from `<cwd>/.autopilot/` by default. `GHOST_ALICE_AUTOPILOT_RUN_DIR` can point at a different run directory.
 - Runtime activation requires `approved-run.json` with `approved: true`, `status: "running"`, a positive `budget.remaining_steps`, non-empty `scope`, non-empty `allowed_surfaces`, non-empty `stop_conditions`, and non-empty `approval_evidence`.
@@ -75,6 +76,53 @@ The adapter accepts these checker decisions:
 
 `continue_next` requires passing completion evidence: `verdict: "pass"`, a non-empty `completion_check_digest`, and non-empty `evidence`.
 
+## Start Script
+
+Use `scripts/autopilot_start_run.py` after explicit GO approval. It reads a JSON
+spec from stdin by default, writes `.autopilot/approved-run.json` and
+`.autopilot/tasks.jsonl`, refuses `approval_evidence.decision` values other
+than `GO`, and refuses to overwrite an active run unless `--replace-active` is
+passed.
+
+```bash
+python3 scripts/autopilot_start_run.py --project-dir /path/to/project <<'JSON'
+{
+  "run_id": "approved-run",
+  "scope": {"summary": "Approved autonomous work"},
+  "budget": {"remaining_steps": 3},
+  "allowed_surfaces": ["src/...", "tests/..."],
+  "stop_conditions": ["budget_exhausted", "user_stop"],
+  "approval_evidence": {"decision": "GO", "source": "user-confirmation"},
+  "tasks": [
+    {
+      "id": "unit-1",
+      "focus_layer": "meso",
+      "depends_on": [],
+      "prompt": "Implement the first approved work unit.",
+      "acceptance_criteria": ["tests pass"],
+      "allowed_surface": ["src/...", "tests/..."]
+    }
+  ]
+}
+JSON
+```
+
+## Consistency Decision Script
+
+Use `scripts/autopilot_consistency_decision.py` after a work item produces a
+completion-check result. The script writes `.autopilot/consistency-decision.json`
+for the adapter to consume on the next Stop event. Passing completion checks
+become `continue_next`; failing or invalid completion checks become
+`retry_same_unit`. Operator-controlled outcomes such as `stop`,
+`ask_user_meta`, or `reopen_macro` are accepted through `--decision` with
+explicit `--evidence`.
+
+```bash
+python3 scripts/autopilot_consistency_decision.py \
+  --run-dir /path/to/project/.autopilot \
+  --work-item-id unit-1 < final-response.txt
+```
+
 ## Continuation Message
 
 When a next item is ready, the adapter emits this message shape:
@@ -92,9 +140,24 @@ prompt:
 <work item prompt>
 ```
 
+## Supervised Dogfood
+
+Use `scripts/autopilot_dogfood_runner.py` when verifying the adapter signal
+chain without claiming the host runtime hook path is solved. The runner creates
+a local `.autopilot` run, calls the real no-args adapter with Stop-style input,
+uses `autopilot_consistency_decision.py` to produce `continue_next`,
+`retry_same_unit`, and `stop` decisions, and writes a summary JSON.
+
+```bash
+python3 scripts/autopilot_dogfood_runner.py \
+  --project-dir /tmp/autopilot-dogfood \
+  --prompt "approved work prompt" \
+  --summary-json /tmp/autopilot-dogfood-summary.json
+```
+
 ## Operating It
 
-- Start: create `.autopilot/approved-run.json` and `.autopilot/tasks.jsonl` after the user explicitly approves the autonomous run.
+- Start: run `scripts/autopilot_start_run.py` after the user explicitly approves the autonomous run.
 - Pause: create `.autopilot/OFF`.
 - Resume: remove `.autopilot/OFF`.
 - Stop: set `approved-run.json` `status` to `stopped`, set `approved` to false, set `budget.remaining_steps` to 0, or remove the approved run file.

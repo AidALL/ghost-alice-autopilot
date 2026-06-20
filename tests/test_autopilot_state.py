@@ -328,6 +328,17 @@ class AutopilotStateTest(unittest.TestCase):
         self.assertEqual(events[0]["event"], "continue_next_item")
         self.assertEqual(events[0]["work_item_id"], "next")
 
+    def test_approved_run_decrements_budget_when_continuation_starts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            _write_run(run_dir, [_item("next")])
+
+            payload = aps.advance_approved_run(run_dir)
+            record = json.loads((run_dir / "approved-run.json").read_text(encoding="utf-8"))
+
+        self.assertIn("work-item: next", payload["systemMessage"])
+        self.assertEqual(record["budget"]["remaining_steps"], 2)
+
     def test_consistency_decision_completes_running_item_before_selecting_next(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp)

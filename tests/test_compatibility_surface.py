@@ -42,3 +42,20 @@ def test_user_docs_warn_old_core_can_install_inert_skill_without_adapter() -> No
     korean = (REPO_ROOT / "README_ko.md").read_text(encoding="utf-8")
     for phrase in ("0.1.3", "skill만 복사", "privileged adapter", "inert"):
         assert phrase in korean, f"README_ko.md does not document old-core inert install behavior: {phrase!r}"
+
+
+def test_skill_docs_expose_supervised_dogfood_runner_without_internal_phase_label() -> None:
+    text = (REPO_ROOT / "addons" / "autopilot-mode" / "skill" / "SKILL.md").read_text(encoding="utf-8")
+
+    assert "autopilot_dogfood_runner.py" in text
+    assert "Supervised Dogfood" in text
+    assert "P6" not in text
+
+
+def test_user_docs_expose_start_script_as_primary_run_entrypoint() -> None:
+    for rel in ("README.md", "README_ko.md", "addons/autopilot-mode/skill/SKILL.md"):
+        text = (REPO_ROOT / rel).read_text(encoding="utf-8")
+        assert "autopilot_start_run.py" in text
+        assert "autopilot_consistency_decision.py" in text
+        assert "approved-run.json" in text
+        assert "tasks.jsonl" in text
