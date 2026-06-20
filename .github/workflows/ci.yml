@@ -1,0 +1,39 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: pytest
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out addon
+        uses: actions/checkout@v4
+        with:
+          path: ghost-alice-autopilot
+
+      - name: Check out Ghost-ALICE core
+        uses: actions/checkout@v4
+        with:
+          repository: AidALL/ghost-alice
+          path: ghost-alice
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install test dependencies
+        run: python -m pip install --upgrade pip pytest
+
+      - name: Run addon tests
+        working-directory: ghost-alice-autopilot
+        env:
+          GHOST_ALICE_CORE_REPO: ${{ github.workspace }}/ghost-alice
+        run: python -m pytest -p no:cacheprovider tests -q
