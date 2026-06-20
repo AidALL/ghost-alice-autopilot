@@ -53,29 +53,31 @@ Ghost-ALICE core 0.1.3 미만에는 이 애드온을 설치하지 않는다. 오
 
 ## 설치
 
-로컬 checkout:
+Ghost-ALICE core checkout에서 실행한다.
 
 ```bash
-bash <ghost-alice>/install.sh \
-  --platform claude \
-  --addon-source /path/to/ghost-alice-autopilot
+bash install.sh --addon autopilot
 ```
 
-Git URL source:
+core installer는 기본값으로 Claude Code/Codex 대상을 감지한다. 한 대상에만 설치하려면 `--platform`을 추가한다.
 
 ```bash
-bash <ghost-alice>/install.sh \
-  --platform claude \
-  --addon-source https://github.com/AidALL/ghost-alice-autopilot.git
+bash install.sh --platform codex --addon autopilot
 ```
 
-Codex는 `--platform codex`를 사용한다.
+development checkout override:
+
+```bash
+bash <ghost-alice>/install.sh --addon-source /path/to/ghost-alice-autopilot
+```
 
 설치 상태 확인:
 
 ```bash
-bash <ghost-alice>/install.sh --platform claude --status
+bash <ghost-alice>/install.sh --platform codex --status
 ```
+
+Claude Code 상태 확인은 `--platform claude`를 사용한다.
 
 ## 바로 실행해 보기
 
@@ -161,17 +163,15 @@ rm .autopilot/OFF
 이 애드온만 제거:
 
 ```bash
-bash <ghost-alice>/install.sh \
-  --platform claude \
-  --uninstall --addon autopilot-mode
+bash <ghost-alice>/install.sh --platform codex --uninstall --addon autopilot-mode
 ```
 
-Codex는 `--platform codex`를 사용한다.
+Claude Code는 `--platform claude`를 사용한다.
 
 Ghost-ALICE 전체 제거는 core full-uninstall 경로를 사용한다.
 
 ```bash
-bash <ghost-alice>/install.sh --platform claude --uninstall
+bash <ghost-alice>/install.sh --uninstall
 ```
 
 ## 제한 및 신뢰 메모
