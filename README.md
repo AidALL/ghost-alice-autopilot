@@ -10,6 +10,8 @@ Language: English | [Korean](./README_ko.md)
 
 - Installs the `autopilot-mode` skill.
 - Registers the core-owned `[adapter:autopilot-mode] continue` hook through the Ghost-ALICE installer.
+- Provides `scripts/autopilot_start_run.py` to write approved run state from a user-approved GO spec.
+- Provides `scripts/autopilot_consistency_decision.py` to convert completion-check output into the next run decision.
 - Reads project-local run state from `.autopilot/`.
 - Emits either a no-op payload or a next-work-item message.
 - Records adapter events in `.autopilot/events.jsonl`.
@@ -21,11 +23,13 @@ It does not decide that a run should start. Session intent analysis, task routin
 Runtime loop:
 
 1. The Ghost-ALICE core installer installs this addon and wires the privileged adapter hook.
-2. A project creates `.autopilot/approved-run.json` and `.autopilot/tasks.jsonl` after user approval.
+2. After session intent and task routing identify an explicit user GO decision, `autopilot_start_run.py` writes `.autopilot/approved-run.json` and `.autopilot/tasks.jsonl`.
 3. When the agent stops, the adapter reads `.autopilot/`.
 4. If the run is approved, running, within budget, and has a ready task, the adapter marks that task `running`.
 5. The adapter prints a continuation payload with the next work item.
-6. If the run is not approved, paused, stopped, out of budget, or has no ready item, the adapter returns a no-op payload.
+6. After a work item produces completion-check output, `autopilot_consistency_decision.py` writes `.autopilot/consistency-decision.json`.
+7. On the next stop event, the adapter applies that decision before selecting another ready item.
+8. If the run is not approved, paused, stopped, out of budget, or has no ready item, the adapter returns a no-op payload.
 
 Default run directory:
 
@@ -78,24 +82,26 @@ bash <ghost-alice>/install.sh --platform claude --status
 From a project directory, create an approved run:
 
 ```bash
-mkdir -p .autopilot
-cat > .autopilot/approved-run.json <<'JSON'
+python3 /path/to/ghost-alice-autopilot/addons/autopilot-mode/skill/scripts/autopilot_start_run.py <<'JSON'
 {
-  "schema_version": "autopilot-run.v1",
   "run_id": "demo-run",
-  "approved": true,
-  "status": "running",
   "scope": {"summary": "Demo autopilot continuation"},
   "budget": {"remaining_steps": 2},
   "allowed_surfaces": ["src/...", "tests/..."],
   "stop_conditions": ["budget_exhausted", "user_stop"],
-  "approval_evidence": {"decision": "GO", "source": "user-confirmation"}
+  "approval_evidence": {"decision": "GO", "source": "user-confirmation"},
+  "tasks": [
+    {
+      "id": "unit-1",
+      "focus_layer": "micro",
+      "depends_on": [],
+      "prompt": "Implement the first approved demo unit.",
+      "acceptance_criteria": ["the next continuation message names unit-1"],
+      "allowed_surface": ["src/..."]
+    }
+  ]
 }
 JSON
-
-cat > .autopilot/tasks.jsonl <<'JSONL'
-{"id":"unit-1","status":"ready","focus_layer":"micro","depends_on":[],"prompt":"Implement the first approved demo unit.","acceptance_criteria":["the next continuation message names unit-1"],"allowed_surface":["src/..."],"completion":{"state":"not_started","verdict":null,"evidence":[],"completion_check_digest":null,"reopen_target":null},"attempt":0}
-JSONL
 ```
 
 After the next agent stop event, the adapter should emit a continuation message shaped like this:
@@ -118,8 +124,8 @@ Implement the first approved demo unit.
 Recommended video flow:
 
 1. Install from a local checkout or Git URL.
-2. Create `.autopilot/approved-run.json`.
-3. Create `.autopilot/tasks.jsonl`.
+2. Run `autopilot_start_run.py` with an explicit GO spec.
+3. Show the generated `.autopilot/approved-run.json` and `.autopilot/tasks.jsonl`.
 4. End an agent turn and show the `[autopilot]` continuation message.
 5. Run per-addon uninstall and show the adapter hook is gone.
 
@@ -185,6 +191,9 @@ addons/autopilot-mode/
   skill/SKILL.md
   skill/adapters/autopilot_mode.py
   skill/adapters/autopilot_state.py
+  skill/scripts/autopilot_start_run.py
+  skill/scripts/autopilot_consistency_decision.py
+  skill/scripts/autopilot_dogfood_runner.py
 tests/
 ```
 

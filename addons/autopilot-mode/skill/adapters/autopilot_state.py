@@ -44,6 +44,10 @@ class AutopilotStateError(ValueError):
     """Raised when autopilot work-item state is invalid."""
 
 
+class AutopilotActiveRunError(AutopilotStateError):
+    """Raised when a start request would overwrite an active run."""
+
+
 def _require_string(value: Any, field: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise AutopilotStateError(f"{field} must be a non-empty string")
@@ -293,7 +297,140 @@ def _read_json_object(path: Path) -> dict[str, Any]:
     return value
 
 
-def _approved_run_allows_continue(run: dict[str, Any]) -> bool:
+def _write_json_object(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        dir=path.parent,
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as out:
+            out.write(json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
+        os.replace(tmp_path, path)
+        tmp_path = None
+    finally:
+        if tmp_path is not None:
+            try:
+                tmp_path.unlink()
+            except FileNotFoundError:
+                pass
+
+
+def _approved_run_is_active(run: dict[str, Any]) -> bool:
+    return run.get("approved") is True and run.get("status") == "running"
+
+
+def _normalise_start_task(raw: Any) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        raise AutopilotStateError("start spec tasks entries must be objects")
+    item = dict(raw)
+    item.setdefault("status", "ready")
+    item.setdefault("depends_on", [])
+    item.setdefault("completion", {
+        "state": "not_started",
+        "verdict": None,
+        "evidence": [],
+        "completion_check_digest": None,
+        "reopen_target": None,
+    })
+    item.setdefault("attempt", 0)
+    return item
+
+
+def _start_run_record_from_spec(spec: Mapping[str, Any]) -> dict[str, Any]:
+    run_id = _require_string(spec.get("run_id"), "run_id")
+    scope = spec.get("scope")
+    if not _has_non_empty_scope(scope):
+        raise AutopilotStateError("scope must be a non-empty string or object")
+    budget = spec.get("budget")
+    if not isinstance(budget, dict):
+        raise AutopilotStateError("budget must be an object")
+    remaining_steps = budget.get("remaining_steps")
+    if not isinstance(remaining_steps, int) or isinstance(remaining_steps, bool) or remaining_steps <= 0:
+        raise AutopilotStateError("budget.remaining_steps must be a positive integer")
+    allowed_surfaces = spec.get("allowed_surfaces")
+    if not _is_non_empty_string_array(allowed_surfaces):
+        raise AutopilotStateError("allowed_surfaces must be a non-empty string array")
+    stop_conditions = spec.get("stop_conditions")
+    if not _is_non_empty_string_array(stop_conditions):
+        raise AutopilotStateError("stop_conditions must be a non-empty string array")
+    approval_evidence = spec.get("approval_evidence")
+    if not isinstance(approval_evidence, dict) or not approval_evidence:
+        raise AutopilotStateError("approval_evidence must be a non-empty object")
+    if approval_evidence.get("decision") != "GO":
+        raise AutopilotStateError("approval_evidence.decision must be GO")
+
+    return {
+        "schema_version": "autopilot-run.v1",
+        "run_id": run_id,
+        "approved": True,
+        "status": "running",
+        "scope": scope,
+        "budget": {"remaining_steps": remaining_steps},
+        "allowed_surfaces": list(allowed_surfaces),
+        "stop_conditions": list(stop_conditions),
+        "approval_evidence": dict(approval_evidence),
+    }
+
+
+def start_approved_run(
+    run_dir: str | Path,
+    spec: Mapping[str, Any],
+    *,
+    replace_active: bool = False,
+) -> dict[str, Any]:
+    root = Path(run_dir)
+    if not isinstance(spec, Mapping):
+        raise AutopilotStateError("start spec must be a JSON object")
+
+    approved_run_path = root / APPROVED_RUN_FILE
+    tasks_path = root / TASKS_FILE
+    if approved_run_path.exists() and tasks_path.exists() and not replace_active:
+        try:
+            existing = _read_json_object(approved_run_path)
+        except AutopilotStateError:
+            existing = {}
+        if _approved_run_is_active(existing):
+            raise AutopilotActiveRunError("active autopilot run already exists")
+
+    run = _start_run_record_from_spec(spec)
+    raw_tasks = spec.get("tasks")
+    if not isinstance(raw_tasks, list) or not raw_tasks:
+        raise AutopilotStateError("tasks must be a non-empty array")
+    items = validate_work_items(_normalise_start_task(task) for task in raw_tasks)
+    for item in items:
+        if not _work_item_within_run_surfaces(run, item):
+            raise AutopilotStateError(f"work item {item['id']!r} is outside run allowed_surfaces")
+
+    root.mkdir(parents=True, exist_ok=True)
+    for residue in (DECISION_FILE, APPLIED_DECISION_FILE, EVENTS_FILE, OFF_FILE):
+        try:
+            (root / residue).unlink()
+        except FileNotFoundError:
+            pass
+    _write_json_object(approved_run_path, run)
+    write_work_items(tasks_path, items)
+    _append_event(
+        root,
+        {
+            "schema_version": "autopilot-event.v1",
+            "event": "approved_run_started",
+            "run_id": run["run_id"],
+            "task_count": len(items),
+        },
+    )
+    return {
+        "schema_version": "autopilot-start-summary.v1",
+        "run_id": run["run_id"],
+        "run_dir": str(root),
+        "task_count": len(items),
+        "remaining_steps": run["budget"]["remaining_steps"],
+    }
+
+
+def _approved_run_has_valid_execution_context(run: dict[str, Any]) -> bool:
     if run.get("schema_version") != "autopilot-run.v1":
         return False
     if run.get("approved") is not True:
@@ -306,7 +443,7 @@ def _approved_run_allows_continue(run: dict[str, Any]) -> bool:
     if not isinstance(budget, dict):
         return False
     remaining_steps = budget.get("remaining_steps")
-    if not isinstance(remaining_steps, int) or isinstance(remaining_steps, bool) or remaining_steps <= 0:
+    if not isinstance(remaining_steps, int) or isinstance(remaining_steps, bool) or remaining_steps < 0:
         return False
     if not _is_non_empty_string_array(run.get("allowed_surfaces")):
         return False
@@ -315,6 +452,12 @@ def _approved_run_allows_continue(run: dict[str, Any]) -> bool:
     if not _has_non_empty_approval_evidence(run.get("approval_evidence")):
         return False
     return True
+
+
+def _approved_run_allows_continue(run: dict[str, Any]) -> bool:
+    if not _approved_run_has_valid_execution_context(run):
+        return False
+    return run["budget"]["remaining_steps"] > 0
 
 
 def _append_event(run_dir: Path, event: dict[str, Any]) -> None:
@@ -379,6 +522,12 @@ def _select_ready_item(items: list[dict[str, Any]], item_id: str) -> dict[str, A
     return {"item": item, "items": updated}
 
 
+def _consume_budget_step(run: dict[str, Any]) -> dict[str, Any]:
+    updated = copy.deepcopy(run)
+    updated["budget"]["remaining_steps"] -= 1
+    return updated
+
+
 def advance_approved_run(run_dir: str | Path) -> dict[str, Any]:
     root = Path(run_dir)
     approved_run_path = root / APPROVED_RUN_FILE
@@ -389,11 +538,13 @@ def advance_approved_run(run_dir: str | Path) -> dict[str, Any]:
         return _noop_payload()
 
     run = _read_json_object(approved_run_path)
-    if not _approved_run_allows_continue(run):
+    if not _approved_run_has_valid_execution_context(run):
         return _noop_payload()
 
     items = read_work_items(tasks_path)
     items = _apply_pending_decision(root, items)
+    if not _approved_run_allows_continue(run):
+        return _noop_payload()
     ready_queue = derive_ready_queue(items)
     if not ready_queue:
         _append_event(
@@ -421,7 +572,9 @@ def advance_approved_run(run_dir: str | Path) -> dict[str, Any]:
 
     selected = _select_ready_item(items, next_item["id"])
     selected_item = selected["item"]
+    updated_run = _consume_budget_step(run)
     write_work_items(tasks_path, selected["items"])
+    _write_json_object(approved_run_path, updated_run)
     _append_event(
         root,
         {
@@ -430,6 +583,7 @@ def advance_approved_run(run_dir: str | Path) -> dict[str, Any]:
             "run_id": run.get("run_id"),
             "work_item_id": selected_item["id"],
             "focus_layer": selected_item["focus_layer"],
+            "remaining_steps": updated_run["budget"]["remaining_steps"],
         },
     )
     return {

@@ -10,6 +10,8 @@ Language: [English](./README.md) | Korean
 
 - `autopilot-mode` skill을 설치한다.
 - Ghost-ALICE installer를 통해 core-owned `[adapter:autopilot-mode] continue` hook을 등록한다.
+- `scripts/autopilot_start_run.py`로 사용자 승인 GO spec에서 approved run state를 만든다.
+- `scripts/autopilot_consistency_decision.py`로 completion-check output을 다음 run decision으로 변환한다.
 - 프로젝트 로컬 `.autopilot/` 실행 상태를 읽는다.
 - no-op payload 또는 다음 work-item message를 출력한다.
 - adapter event를 `.autopilot/events.jsonl`에 기록한다.
@@ -21,11 +23,13 @@ Language: [English](./README.md) | Korean
 런타임 흐름:
 
 1. Ghost-ALICE core installer가 이 애드온을 설치하고 privileged adapter hook을 배선한다.
-2. 프로젝트는 사용자 승인 후 `.autopilot/approved-run.json`과 `.autopilot/tasks.jsonl`을 만든다.
+2. session intent와 task routing이 사용자의 명시적 GO 결정을 확인한 뒤 `autopilot_start_run.py`가 `.autopilot/approved-run.json`과 `.autopilot/tasks.jsonl`을 쓴다.
 3. 에이전트가 멈추면 adapter가 `.autopilot/`을 읽는다.
 4. 실행이 approved, running, 예산 내 상태이고 ready task가 있으면 adapter가 해당 task를 `running`으로 표시한다.
 5. adapter가 다음 work item이 담긴 continuation payload를 출력한다.
-6. 실행이 승인되지 않았거나, pause/stop 상태이거나, 예산이 없거나, ready item이 없으면 no-op payload를 반환한다.
+6. work item이 completion-check output을 만들면 `autopilot_consistency_decision.py`가 `.autopilot/consistency-decision.json`을 쓴다.
+7. 다음 stop 이벤트에서 adapter는 다른 ready item을 선택하기 전에 그 decision을 적용한다.
+8. 실행이 승인되지 않았거나, pause/stop 상태이거나, 예산이 없거나, ready item이 없으면 no-op payload를 반환한다.
 
 기본 run directory:
 
@@ -78,24 +82,26 @@ bash <ghost-alice>/install.sh --platform claude --status
 프로젝트 디렉토리에서 approved run을 만든다.
 
 ```bash
-mkdir -p .autopilot
-cat > .autopilot/approved-run.json <<'JSON'
+python3 /path/to/ghost-alice-autopilot/addons/autopilot-mode/skill/scripts/autopilot_start_run.py <<'JSON'
 {
-  "schema_version": "autopilot-run.v1",
   "run_id": "demo-run",
-  "approved": true,
-  "status": "running",
   "scope": {"summary": "Demo autopilot continuation"},
   "budget": {"remaining_steps": 2},
   "allowed_surfaces": ["src/...", "tests/..."],
   "stop_conditions": ["budget_exhausted", "user_stop"],
-  "approval_evidence": {"decision": "GO", "source": "user-confirmation"}
+  "approval_evidence": {"decision": "GO", "source": "user-confirmation"},
+  "tasks": [
+    {
+      "id": "unit-1",
+      "focus_layer": "micro",
+      "depends_on": [],
+      "prompt": "Implement the first approved demo unit.",
+      "acceptance_criteria": ["the next continuation message names unit-1"],
+      "allowed_surface": ["src/..."]
+    }
+  ]
 }
 JSON
-
-cat > .autopilot/tasks.jsonl <<'JSONL'
-{"id":"unit-1","status":"ready","focus_layer":"micro","depends_on":[],"prompt":"Implement the first approved demo unit.","acceptance_criteria":["the next continuation message names unit-1"],"allowed_surface":["src/..."],"completion":{"state":"not_started","verdict":null,"evidence":[],"completion_check_digest":null,"reopen_target":null},"attempt":0}
-JSONL
 ```
 
 다음 agent stop 이벤트 이후 adapter는 아래 형태의 continuation message를 출력한다.
@@ -118,8 +124,8 @@ Implement the first approved demo unit.
 권장 영상 흐름:
 
 1. 로컬 checkout 또는 Git URL에서 설치한다.
-2. `.autopilot/approved-run.json`을 만든다.
-3. `.autopilot/tasks.jsonl`을 만든다.
+2. 명시적 GO spec으로 `autopilot_start_run.py`를 실행한다.
+3. 생성된 `.autopilot/approved-run.json`과 `.autopilot/tasks.jsonl`을 보여준다.
 4. 에이전트 턴을 끝내고 `[autopilot]` continuation message를 보여준다.
 5. per-addon uninstall을 실행하고 adapter hook이 제거된 상태를 보여준다.
 
@@ -185,6 +191,9 @@ addons/autopilot-mode/
   skill/SKILL.md
   skill/adapters/autopilot_mode.py
   skill/adapters/autopilot_state.py
+  skill/scripts/autopilot_start_run.py
+  skill/scripts/autopilot_consistency_decision.py
+  skill/scripts/autopilot_dogfood_runner.py
 tests/
 ```
 
