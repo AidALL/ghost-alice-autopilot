@@ -53,29 +53,31 @@ Do not install this addon with Ghost-ALICE core older than 0.1.3. Older core ins
 
 ## Install
 
-Local checkout:
+From a Ghost-ALICE core checkout:
 
 ```bash
-bash <ghost-alice>/install.sh \
-  --platform claude \
-  --addon-source /path/to/ghost-alice-autopilot
+bash install.sh --addon autopilot
 ```
 
-Git URL source:
+The core installer detects Claude Code/Codex targets by default. To install only one target, add `--platform`:
 
 ```bash
-bash <ghost-alice>/install.sh \
-  --platform claude \
-  --addon-source https://github.com/AidALL/ghost-alice-autopilot.git
+bash install.sh --platform codex --addon autopilot
 ```
 
-Use `--platform codex` for Codex.
+Development checkout override:
+
+```bash
+bash <ghost-alice>/install.sh --addon-source /path/to/ghost-alice-autopilot
+```
 
 Check install status:
 
 ```bash
-bash <ghost-alice>/install.sh --platform claude --status
+bash <ghost-alice>/install.sh --platform codex --status
 ```
+
+Use `--platform claude` for Claude Code status.
 
 ## Try It
 
@@ -161,17 +163,15 @@ Stop by doing any one of these:
 Remove only this addon:
 
 ```bash
-bash <ghost-alice>/install.sh \
-  --platform claude \
-  --uninstall --addon autopilot-mode
+bash <ghost-alice>/install.sh --platform codex --uninstall --addon autopilot-mode
 ```
 
-Use `--platform codex` for Codex.
+Use `--platform claude` for Claude Code.
 
 Full Ghost-ALICE uninstall still uses the core full-uninstall path:
 
 ```bash
-bash <ghost-alice>/install.sh --platform claude --uninstall
+bash <ghost-alice>/install.sh --uninstall
 ```
 
 ## Limits And Trust Notes

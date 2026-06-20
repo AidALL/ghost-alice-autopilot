@@ -167,23 +167,30 @@ python3 scripts/autopilot_dogfood_runner.py \
 
 Use the Ghost-ALICE core installer. This addon does not install hooks directly.
 
-Local checkout:
+From a Ghost-ALICE core checkout:
 
 ```bash
-bash <ghost-alice>/install.sh --platform claude --addon-source <this-repo>
+bash install.sh --addon autopilot
 ```
 
-Git URL source:
+To install one platform only:
 
 ```bash
-bash <ghost-alice>/install.sh --platform claude \
-  --addon-source https://github.com/AidALL/ghost-alice-autopilot.git
+bash install.sh --platform codex --addon autopilot
+```
+
+Development checkout override:
+
+```bash
+bash <ghost-alice>/install.sh --addon-source <this-repo>
 ```
 
 Remove only this addon:
 
 ```bash
-bash <ghost-alice>/install.sh --platform claude --uninstall --addon autopilot-mode
+bash <ghost-alice>/install.sh --platform codex --uninstall --addon autopilot-mode
 ```
+
+Use `--platform claude` for Claude Code.
 
 The addon manifest requests `privileged_adapters: ["autopilot-mode"]`. The core-owned privileged adapter allowlist chooses the event, marker, runner namespace, and adapter script path.

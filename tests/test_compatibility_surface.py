@@ -27,6 +27,21 @@ def test_public_docs_do_not_expose_internal_p6_phase_label() -> None:
         assert "P6" not in text, f"{rel} exposes internal phase label 'P6'"
 
 
+def test_install_docs_lead_with_official_addon_alias() -> None:
+    for rel in ("README.md", "README_ko.md", "addons/autopilot-mode/skill/SKILL.md"):
+        text = (REPO_ROOT / rel).read_text(encoding="utf-8")
+        assert "bash install.sh --addon autopilot" in text
+        assert "--addon-source https://github.com/AidALL/ghost-alice-autopilot.git" not in text
+
+
+def test_install_docs_keep_codex_as_first_class_target() -> None:
+    for rel in ("README.md", "README_ko.md", "addons/autopilot-mode/skill/SKILL.md"):
+        text = (REPO_ROOT / rel).read_text(encoding="utf-8")
+        assert "--platform codex --addon autopilot" in text
+        assert "--platform claude --status" not in text
+        assert "--platform claude --uninstall --addon autopilot-mode" not in text
+
+
 def test_core_repo_auto_discovery_uses_current_main_checkout_not_deleted_worktree() -> None:
     text = (REPO_ROOT / "tests" / "test_privileged_adapter.py").read_text(encoding="utf-8")
     assert ".worktrees" not in text
