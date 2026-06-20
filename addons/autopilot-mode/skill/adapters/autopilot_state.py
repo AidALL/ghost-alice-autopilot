@@ -430,7 +430,7 @@ def start_approved_run(
     }
 
 
-def _approved_run_allows_continue(run: dict[str, Any]) -> bool:
+def _approved_run_has_valid_execution_context(run: dict[str, Any]) -> bool:
     if run.get("schema_version") != "autopilot-run.v1":
         return False
     if run.get("approved") is not True:
@@ -443,7 +443,7 @@ def _approved_run_allows_continue(run: dict[str, Any]) -> bool:
     if not isinstance(budget, dict):
         return False
     remaining_steps = budget.get("remaining_steps")
-    if not isinstance(remaining_steps, int) or isinstance(remaining_steps, bool) or remaining_steps <= 0:
+    if not isinstance(remaining_steps, int) or isinstance(remaining_steps, bool) or remaining_steps < 0:
         return False
     if not _is_non_empty_string_array(run.get("allowed_surfaces")):
         return False
@@ -452,6 +452,12 @@ def _approved_run_allows_continue(run: dict[str, Any]) -> bool:
     if not _has_non_empty_approval_evidence(run.get("approval_evidence")):
         return False
     return True
+
+
+def _approved_run_allows_continue(run: dict[str, Any]) -> bool:
+    if not _approved_run_has_valid_execution_context(run):
+        return False
+    return run["budget"]["remaining_steps"] > 0
 
 
 def _append_event(run_dir: Path, event: dict[str, Any]) -> None:
@@ -532,11 +538,13 @@ def advance_approved_run(run_dir: str | Path) -> dict[str, Any]:
         return _noop_payload()
 
     run = _read_json_object(approved_run_path)
-    if not _approved_run_allows_continue(run):
+    if not _approved_run_has_valid_execution_context(run):
         return _noop_payload()
 
     items = read_work_items(tasks_path)
     items = _apply_pending_decision(root, items)
+    if not _approved_run_allows_continue(run):
+        return _noop_payload()
     ready_queue = derive_ready_queue(items)
     if not ready_queue:
         _append_event(

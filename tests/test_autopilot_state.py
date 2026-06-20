@@ -339,6 +339,38 @@ class AutopilotStateTest(unittest.TestCase):
         self.assertIn("work-item: next", payload["systemMessage"])
         self.assertEqual(record["budget"]["remaining_steps"], 2)
 
+    def test_pending_decision_applies_after_last_budget_step_is_consumed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            _write_run(run_dir, [_item("last")])
+            _write_run_config(run_dir, remaining_steps=1)
+
+            first_payload = aps.advance_approved_run(run_dir)
+            run_after_start = json.loads((run_dir / "approved-run.json").read_text(encoding="utf-8"))
+            (run_dir / "consistency-decision.json").write_text(
+                json.dumps({
+                    "decision_id": "last-step-decision",
+                    "work_item_id": "last",
+                    "decision": "continue_next",
+                    "completion_check_digest": "sha256:abc",
+                    "verdict": "pass",
+                    "evidence": ["pytest tests/test_autopilot_state.py"],
+                }),
+                encoding="utf-8",
+            )
+
+            second_payload = aps.advance_approved_run(run_dir)
+            items = aps.read_work_items(run_dir / "tasks.jsonl")
+            decision_removed = not (run_dir / "consistency-decision.json").exists()
+            applied_decision_exists = (run_dir / "consistency-decision.applied.json").is_file()
+
+        self.assertIn("work-item: last", first_payload["systemMessage"])
+        self.assertEqual(run_after_start["budget"]["remaining_steps"], 0)
+        self.assertEqual(second_payload, {"continue": True, "systemMessage": ""})
+        self.assertEqual(items[0]["status"], "completed")
+        self.assertTrue(decision_removed)
+        self.assertTrue(applied_decision_exists)
+
     def test_consistency_decision_completes_running_item_before_selecting_next(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp)
