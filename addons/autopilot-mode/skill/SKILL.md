@@ -28,7 +28,7 @@ autopilot-mode is a Ghost-ALICE addon for approved autonomous continuation. The 
 - If a running item has no decision file on the next Stop hook, the adapter resumes that same item with `pending-decision: missing` instead of returning a silent no-op. A repeated missing decision escalates to `ask_user_meta` only when neither io-trace nor work state can resolve the next action.
 - `conduct-plan.json` is an approved handoff from the conduct-feedback planning path. The adapter imports `autopilot-conduct-plan.v2` `proposed_queue_items` only when the plan has `promotion_state: "approved"`, approval evidence, source candidate id, and evidence digest.
 - Imported conduct plan items preserve `observer_agent_required` and `observer_contract`; observer requirements are surfaced in the continuation message.
-- Full compatibility claims must read repository `compatibility-matrix.json` first. Linux, Windows Command Prompt, Windows PowerShell 5, and Windows PowerShell 7 targets marked `not-run` block a full compatibility claim until runner evidence is attached.
+- Full compatibility claims must read repository `compatibility-matrix.json` first. Matrix evidence records the current support contract, not historical dated run prose. Linux, Windows Command Prompt, Windows PowerShell 5, and Windows PowerShell 7 targets marked `not-run` block a full compatibility claim until runner evidence is attached.
 - The adapter never denies tools and never widens Ghost-ALICE core policy. Its Stop hook output is either a no-op payload or a continuation message for the next ready/reopened item or the current running item that still has unresolved runtime material.
 
 ## Run Directory
@@ -188,7 +188,9 @@ skill/scripts/autopilot_session_material.py
 
 ## Install and Remove
 
-Use the Ghost-ALICE core installer. This addon does not install hooks directly.
+Use the Ghost-ALICE core installer from a Ghost-ALICE core checkout. This addon
+does not install hooks directly and does not provide a standalone root
+`install.sh`.
 
 Default install to detected Claude Code/Codex targets:
 

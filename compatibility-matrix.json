@@ -2,6 +2,7 @@
   "schema_version": "autopilot-compatibility-matrix.v1",
   "scope": "autopilot-mode addon runtime, install surface, and documented shell/platform coverage",
   "full_compatibility_claim_rule": "Do not claim full compatibility while any required target has status not-run.",
+  "evidence_policy": "Evidence entries describe the current support contract. Historical run timestamps belong in external test logs, CI artifacts, or release notes, not in this matrix.",
   "targets": [
     {
       "id": "os-macos",
@@ -10,13 +11,11 @@
       "status": "verified-local",
       "full_compatibility_blocker": false,
       "evidence": [
-        "2026-06-21 local macOS: PYTHONDONTWRITEBYTECODE=1 /opt/homebrew/bin/python3 -m pytest -q reported 143 passed and 166 subtests passed",
-        "2026-06-21 local macOS: installed bridge-to-adapter smoke passed for /Users/aidall/.agents/skills/autopilot-mode and /Users/aidall/.claude/skills/autopilot-mode",
-        "2026-06-22 local macOS: PYTHONDONTWRITEBYTECODE=1 /opt/homebrew/bin/python3 -m pytest -q reported 143 passed and 166 subtests passed"
+        "local unit suite covers compatibility, bridge, governance signal, live semantic harness, privileged adapter, and autopilot state surfaces",
+        "installed bridge-to-adapter smoke covers Codex and Claude installed skill layouts",
+        "fresh install E2E covers default install/status, Codex status, installed adapter smoke, Claude lifecycle uninstall, and overall uninstall cleanup"
       ],
-      "next_evidence_required": [
-        "run Claude live semantic E2E with working Claude credentials and attach command, exit code, and semantic_status evidence"
-      ]
+      "next_evidence_required": []
     },
     {
       "id": "os-linux",
@@ -81,14 +80,14 @@
       "status": "simulated-local",
       "full_compatibility_blocker": false,
       "evidence": [
-        "2026-06-21 local install status: bash install.sh --platform claude --status reported addon-registry ok, autopilot-mode skill/adapter content_hash-match, and overall ok",
-        "2026-06-21 local installed-copy smoke: /Users/aidall/.claude/skills/autopilot-mode/scripts/autopilot_session_bridge.py wrote approved run state and /Users/aidall/.claude/skills/autopilot-mode/adapters/autopilot_mode.py emitted a continuation payload",
-        "2026-06-21 fresh install E2E in Docker with --agent-cli-mode skip --live-cli-mode skip reported Claude status ok and smoke event continue_next_item with task_status running",
-        "2026-06-22 fresh install E2E in Docker with --agent-cli-mode skip --live-cli-mode skip reported Claude status ok and smoke event continue_next_item with task_status running",
-        "2026-06-22 temp HOME lifecycle: bash install.sh --platform claude --addon-source /Users/aidall/ghost-alice-autopilot --skip-source-health followed by bash install.sh --platform claude --uninstall autopilot-mode removed both skill and sidecar",
-        "2026-06-21 Claude live semantic E2E attempted with --runtime both --scenario-source intent --execute, but Claude scenarios returned api_error_status 401 and semantic_status not-run, so this target remains simulated-local rather than verified-local"
+        "install status covers addon-registry ok, autopilot-mode skill/adapter content_hash-match, and overall ok for the Claude surface",
+        "installed-copy smoke covers the Claude skill bridge writing approved run state and the adapter emitting a continuation payload",
+        "fresh install E2E covers install/status and temporary HOME lifecycle for the Claude surface",
+        "live semantic E2E has no successful Claude semantic result attached; status remains simulated-local until a credentialed Claude runtime run passes"
       ],
-      "next_evidence_required": []
+      "next_evidence_required": [
+        "run Claude live semantic E2E with working Claude credentials and attach command, exit code, and semantic_status evidence"
+      ]
     },
     {
       "id": "agent-platform-codex",
@@ -97,13 +96,11 @@
       "status": "verified-local",
       "full_compatibility_blocker": false,
       "evidence": [
-        "2026-06-21 local core status: bash install.sh --platform codex --status reported addon-registry ok, autopilot-mode skill/adapter content_hash-match, and overall ok",
-        "2026-06-21 local installed-copy smoke: /Users/aidall/.agents/skills/autopilot-mode/scripts/autopilot_session_bridge.py wrote approved run state and /Users/aidall/.agents/skills/autopilot-mode/adapters/autopilot_mode.py emitted a continuation payload",
-        "2026-06-21 fresh install E2E in Docker with --agent-cli-mode skip --live-cli-mode skip reported Codex status ok and smoke event continue_next_item with task_status running",
-        "2026-06-22 fresh install E2E in Docker with --agent-cli-mode skip --live-cli-mode skip reported Codex status ok and smoke event continue_next_item with task_status running",
-        "2026-06-22 temp HOME lifecycle: bash install.sh --platform codex --addon-source /Users/aidall/ghost-alice-autopilot --skip-source-health followed by bash install.sh --platform codex --uninstall autopilot-mode removed both skill and sidecar",
-        "2026-06-21 local Codex live semantic E2E: scripts/live_semantic_e2e.py --runtime both --scenario-source intent --execute --jsonl --timeout-sec 180 produced Codex results with inference_status=ok, semantic_status=parsed, and hook_status=complete",
-        "2026-06-21 local candidate boundary check converted all 12 Codex live observation signals to candidate-only decisions with action_file_allowed false and direct promotion false",
+        "bash install.sh --platform codex --status covers addon-registry ok, autopilot-mode skill/adapter content_hash-match, and overall ok",
+        "installed-copy smoke covers ~/.agents/skills/autopilot-mode/scripts/autopilot_session_bridge.py writing approved run state and ~/.agents/skills/autopilot-mode/adapters/autopilot_mode.py emitting a continuation payload",
+        "fresh install E2E covers default install/status, Codex status, installed adapter smoke, Claude lifecycle uninstall, and overall uninstall cleanup",
+        "scripts/live_semantic_e2e.py --runtime both --scenario-source intent --execute --jsonl --timeout-sec 180 produces Codex inference_status=ok, semantic_status=parsed, and hook_status=complete",
+        "candidate-boundary check keeps Codex live observation signals candidate-only with action_file_allowed false and direct promotion false",
         "tests/test_autopilot_session_bridge.py verifies --platform codex bridges current-session.json, intent-state.json, and intent-events.jsonl into approval-gated .autopilot run state"
       ],
       "next_evidence_required": []

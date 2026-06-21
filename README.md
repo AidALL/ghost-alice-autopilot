@@ -111,7 +111,7 @@ Do not install this addon with Ghost-ALICE core older than 0.1.3. Older core ins
 
 ## Compatibility Matrix
 
-The compatibility SSOT is `compatibility-matrix.json`. It must be checked before making a full compatibility claim.
+The compatibility SSOT is `compatibility-matrix.json`. It must be checked before making a full compatibility claim. The matrix records the current support posture, not a chronological test log; dated run artifacts belong in CI/test reports or release notes.
 
 Current target status:
 
@@ -127,6 +127,9 @@ Any `not-run` target blocks a full compatibility claim until runner evidence is 
 Linux and Windows runner targets still block a full compatibility claim.
 
 ## Install
+
+Run these commands from a Ghost-ALICE core checkout. This addon repository does
+not provide a standalone root `install.sh`.
 
 Default install to detected Claude Code/Codex targets:
 
@@ -207,22 +210,6 @@ Implement the first approved demo unit.
 ```
 
 The next stop event consumes promoted `.autopilot/consistency-decision.json`. `continue_next` completes the running item only with passing completion evidence: a `sha256:<64-hex>` `completion_check_digest` and evidence text containing `[completion-check]`, `acceptance-criteria`, and `claim-evidence-map` entries that reference known acceptance-criteria criterion ids. `retry_same_unit` queues the same item again only with concrete evidence. `reopen_micro`, `reopen_meso`, and `reopen_macro` keep the same item open and surface the requested focus layer in the next continuation message. If a running item has no decision file at the next stop, the adapter resumes that same item with `pending-decision: missing`; a repeated missing decision escalates to `ask_user_meta` only when neither io-trace nor work state can resolve the next action.
-
-## Demo Video
-
-Recommended video flow:
-
-1. Install from a local checkout or Git URL.
-2. Create `.autopilot/approved-run.json`.
-3. Create `.autopilot/tasks.jsonl`.
-4. End an agent turn and show the `[autopilot]` continuation message.
-5. Run per-addon uninstall and show the adapter hook is gone.
-
-Add the final asset here when recorded:
-
-```text
-docs/demo/autopilot-mode.mp4
-```
 
 ## Pause, Resume, Stop
 

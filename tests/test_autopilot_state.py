@@ -113,7 +113,7 @@ def _write_io_trace(home: Path, session_id: str, *, command: str = "pytest tests
     path = home / ".ghost-alice" / "io-trace.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)
     row = {
-        "ts": "2026-06-21T00:00:00Z",
+        "ts": "fixture-timestamp",
         "session": session_id,
         "tool": "Bash",
         "path": "n/a",

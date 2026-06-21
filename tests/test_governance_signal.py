@@ -621,7 +621,7 @@ class GovernanceSignalTest(unittest.TestCase):
         candidate = module.conduct_plan_candidate_from_governance(
             intent_state=_intent_state_with_conduct_feedback(occurrence_count=3),
             current_work_item_id="work-1",
-            plan_path=".tmp/implementation-plans/2026-06-21-autopilot-behavior-upgrade.md",
+            plan_path=".tmp/implementation-plans/autopilot-behavior-upgrade.md",
         )
 
         self.assertEqual(candidate["schema_version"], "autopilot-conduct-plan-candidate.v1")
@@ -635,7 +635,7 @@ class GovernanceSignalTest(unittest.TestCase):
         self.assertIs(proposal["observer_agent_required"], True)
         self.assertEqual(proposal["observer_contract"]["mode"], "read_only")
         self.assertIn(
-            ".tmp/implementation-plans/2026-06-21-autopilot-behavior-upgrade.md",
+            ".tmp/implementation-plans/autopilot-behavior-upgrade.md",
             proposal["task_template"]["allowed_surface"],
         )
 
@@ -644,7 +644,7 @@ class GovernanceSignalTest(unittest.TestCase):
         candidate = module.conduct_plan_candidate_from_governance(
             intent_state=_intent_state_with_conduct_feedback(occurrence_count=3),
             current_work_item_id="work-1",
-            plan_path=".tmp/implementation-plans/2026-06-21-autopilot-behavior-upgrade.md",
+            plan_path=".tmp/implementation-plans/autopilot-behavior-upgrade.md",
         )
 
         approved = module.promote_conduct_plan_candidate(

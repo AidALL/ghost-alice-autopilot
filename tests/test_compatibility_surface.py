@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 import unittest
 from pathlib import Path
@@ -20,9 +21,25 @@ REQUIRED_TARGETS = {
     "agent-platform-codex",
 }
 ALLOWED_STATUSES = {"verified-local", "simulated-local", "not-run"}
+TRACKED_BINARY_EXCLUSIONS = {
+    "logo/logo_inward_fade.png",
+    "logo/logo_outward_fade.png",
+}
 RELEASE_PACKAGE_FILES = (
+    ".github/workflows/ci.yml",
+    ".gitignore",
+    "LICENSE",
+    "NOTICE",
+    "README.md",
+    "README_ko.md",
+    "VERSION",
+    "addons-manifest.json",
+    "addons/autopilot-mode/addon.json",
+    "addons/autopilot-mode/skill/SKILL.md",
+    "addons/autopilot-mode/skill/adapters/autopilot_mode.py",
     "compatibility-matrix.json",
     "addons/autopilot-mode/skill/adapters/autopilot_messages.py",
+    "addons/autopilot-mode/skill/adapters/autopilot_state.py",
     "addons/autopilot-mode/skill/adapters/autopilot_work_items.py",
     "addons/autopilot-mode/skill/scripts/autopilot_governance_signal.py",
     "addons/autopilot-mode/skill/scripts/autopilot_session_bridge.py",
@@ -31,9 +48,11 @@ RELEASE_PACKAGE_FILES = (
     "scripts/fresh_install_e2e.py",
     "scripts/live_semantic_e2e.py",
     "tests/test_autopilot_session_bridge.py",
-    "tests/test_fresh_install_e2e_harness.py",
+    "tests/test_autopilot_state.py",
+    "tests/test_compatibility_surface.py",
     "tests/test_governance_signal.py",
     "tests/test_live_semantic_e2e_harness.py",
+    "tests/test_privileged_adapter.py",
 )
 
 
@@ -41,8 +60,32 @@ def _compatibility_matrix() -> dict:
     return json.loads(MATRIX_PATH.read_text(encoding="utf-8"))
 
 
+def _matrix_evidence(matrix: dict) -> list[str]:
+    return [
+        evidence
+        for target in matrix["targets"]
+        for evidence in target.get("evidence", [])
+    ]
+
+
+def _tracked_release_surface() -> list[str]:
+    result = subprocess.run(
+        ["git", "ls-files"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    return sorted(
+        rel
+        for rel in result.stdout.splitlines()
+        if rel not in TRACKED_BINARY_EXCLUSIONS and (REPO_ROOT / rel).is_file()
+    )
+
+
 class CompatibilitySurfaceTest(unittest.TestCase):
     def test_release_package_files_are_in_git_index(self) -> None:
+        self.assertEqual(sorted(RELEASE_PACKAGE_FILES), _tracked_release_surface())
         for rel in RELEASE_PACKAGE_FILES:
             with self.subTest(rel=rel):
                 self.assertTrue((REPO_ROOT / rel).is_file())
@@ -58,6 +101,10 @@ class CompatibilitySurfaceTest(unittest.TestCase):
     def test_compatibility_matrix_enumerates_required_targets(self) -> None:
         matrix = _compatibility_matrix()
         self.assertEqual(matrix["schema_version"], "autopilot-compatibility-matrix.v1")
+        self.assertEqual(
+            matrix["evidence_policy"],
+            "Evidence entries describe the current support contract. Historical run timestamps belong in external test logs, CI artifacts, or release notes, not in this matrix.",
+        )
         targets = matrix["targets"]
         target_ids = [target["id"] for target in targets]
 
@@ -79,6 +126,25 @@ class CompatibilitySurfaceTest(unittest.TestCase):
                 else:
                     self.assertIs(target["full_compatibility_blocker"], False)
 
+    def test_matrix_evidence_is_not_a_dated_test_run_log(self) -> None:
+        matrix = _compatibility_matrix()
+        dated_run_pattern = re.compile(r"\b20\d{2}-\d{2}-\d{2}\b|\bKST\b")
+
+        for evidence in _matrix_evidence(matrix):
+            with self.subTest(evidence=evidence):
+                self.assertIsNone(dated_run_pattern.search(evidence))
+
+    def test_claude_live_semantic_gap_stays_next_evidence_not_stale_evidence(self) -> None:
+        matrix = _compatibility_matrix()
+        by_id = {target["id"]: target for target in matrix["targets"]}
+        claude = by_id["agent-platform-claude"]
+
+        self.assertEqual(claude["status"], "simulated-local")
+        self.assertIn("Claude live semantic E2E", " ".join(claude["next_evidence_required"]))
+        evidence = "\n".join(claude["evidence"])
+        self.assertNotIn("api_error_status", evidence)
+        self.assertNotIn("401", evidence)
+
     def test_public_docs_surface_unverified_compatibility_targets(self) -> None:
         required_phrases = (
             "compatibility-matrix.json",
@@ -93,6 +159,17 @@ class CompatibilitySurfaceTest(unittest.TestCase):
             for phrase in required_phrases:
                 with self.subTest(rel=rel, phrase=phrase):
                     self.assertIn(phrase, text)
+
+    def test_docs_explain_matrix_is_not_a_dated_test_log(self) -> None:
+        expected = {
+            "README.md": "not a chronological test log",
+            "README_ko.md": "시간순 테스트 로그가 아니다",
+            "addons/autopilot-mode/skill/SKILL.md": "not historical dated run prose",
+        }
+        for rel, phrase in expected.items():
+            text = (REPO_ROOT / rel).read_text(encoding="utf-8")
+            with self.subTest(rel=rel):
+                self.assertIn(phrase, text)
 
     def test_user_facing_install_docs_do_not_reference_deleted_p6_branches(self) -> None:
         stale_refs = ("p6-privileged-adapter", "p6-autopilot")
@@ -119,6 +196,23 @@ class CompatibilitySurfaceTest(unittest.TestCase):
             with self.subTest(rel=rel):
                 self.assertIn("bash install.sh --addon autopilot", text)
                 self.assertNotIn("--addon-source https://github.com/AidALL/ghost-alice-autopilot.git", text)
+
+    def test_install_docs_state_commands_run_from_core_checkout(self) -> None:
+        expected = {
+            "README.md": "from a Ghost-ALICE core checkout",
+            "README_ko.md": "Ghost-ALICE core checkout에서 실행한다",
+            "addons/autopilot-mode/skill/SKILL.md": "from a Ghost-ALICE core checkout",
+        }
+        for rel, phrase in expected.items():
+            text = (REPO_ROOT / rel).read_text(encoding="utf-8")
+            with self.subTest(rel=rel):
+                self.assertIn(phrase, text)
+
+    def test_docs_do_not_reference_missing_demo_asset_placeholder(self) -> None:
+        for rel in ("README.md", "README_ko.md"):
+            text = (REPO_ROOT / rel).read_text(encoding="utf-8")
+            with self.subTest(rel=rel):
+                self.assertNotIn("docs/demo/autopilot-mode.mp4", text)
 
     def test_install_docs_keep_codex_as_first_class_target(self) -> None:
         for rel in ("README.md", "README_ko.md", "addons/autopilot-mode/skill/SKILL.md"):

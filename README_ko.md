@@ -110,7 +110,7 @@ Ghost-ALICE core 0.1.3 미만에는 이 애드온을 설치하지 않는다. 오
 
 ## Compatibility Matrix
 
-호환성 SSOT는 `compatibility-matrix.json`이다. full compatibility claim을 하기 전 반드시 이 파일을 확인한다.
+호환성 SSOT는 `compatibility-matrix.json`이다. full compatibility claim을 하기 전 반드시 이 파일을 확인한다. 이 matrix는 현재 지원 상태를 기록하는 표면이지 시간순 테스트 로그가 아니다. 날짜가 붙은 실행 산출물은 CI/test report 또는 release note에 둔다.
 
 현재 target status:
 
@@ -126,6 +126,9 @@ Ghost-ALICE core 0.1.3 미만에는 이 애드온을 설치하지 않는다. 오
 Linux와 Windows runner target은 아직 full compatibility claim을 차단한다.
 
 ## 설치
+
+이 명령은 Ghost-ALICE core checkout에서 실행한다. 이 addon repository는
+standalone root `install.sh`를 제공하지 않는다.
 
 감지된 Claude Code/Codex 대상에 기본 설치:
 
@@ -206,22 +209,6 @@ Implement the first approved demo unit.
 ```
 
 다음 stop 이벤트는 promoted `.autopilot/consistency-decision.json`을 소비한다. `continue_next`는 `sha256:<64-hex>` `completion_check_digest`와 `[completion-check]`, `acceptance-criteria`, 그리고 known acceptance-criteria criterion id를 참조하는 `claim-evidence-map` entry를 포함한 evidence text가 있을 때만 running item을 완료한다. `retry_same_unit`은 concrete evidence가 있을 때만 같은 item을 다시 queue에 넣는다. `reopen_micro`, `reopen_meso`, `reopen_macro`는 같은 item을 open 상태로 유지하고 다음 continuation message에 요청된 focus layer를 표면화한다. running item에 decision file이 없으면 adapter는 silent no-op 대신 `pending-decision: missing`으로 같은 item을 재개하고, repeated missing decision은 io-trace와 work state 어느 쪽으로도 next action을 resolved할 수 없을 때만 `ask_user_meta`로 escalate한다.
-
-## 동작 영상 예시
-
-권장 영상 흐름:
-
-1. 로컬 checkout 또는 Git URL에서 설치한다.
-2. `.autopilot/approved-run.json`을 만든다.
-3. `.autopilot/tasks.jsonl`을 만든다.
-4. 에이전트 턴을 끝내고 `[autopilot]` continuation message를 보여준다.
-5. per-addon uninstall을 실행하고 adapter hook이 제거된 상태를 보여준다.
-
-녹화 후 아래 위치에 asset을 추가한다.
-
-```text
-docs/demo/autopilot-mode.mp4
-```
 
 ## 일시정지, 재개, 중지
 

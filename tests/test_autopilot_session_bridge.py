@@ -159,7 +159,7 @@ class AutopilotSessionBridgeTest(unittest.TestCase):
             intent_root = root / "session-intent"
             state_path = _write_current_session_ledger(intent_root)
             run_dir = root / ".autopilot"
-            plan_path = ".tmp/implementation-plans/2026-06-21-local-autopilot-semantic-e2e-test-plan.md"
+            plan_path = ".tmp/implementation-plans/local-autopilot-semantic-e2e-test-plan.md"
 
             result = subprocess.run(
                 [
