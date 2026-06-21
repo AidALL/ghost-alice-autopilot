@@ -1,5 +1,9 @@
 # ghost-alice-autopilot
 
+<p align="center">
+  <img src="./logo/logo_inward_fade.png" alt="Ghost-ALICE Autopilot logo" width="360">
+</p>
+
 승인된 자율 연속 실행을 위한 공식 Ghost-ALICE 애드온.
 
 Language: [English](./README.md) | Korean

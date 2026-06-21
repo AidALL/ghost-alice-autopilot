@@ -1,5 +1,9 @@
 # ghost-alice-autopilot
 
+<p align="center">
+  <img src="./logo/logo_inward_fade.png" alt="Ghost-ALICE Autopilot logo" width="360">
+</p>
+
 Official Ghost-ALICE addon for approved autonomous continuation.
 
 Language: English | [Korean](./README_ko.md)
