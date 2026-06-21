@@ -8,32 +8,36 @@ Official Ghost-ALICE addon for approved autonomous continuation.
 
 Language: English | [Korean](./README_ko.md)
 
-`autopilot-mode` lets Ghost-ALICE continue an approved run one work item at a time. After an agent stop event, it reads the project's `.autopilot/` state, chooses the next ready item, marks that item as running, and emits the next continuation message.
+`autopilot-mode` lets Ghost-ALICE continue an approved run one work item at a time. After an agent stop event, it reads the project's `.autopilot/` state, chooses the next ready or reopened item, resumes an unresolved running item when current io-trace material exists, and emits the next continuation message.
 
 ## What This Addon Does
 
 - Installs the `autopilot-mode` skill.
 - Registers the core-owned `[adapter:autopilot-mode] continue` hook through the Ghost-ALICE installer.
-- Provides `scripts/autopilot_start_run.py` to write approved run state from a user-approved GO spec.
-- Provides `scripts/autopilot_consistency_decision.py` to convert completion-check output into the next run decision.
 - Reads project-local run state from `.autopilot/`.
+- Provides `skill/scripts/autopilot_session_bridge.py` plus the repository wrapper `scripts/autopilot_session_bridge.py` to bootstrap `.autopilot/` from session-intent ledger files after explicit approval.
+- Lets the Stop adapter materialize current-session `.autopilot/` state from session-intent plus io-trace or open conduct feedback without adding a separate receptor.
+- Provides `autopilot_governance_signal.py` for evidence-backed governance candidates and promotion.
+- Imports approved `conduct-plan.json` proposal queues into durable `tasks.jsonl` work items.
 - Emits either a no-op payload or a next-work-item message.
 - Records adapter events in `.autopilot/events.jsonl`.
 
-It does not decide that a run should start. Session intent analysis, task routing, and the user's explicit GO decision create the approved run state.
+It does not invent work outside the current session. Session intent analysis, task routing, the user's explicit GO decision, and current-session runtime material create the approved run state.
 
 ## How It Works
 
 Runtime loop:
 
 1. The Ghost-ALICE core installer installs this addon and wires the privileged adapter hook.
-2. After session intent and task routing identify an explicit user GO decision, `autopilot_start_run.py` writes `.autopilot/approved-run.json` and `.autopilot/tasks.jsonl`.
+2. A project creates `.autopilot/approved-run.json` and `.autopilot/tasks.jsonl` after user approval. A conduct-feedback run can instead provide an approved `.autopilot/conduct-plan.json`. The package bridge `skill/scripts/autopilot_session_bridge.py` or repository wrapper `scripts/autopilot_session_bridge.py` can create that run state from `current-session.json`, `intent-state.json`, and `intent-events.jsonl` when the caller supplies explicit approval evidence. The Stop adapter can also materialize the current session when session-intent plus io-trace or open conduct feedback provide runtime material.
 3. When the agent stops, the adapter reads `.autopilot/`.
-4. If the run is approved, running, within budget, and has a ready task, the adapter marks that task `running`.
-5. The adapter prints a continuation payload with the next work item.
-6. After a work item produces completion-check output, `autopilot_consistency_decision.py` writes `.autopilot/consistency-decision.json`.
-7. On the next stop event, the adapter applies that decision before selecting another ready item.
-8. If the run is not approved, paused, stopped, out of budget, or has no ready item, the adapter returns a no-op payload.
+4. Governance signals first write `consistency-decision.candidate.json` or `conduct-plan.candidate.json`; those candidate files are not adapter-consumable.
+5. Only promotion creates adapter-consumable `consistency-decision.json` or approved `conduct-plan.json`.
+6. If `conduct-plan.json` exists, the adapter imports new proposed queue items into `tasks.jsonl` before checking for a ready task.
+7. If the run is approved, running, within budget, and has a ready or reopened task, the adapter marks that task `running`.
+8. If a running task is missing a promoted decision but current io-trace exists, the adapter feeds io-trace through `autopilot-observation-signal.v1` and resumes the same task.
+9. The adapter prints a continuation payload with the next work item and a `before-stop` instruction to write or promote `.autopilot/consistency-decision.json` when a decision is resolved.
+10. If the run is not approved, paused, stopped, out of budget, or has no runnable item or runtime material, the adapter returns a no-op payload.
 
 Default run directory:
 
@@ -41,10 +45,60 @@ Default run directory:
 <project>/.autopilot/
   approved-run.json
   tasks.jsonl
+  conduct-plan.candidate.json
+  conduct-plan.json
+  conduct-plan.applied.json
+  consistency-decision.candidate.json
   consistency-decision.json
   consistency-decision.applied.json
   events.jsonl
   OFF
+```
+
+## Governance Candidates And Promotion
+
+`addons/autopilot-mode/skill/scripts/autopilot_governance_signal.py` converts session intent, conduct feedback, routing-surface corrections, and completion validation failures into evidence-backed candidate files. A candidate file is diagnostic only:
+
+- `consistency-decision.candidate.json` uses `schema_version: "autopilot-consistency-decision-candidate.v1"`, `promotion_state: "candidate"`, and `action_file_allowed: false`.
+- `conduct-plan.candidate.json` uses `schema_version: "autopilot-conduct-plan-candidate.v1"`, `promotion_state: "candidate"`, and `action_file_allowed: false`.
+- The adapter rejects candidate schemas even if a candidate is accidentally placed at an adapter-consumable path.
+
+Promotion is the boundary that creates adapter-consumable files. `promote-decision` writes a promoted `consistency-decision.json` with `schema_version: "autopilot-consistency-decision.v1"`, `promotion_state: "promoted"`, promotion evidence, candidate id, evidence digest, state hash, decision key, and loop key. `promote-conduct-plan` writes an approved `conduct-plan.json` with `promotion_state: "approved"`, approval evidence, source candidate id, and evidence digest.
+
+The promotion command can read `.autopilot/tasks.jsonl` and `.autopilot/events.jsonl` with `--run-dir` so retry caps and repeated decision/state loops escalate to `ask_user_meta` instead of looping.
+
+## Session-Intent Bridge
+
+Installation alone does not create `.autopilot/`. To activate an approved run
+from the current Ghost-ALICE session ledger, use the package bridge
+`skill/scripts/autopilot_session_bridge.py` or the repository wrapper
+`scripts/autopilot_session_bridge.py`. The bridge reads
+`.tmp/session-intent/<platform>/current-session.json`, the pointed
+`intent-state.json`, and sibling `intent-events.jsonl`, then writes
+`.autopilot/approved-run.json` plus either a promoted `conduct-plan.json` or a
+ready `tasks.jsonl` item.
+
+The bridge supports `--platform codex` and `--platform claude`. It refuses to
+write run state unless `--approval-evidence-json` contains an approval decision
+(`GO`, `approve`, or `approved`) and a non-empty `source`, and it preserves
+session event metadata in `approved-run.json` approval evidence.
+
+The Stop adapter has a separate automatic current-session path. When the
+project has no `.autopilot/` run state but the session ledger points at current
+work and io-trace or open conduct feedback exists, the adapter writes
+`approval_evidence.decision: "AUTO"` and routes io-trace through the existing
+`autopilot-observation-signal.v1` receptor in
+`autopilot_governance_signal.py`. Observation candidates stay diagnostic and
+are not promoted into adapter-consumable action files.
+
+```bash
+/opt/homebrew/bin/python3 scripts/autopilot_session_bridge.py \
+  --intent-root <ghost-alice>/.tmp/session-intent \
+  --platform codex \
+  --run-dir .autopilot \
+  --current-work-item-id current \
+  --plan-path .tmp/implementation-plans/current.md \
+  --approval-evidence-json '{"decision":"GO","source":"user-confirmation"}'
 ```
 
 ## Requirements
@@ -55,15 +109,32 @@ Default run directory:
 
 Do not install this addon with Ghost-ALICE core older than 0.1.3. Older core installers may copy the skill without wiring the privileged adapter; that install is inert and should be removed before upgrading.
 
+## Compatibility Matrix
+
+The compatibility SSOT is `compatibility-matrix.json`. It must be checked before making a full compatibility claim.
+
+Current target status:
+
+- macOS: `verified-local` with local unit tests and adapter subprocess simulation.
+- Claude Code: `simulated-local` with temporary hook install and removal tests.
+- Linux: `not-run`.
+- Windows Command Prompt: `not-run`.
+- Windows PowerShell 5: `not-run`.
+- Windows PowerShell 7: `not-run`.
+- Codex: `verified-local` with local install status, Codex live semantic E2E, and candidate-boundary checks.
+
+Any `not-run` target blocks a full compatibility claim until runner evidence is attached to the matrix.
+Linux and Windows runner targets still block a full compatibility claim.
+
 ## Install
 
-From a Ghost-ALICE core checkout:
+Default install to detected Claude Code/Codex targets:
 
 ```bash
 bash install.sh --addon autopilot
 ```
 
-The core installer detects Claude Code/Codex targets by default. To install only one target, add `--platform`:
+Install only to Codex:
 
 ```bash
 bash install.sh --platform codex --addon autopilot
@@ -81,33 +152,29 @@ Check install status:
 bash <ghost-alice>/install.sh --platform codex --status
 ```
 
-Use `--platform claude` for Claude Code status.
-
 ## Try It
 
 From a project directory, create an approved run:
 
 ```bash
-python3 /path/to/ghost-alice-autopilot/addons/autopilot-mode/skill/scripts/autopilot_start_run.py <<'JSON'
+mkdir -p .autopilot
+cat > .autopilot/approved-run.json <<'JSON'
 {
+  "schema_version": "autopilot-run.v1",
   "run_id": "demo-run",
+  "approved": true,
+  "status": "running",
   "scope": {"summary": "Demo autopilot continuation"},
   "budget": {"remaining_steps": 2},
   "allowed_surfaces": ["src/...", "tests/..."],
   "stop_conditions": ["budget_exhausted", "user_stop"],
-  "approval_evidence": {"decision": "GO", "source": "user-confirmation"},
-  "tasks": [
-    {
-      "id": "unit-1",
-      "focus_layer": "micro",
-      "depends_on": [],
-      "prompt": "Implement the first approved demo unit.",
-      "acceptance_criteria": ["the next continuation message names unit-1"],
-      "allowed_surface": ["src/..."]
-    }
-  ]
+  "approval_evidence": {"decision": "GO", "source": "user-confirmation"}
 }
 JSON
+
+cat > .autopilot/tasks.jsonl <<'JSONL'
+{"id":"unit-1","status":"ready","focus_layer":"micro","depends_on":[],"prompt":"Implement the first approved demo unit.","acceptance_criteria":["the next continuation message names unit-1"],"allowed_surface":["src/..."],"completion":{"state":"not_started","verdict":null,"evidence":[],"completion_check_digest":null,"reopen_target":null},"attempt":0}
+JSONL
 ```
 
 After the next agent stop event, the adapter should emit a continuation message shaped like this:
@@ -117,21 +184,37 @@ After the next agent stop event, the adapter should emit a continuation message 
 run: demo-run
 work-item: unit-1
 focus-layer: micro
+io-trace:
+- Bash n/a apply_patch current work
+governance-signal:
+- candidate: candidate-<digest>
+- decision: reopen_micro
+- source: observation_signal
+governance-evidence:
+- observation_next_action:continue from latest io-trace
 allowed-surface:
 - src/...
 acceptance-criteria:
 - the next continuation message names unit-1
+before-stop:
+- continue from the latest io-trace when no promoted consistency decision exists.
+- write .autopilot/consistency-decision.json when a completion/retry/reopen decision is resolved.
+- use continue_next only after [completion-check] with verdict pass, sha256 completion_check_digest, acceptance-criteria, and criterion-bound claim-evidence-map evidence.
+- use retry_same_unit or reopen_micro/reopen_meso/reopen_macro when verification fails or drift remains.
+- use ask_user_meta only when neither io-trace nor work state can resolve the next action.
 prompt:
 Implement the first approved demo unit.
 ```
+
+The next stop event consumes promoted `.autopilot/consistency-decision.json`. `continue_next` completes the running item only with passing completion evidence: a `sha256:<64-hex>` `completion_check_digest` and evidence text containing `[completion-check]`, `acceptance-criteria`, and `claim-evidence-map` entries that reference known acceptance-criteria criterion ids. `retry_same_unit` queues the same item again only with concrete evidence. `reopen_micro`, `reopen_meso`, and `reopen_macro` keep the same item open and surface the requested focus layer in the next continuation message. If a running item has no decision file at the next stop, the adapter resumes that same item with `pending-decision: missing`; a repeated missing decision escalates to `ask_user_meta` only when neither io-trace nor work state can resolve the next action.
 
 ## Demo Video
 
 Recommended video flow:
 
 1. Install from a local checkout or Git URL.
-2. Run `autopilot_start_run.py` with an explicit GO spec.
-3. Show the generated `.autopilot/approved-run.json` and `.autopilot/tasks.jsonl`.
+2. Create `.autopilot/approved-run.json`.
+3. Create `.autopilot/tasks.jsonl`.
 4. End an agent turn and show the `[autopilot]` continuation message.
 5. Run per-addon uninstall and show the adapter hook is gone.
 
@@ -167,10 +250,12 @@ Stop by doing any one of these:
 Remove only this addon:
 
 ```bash
-bash <ghost-alice>/install.sh --platform codex --uninstall --addon autopilot-mode
+bash <ghost-alice>/install.sh \
+  --platform codex \
+  --uninstall --addon autopilot-mode
 ```
 
-Use `--platform claude` for Claude Code.
+Use `--platform claude` for Claude Code. Uninstall is driven by the installed addon id and sidecar, not by `--addon-source`.
 
 Full Ghost-ALICE uninstall still uses the core full-uninstall path:
 
@@ -182,7 +267,13 @@ bash <ghost-alice>/install.sh --uninstall
 
 - Installing the addon is not runtime activation.
 - The adapter accepts no arguments.
-- The adapter only reads `.autopilot/` state and emits a continuation payload.
+- The adapter mutates only project-local `.autopilot/` run-state files and emits a continuation payload.
+- The continuation payload contains a `before-stop` contract so an executing agent leaves a promoted `.autopilot/consistency-decision.json` before it stops.
+- Candidate files such as `consistency-decision.candidate.json` and `conduct-plan.candidate.json` are not adapter-consumable.
+- `conduct-plan.json` uses `schema_version: "autopilot-conduct-plan.v2"` and must carry `promotion_state: "approved"`, `approval_evidence`, source candidate id, and evidence digest.
+- Conduct plan proposals must keep `proposal_status: "proposed"`, `approval_required: true`, and an approval transition that copies `task_template` as `ready`.
+- Imported proposals preserve `observer_agent_required` and `observer_contract`, and the continuation message surfaces the read-only observer requirement.
+- Existing task ids are skipped so conduct plan import is idempotent.
 - Tool denial, installer policy, privileged adapter allowlists, hook markers, runner namespaces, and hook install/remove behavior are owned by Ghost-ALICE core.
 - This addon package owns the skill content and adapter implementation.
 
@@ -190,15 +281,19 @@ bash <ghost-alice>/install.sh --uninstall
 
 ```text
 addons-manifest.json
+compatibility-matrix.json
 addons/autopilot-mode/
   addon.json
   skill/SKILL.md
+  skill/adapters/autopilot_messages.py
   skill/adapters/autopilot_mode.py
   skill/adapters/autopilot_state.py
-  skill/scripts/autopilot_start_run.py
-  skill/scripts/autopilot_consistency_decision.py
-  skill/scripts/autopilot_dogfood_runner.py
+  skill/adapters/autopilot_work_items.py
+  skill/scripts/autopilot_governance_signal.py
+  skill/scripts/autopilot_session_bridge.py
+  skill/scripts/autopilot_session_material.py
 tests/
+scripts/autopilot_session_bridge.py
 ```
 
 ## License

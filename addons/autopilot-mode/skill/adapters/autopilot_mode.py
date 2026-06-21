@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Thin privileged adapter for the official autopilot-mode addon."""
+"""Thin privileged adapter for the official autopilot-mode addon.
+
+Dependencies: Python 3.11+ standard library plus sibling adapter modules.
+"""
 
 from __future__ import annotations
 
@@ -55,6 +58,8 @@ def _env_with_hook_cwd(hook_input: dict) -> dict[str, str]:
     cwd = hook_input.get("cwd")
     if isinstance(cwd, str) and cwd.strip():
         env["GHOST_ALICE_AUTOPILOT_CWD"] = cwd
+    else:
+        env["GHOST_ALICE_AUTOPILOT_CWD"] = str(Path.cwd())
     return env
 
 

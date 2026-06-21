@@ -22,6 +22,7 @@ import autopilot_state as aps  # noqa: E402
 
 
 AUTOPILOT_SOURCE = REPO_ROOT
+VALID_SIGNAL_DIGEST = "sha256:" + ("b" * 64)
 
 
 def _candidate_core_repos() -> list[Path]:
@@ -84,6 +85,61 @@ def _write_approved_run(run_dir: Path, items: list[dict]) -> None:
         encoding="utf-8",
     )
     aps.write_work_items(run_dir / "tasks.jsonl", items)
+
+
+def _write_approved_run_config(run_dir: Path, *, allowed_surfaces: list[str]) -> None:
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "approved-run.json").write_text(
+        json.dumps({
+            "schema_version": "autopilot-run.v1",
+            "run_id": "run-1",
+            "approved": True,
+            "status": "running",
+            "scope": {"summary": "P6 autopilot adapter conduct plan test run"},
+            "budget": {"remaining_steps": 3},
+            "allowed_surfaces": allowed_surfaces,
+            "stop_conditions": ["budget_exhausted", "user_stop"],
+            "approval_evidence": {"decision": "GO", "source": "unit-test"},
+        }),
+        encoding="utf-8",
+    )
+
+
+def _conduct_plan() -> dict:
+    return {
+        "schema_version": "autopilot-conduct-plan.v2",
+        "promotion_state": "approved",
+        "source_candidate_id": "conduct-plan-candidate-test",
+        "evidence_digest": VALID_SIGNAL_DIGEST,
+        "approval_evidence": {"decision": "GO", "source": "unit-test"},
+        "source": "skill-evolution/conduct_feedback",
+        "proposed_queue_items": [
+            {
+                "id": "proposal-conduct-scope-drift",
+                "proposal_status": "proposed",
+                "approval_required": True,
+                "approval_transition": {
+                    "status_on_approval": "ready",
+                    "copy_task_template": True,
+                },
+                "task_template": {
+                    "id": "conduct-scope-drift",
+                    "depends_on": [],
+                    "focus_layer": "meta",
+                    "prompt": "Investigate and propose a fix for repeated scope drift.",
+                    "acceptance_criteria": ["bind drift to conduct feedback"],
+                    "allowed_surface": ["skill-evolution/..."],
+                },
+                "observer_agent_required": True,
+                "observer_contract": {
+                    "mode": "read_only",
+                    "purpose": "watch main-process logical consistency",
+                    "prohibited_actions": ["modify files"],
+                },
+                "source_recommendation_id": "scope-drift",
+            },
+        ],
+    }
 
 
 class OfficialAutopilotAddonTest(unittest.TestCase):
@@ -173,10 +229,11 @@ class OfficialAutopilotAddonTest(unittest.TestCase):
         self.assertIn("work-item: next", payload["systemMessage"])
         self.assertIn("Do next", payload["systemMessage"])
 
-    def test_adapter_script_formats_codex_stop_continuation_payload(self):
+    def test_adapter_script_imports_conduct_plan_before_no_ready_item(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp) / "run"
-            _write_approved_run(run_dir, [_work_item("next")])
+            _write_approved_run_config(run_dir, allowed_surfaces=["skill-evolution/..."])
+            (run_dir / "conduct-plan.json").write_text(json.dumps(_conduct_plan()), encoding="utf-8")
             script = (
                 AUTOPILOT_SOURCE
                 / "addons"
@@ -190,26 +247,122 @@ class OfficialAutopilotAddonTest(unittest.TestCase):
 
             result = subprocess.run(
                 [sys.executable, str(script)],
-                input=json.dumps({
-                    "hook_event_name": "Stop",
-                    "cwd": str(Path(tmp)),
-                    "model": "gpt-5.5",
-                    "permission_mode": "bypassPermissions",
-                }),
                 env=env,
                 capture_output=True,
                 text=True,
                 check=False,
             )
             payload = json.loads(result.stdout)
+            items = aps.read_work_items(run_dir / "tasks.jsonl")
+            applied_plan_exists = (run_dir / "conduct-plan.applied.json").is_file()
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(payload["decision"], "block")
-        self.assertIn("work-item: next", payload["reason"])
-        self.assertEqual(payload["systemMessage"], payload["reason"])
+        self.assertTrue(payload["continue"])
+        self.assertIn("work-item: conduct-scope-drift", payload["systemMessage"])
+        self.assertIn("observer-agent: required", payload["systemMessage"])
+        self.assertEqual(items[0]["status"], "running")
+        self.assertTrue(applied_plan_exists)
 
-    def test_adapter_script_keeps_codex_stop_noop_non_blocking(self):
+    def test_governance_signal_promoted_decision_reopens_running_item(self):
         with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_dir = root / "run"
+            intent_state = root / "intent-state.json"
+            _write_approved_run(run_dir, [_work_item("current")])
+            items = aps.read_work_items(run_dir / "tasks.jsonl")
+            items[0]["status"] = "running"
+            aps.write_work_items(run_dir / "tasks.jsonl", items)
+            intent_state.write_text(
+                json.dumps({
+                    "schema_version": "session-intent-ledger.v1",
+                    "conduct_feedback": [
+                        {
+                            "id": "scope-drift",
+                            "status": "open",
+                            "summary": "agent drifted from approved implementation scope",
+                            "corrective_rule": "reopen macro focus before continuing",
+                            "occurrence_count": 2,
+                        }
+                    ],
+                }),
+                encoding="utf-8",
+            )
+            governance_script = (
+                AUTOPILOT_SOURCE
+                / "addons"
+                / "autopilot-mode"
+                / "skill"
+                / "scripts"
+                / "autopilot_governance_signal.py"
+            )
+            adapter_script = (
+                AUTOPILOT_SOURCE
+                / "addons"
+                / "autopilot-mode"
+                / "skill"
+                / "adapters"
+                / "autopilot_mode.py"
+            )
+            candidate_result = subprocess.run(
+                [
+                    sys.executable,
+                    str(governance_script),
+                    "decision-candidate",
+                    "--work-item-id",
+                    "current",
+                    "--intent-state",
+                    str(intent_state),
+                    "--out",
+                    str(run_dir / "consistency-decision.candidate.json"),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            promote_result = subprocess.run(
+                [
+                    sys.executable,
+                    str(governance_script),
+                    "promote-decision",
+                    "--candidate",
+                    str(run_dir / "consistency-decision.candidate.json"),
+                    "--out",
+                    str(run_dir / "consistency-decision.json"),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            env = os.environ.copy()
+            env["GHOST_ALICE_AUTOPILOT_RUN_DIR"] = str(run_dir)
+            adapter_result = subprocess.run(
+                [sys.executable, str(adapter_script)],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            payload = json.loads(adapter_result.stdout)
+            items = aps.read_work_items(run_dir / "tasks.jsonl")
+
+        self.assertEqual(candidate_result.returncode, 0, candidate_result.stderr)
+        self.assertEqual(promote_result.returncode, 0, promote_result.stderr)
+        self.assertEqual(adapter_result.returncode, 0, adapter_result.stderr)
+        self.assertTrue(payload["continue"])
+        self.assertIn("work-item: current", payload["systemMessage"])
+        self.assertIn("reopen-target: macro", payload["systemMessage"])
+        self.assertEqual(items[0]["status"], "running")
+        self.assertEqual(items[0]["completion"]["state"], "reopened")
+        self.assertEqual(items[0]["completion"]["reopen_target"], "macro")
+
+    def test_adapter_script_skips_existing_conduct_plan_task_ids(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run"
+            _write_approved_run_config(run_dir, allowed_surfaces=["skill-evolution/..."])
+            existing = _work_item("conduct-scope-drift")
+            existing["status"] = "running"
+            aps.write_work_items(run_dir / "tasks.jsonl", [existing])
+            (run_dir / "conduct-plan.json").write_text(json.dumps(_conduct_plan()), encoding="utf-8")
             script = (
                 AUTOPILOT_SOURCE
                 / "addons"
@@ -219,27 +372,32 @@ class OfficialAutopilotAddonTest(unittest.TestCase):
                 / "autopilot_mode.py"
             )
             env = os.environ.copy()
-            env["GHOST_ALICE_AUTOPILOT_RUN_DIR"] = str(Path(tmp) / "missing-run")
+            env["GHOST_ALICE_AUTOPILOT_RUN_DIR"] = str(run_dir)
 
             result = subprocess.run(
                 [sys.executable, str(script)],
-                input=json.dumps({
-                    "hook_event_name": "Stop",
-                    "cwd": str(Path(tmp)),
-                    "model": "gpt-5.5",
-                    "permission_mode": "bypassPermissions",
-                }),
                 env=env,
                 capture_output=True,
                 text=True,
                 check=False,
             )
             payload = json.loads(result.stdout)
+            items = aps.read_work_items(run_dir / "tasks.jsonl")
+            events = [
+                json.loads(line)
+                for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            applied_plan_exists = (run_dir / "conduct-plan.applied.json").is_file()
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue(payload["continue"])
-        self.assertNotIn("decision", payload)
-        self.assertEqual(payload["systemMessage"], "")
+        self.assertEqual(payload, {"continue": True, "systemMessage": ""})
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["id"], "conduct-scope-drift")
+        self.assertEqual(items[0]["status"], "running")
+        self.assertNotIn("source_proposal_id", items[0])
+        self.assertTrue(applied_plan_exists)
+        self.assertEqual([event["event"] for event in events], ["conduct_plan_imported", "no_ready_item"])
+        self.assertEqual(events[0]["imported_work_item_ids"], [])
 
     def test_adapter_script_defaults_to_project_autopilot_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -270,43 +428,6 @@ class OfficialAutopilotAddonTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(payload["continue"])
         self.assertIn("work-item: next", payload["systemMessage"])
-
-    def test_adapter_script_uses_stop_hook_cwd_when_runner_cwd_differs(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            project = Path(tmp) / "project"
-            runner_cwd = Path(tmp) / "runner-cwd"
-            run_dir = project / ".autopilot"
-            runner_cwd.mkdir(parents=True)
-            _write_approved_run(run_dir, [_work_item("next")])
-            script = (
-                AUTOPILOT_SOURCE
-                / "addons"
-                / "autopilot-mode"
-                / "skill"
-                / "adapters"
-                / "autopilot_mode.py"
-            )
-            env = os.environ.copy()
-            env.pop("GHOST_ALICE_AUTOPILOT_RUN_DIR", None)
-            env.pop("GHOST_ALICE_AUTOPILOT_CWD", None)
-
-            result = subprocess.run(
-                [sys.executable, str(script)],
-                cwd=runner_cwd,
-                input=json.dumps({
-                    "hook_event_name": "Stop",
-                    "cwd": str(project),
-                }),
-                env=env,
-                capture_output=True,
-                text=True,
-                check=False,
-            )
-            payload = json.loads(result.stdout)
-
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(payload["decision"], "block")
-        self.assertIn("work-item: next", payload["reason"])
 
     def test_adapter_script_rejects_arguments(self):
         script = (

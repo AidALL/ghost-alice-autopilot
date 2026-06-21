@@ -8,4 +8,5 @@ __pycache__/
 *.pyc
 # local runtime state (must never be committed)
 .autopilot/
+.tmp/
 *.bak
