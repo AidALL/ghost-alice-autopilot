@@ -28,6 +28,7 @@ TRACKED_BINARY_EXCLUSIONS = {
 RELEASE_PACKAGE_FILES = (
     ".github/workflows/ci.yml",
     ".gitignore",
+    "CHANGELOG.md",
     "LICENSE",
     "NOTICE",
     "README.md",
@@ -38,6 +39,7 @@ RELEASE_PACKAGE_FILES = (
     "addons/autopilot-mode/skill/SKILL.md",
     "addons/autopilot-mode/skill/adapters/autopilot_mode.py",
     "compatibility-matrix.json",
+    "docs/release/2026-06-22-release-notes.md",
     "addons/autopilot-mode/skill/adapters/autopilot_messages.py",
     "addons/autopilot-mode/skill/adapters/autopilot_state.py",
     "addons/autopilot-mode/skill/adapters/autopilot_work_items.py",
