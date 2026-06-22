@@ -32,6 +32,7 @@ from autopilot_work_items import (
     apply_conduct_plan_proposals,
     apply_consistency_decision,
     derive_ready_queue,
+    materialize_met_criteria_from_continue_next,
     read_work_items,
     rewrite_open_work_items,
     validate_work_items,
@@ -311,18 +312,6 @@ def _governance_candidate_from_iotrace(
     )
 
 
-def _has_open_conduct_feedback(intent_state: Mapping[str, Any]) -> bool:
-    feedback = intent_state.get("conduct_feedback")
-    if not isinstance(feedback, list):
-        return False
-    for raw in feedback:
-        if not isinstance(raw, Mapping):
-            continue
-        if str(raw.get("status") or "open") in {"open", "active"}:
-            return True
-    return False
-
-
 def _valid_approval_evidence(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, Mapping) or not value:
         return None
@@ -365,33 +354,26 @@ def _approval_from_session_decisions(intent_state: Mapping[str, Any]) -> dict[st
     return None
 
 
-def _automatic_material_evidence(
-    source: Mapping[str, str],
-    intent_state: Mapping[str, Any],
-    *,
-    session_id: str,
-) -> dict[str, Any] | None:
-    trace_rows = _read_io_trace_rows(source, session_id=session_id, limit=3)
-    if not trace_rows and not _has_open_conduct_feedback(intent_state):
+def _unmet_admitted_criteria_evidence(intent_state: Mapping[str, Any]) -> dict[str, Any] | None:
+    criteria = intent_state.get("acceptance_criteria")
+    if not isinstance(criteria, list):
         return None
-    evidence: dict[str, Any] = {
+    open_ids = [
+        str(criterion.get("id")).strip()
+        for criterion in criteria
+        if isinstance(criterion, Mapping)
+        and criterion.get("admitted") is True
+        and str(criterion.get("status") or "unmet").lower() != "met"
+        and str(criterion.get("id") or "").strip()
+    ]
+    if not open_ids:
+        return None
+    return {
         "decision": "AUTO",
-        "source": "session-intent-io-trace",
-        "reason": "current session has io-trace or conduct material for automatic continuation",
+        "source": "admitted-unmet-criterion",
+        "reason": "session intent has admitted, not-yet-met acceptance criteria",
+        "open_criteria": open_ids,
     }
-    if trace_rows:
-        evidence["io_trace"] = trace_rows
-        candidate = _governance_candidate_from_iotrace(
-            work_item_id=f"session-intent-{_safe_id(session_id)}",
-            focus_layer="macro",
-            run_id=f"session-intent-{_safe_id(session_id)}",
-            session_id=session_id,
-            rows=trace_rows,
-        )
-        compact_candidate = compact_governance_candidate(candidate)
-        if compact_candidate:
-            evidence["governance_candidate"] = compact_candidate
-    return evidence
 
 
 def _project_cwd_from_env(source: Mapping[str, str]) -> Path:
@@ -504,11 +486,7 @@ def _bootstrap_from_session_intent_if_approved(
         candidate_approval = (
             _approval_from_env(source)
             or _approval_from_session_decisions(intent_state)
-            or _automatic_material_evidence(
-                source,
-                intent_state,
-                session_id=str(candidate["session_id"]),
-            )
+            or _unmet_admitted_criteria_evidence(intent_state)
         )
         if candidate_approval is None:
             continue
@@ -702,6 +680,7 @@ def _apply_pending_decision(
         "work_item_id": item_id,
         "evidence": evidence,
         "decision_id": decision.get("decision_id"),
+        "completion_check_digest": decision.get("completion_check_digest"),
     }
 
 
@@ -835,6 +814,8 @@ def _advance_approved_run_locked(root: Path, source: Mapping[str, str] | None = 
 
     items = read_work_items(tasks_path) if tasks_path.is_file() else []
     items, applied_decision = _apply_pending_decision(root, items)
+    if applied_decision is not None and applied_decision.get("decision") == "continue_next":
+        materialize_met_criteria_from_continue_next(run, applied_decision, source)
     if applied_decision is not None and applied_decision["decision"] == "ask_user_meta":
         return {
             "continue": True,
