@@ -103,11 +103,11 @@ are not promoted into adapter-consumable action files.
 
 ## Requirements
 
-- Ghost-ALICE core 0.1.3 or newer with privileged adapter support.
+- Ghost-ALICE core 0.2.0 or newer with privileged adapter support.
 - Python 3.11+.
 - Claude Code and/or Codex hooks installed by the Ghost-ALICE core installer.
 
-Do not install this addon with Ghost-ALICE core older than 0.1.3. Older core installers may copy the skill without wiring the privileged adapter; that install is inert and should be removed before upgrading.
+Do not install this addon with Ghost-ALICE core older than 0.2.0. Older core installers may copy the skill without wiring the privileged adapter; that install is inert and should be removed before upgrading.
 
 ## Compatibility Matrix
 

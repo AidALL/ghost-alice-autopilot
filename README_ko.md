@@ -102,11 +102,11 @@ adapter-consumable action file로 promote되지 않는다.
 
 ## 요구사항
 
-- privileged adapter를 지원하는 Ghost-ALICE core 0.1.3 이상.
+- privileged adapter를 지원하는 Ghost-ALICE core 0.2.0 이상.
 - Python 3.11+.
 - Ghost-ALICE core installer로 설치된 Claude Code 또는 Codex hook.
 
-Ghost-ALICE core 0.1.3 미만에는 이 애드온을 설치하지 않는다. 오래된 core installer는 skill만 복사하고 privileged adapter를 배선하지 않을 수 있다. 이 설치는 inert 상태이므로 업그레이드 전에 제거한다.
+Ghost-ALICE core 0.2.0 미만에는 이 애드온을 설치하지 않는다. 오래된 core installer는 skill만 복사하고 privileged adapter를 배선하지 않을 수 있다. 이 설치는 inert 상태이므로 업그레이드 전에 제거한다.
 
 ## Compatibility Matrix
 
