@@ -7,6 +7,7 @@ Dependencies: Python 3.11+ standard library only.
 from __future__ import annotations
 
 import copy
+import importlib.util
 import json
 import os
 import re
@@ -370,6 +371,95 @@ def apply_consistency_decision(
             "reopen_target": "meta" if decision == "ask_user_meta" else None,
         })
     return validate_work_items(updated)
+
+
+def _load_core_ledger_module(state_path: Path, source: Mapping[str, str] | None = None):
+    """Resolve and import the core session-intent ledger by path (B.3 hybrid).
+
+    Tries an explicit core root from the environment, then walks up from the
+    ledger state file to find a core repo checkout. Returns None when no core
+    source is reachable (e.g. a data-only installed layout) so the caller can
+    skip the met-flip gracefully instead of crashing.
+    """
+    candidates: list[Path] = []
+    if source is not None:
+        core_root = str(source.get("GHOST_ALICE_CORE_ROOT") or "").strip()
+        if core_root:
+            candidates.append(
+                Path(core_root) / "session-intent-analyzer" / "scripts" / "session_intent_ledger.py"
+            )
+    for parent in Path(state_path).resolve().parents:
+        candidates.append(parent / "session-intent-analyzer" / "scripts" / "session_intent_ledger.py")
+    for candidate in candidates:
+        try:
+            if not candidate.is_file():
+                continue
+            spec = importlib.util.spec_from_file_location(
+                "ghost_alice_session_intent_ledger", candidate
+            )
+            if spec is None or spec.loader is None:
+                continue
+            module = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(module)
+            return module
+        except Exception:
+            continue
+    return None
+
+
+def materialize_met_criteria_from_continue_next(
+    run: Mapping[str, Any],
+    applied_decision: Mapping[str, Any],
+    source: Mapping[str, str] | None = None,
+) -> list[str]:
+    """Flip the satisfied admitted criteria to "met" after a validated continue_next.
+
+    Hybrid B.3: the core ledger owns the write-only "met" invariant; the adapter
+    only calls it, using the same validated completion-check digest that
+    continue_next already required. Any resolution or flip failure is a graceful
+    skip (the criterion stays unmet, so the run keeps going) rather than a crash
+    or a premature stop.
+    """
+    approval = run.get("approval_evidence")
+    if not isinstance(approval, Mapping):
+        return []
+    session_intent = approval.get("session_intent")
+    if not isinstance(session_intent, Mapping):
+        return []
+    state_path_raw = session_intent.get("state_path")
+    if not isinstance(state_path_raw, str) or not state_path_raw:
+        return []
+    raw_digest = str(applied_decision.get("completion_check_digest") or "").strip()
+    if not COMPLETION_CHECK_DIGEST_PATTERN.fullmatch(raw_digest):
+        return []
+    core_digest = raw_digest[len("sha256:"):] if raw_digest.startswith("sha256:") else raw_digest
+    evidence = applied_decision.get("evidence")
+    if not isinstance(evidence, list):
+        return []
+    criterion_ids = _extract_completion_claim_criteria("\n".join(str(line) for line in evidence))
+    if not criterion_ids:
+        return []
+    state_path = Path(state_path_raw)
+    ledger = _load_core_ledger_module(state_path, source)
+    if ledger is None or not hasattr(ledger, "mark_acceptance_criterion_met"):
+        return []
+    intent_root = state_path.parent.parent.parent
+    platform = state_path.parent.parent.name
+    session_id = state_path.parent.name
+    flipped: list[str] = []
+    for criterion_id in criterion_ids:
+        try:
+            ledger.mark_acceptance_criterion_met(
+                root=intent_root,
+                platform=platform,
+                session_id=session_id,
+                criterion_id=criterion_id,
+                completion_check_digest=core_digest,
+            )
+            flipped.append(criterion_id)
+        except Exception:
+            continue
+    return flipped
 
 
 def rewrite_open_work_items(

@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 import tempfile
 import threading
@@ -40,6 +41,22 @@ VALID_COMPLETION_EVIDENCE = [
     ])
 ]
 VALID_PROMOTION_EVIDENCE = {"decision": "PROMOTE", "source": "unit-test"}
+
+
+def _locate_core_ledger_source() -> Path | None:
+    candidates = []
+    env_root = os.environ.get("GHOST_ALICE_CORE_ROOT")
+    if env_root:
+        candidates.append(
+            Path(env_root) / "session-intent-analyzer" / "scripts" / "session_intent_ledger.py"
+        )
+    candidates.append(
+        REPO_ROOT.parent / "ghost-alice" / "session-intent-analyzer" / "scripts" / "session_intent_ledger.py"
+    )
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 def _item(item_id: str, *, status: str = "ready", depends_on: list[str] | None = None) -> dict:
@@ -130,6 +147,7 @@ def _write_session_intent_run_source(
     decision_approval: bool = False,
     repeated_conduct_feedback: bool = False,
     rich_event_metadata: bool = False,
+    criteria: list[dict] | None = None,
 ) -> Path:
     session_dir = root / "codex" / session_id
     session_dir.mkdir(parents=True)
@@ -140,11 +158,13 @@ def _write_session_intent_run_source(
         "session_id": session_id,
         "current_goal": "Use the current correction flow as autopilot work material.",
         "user_intent_summary": "Bridge session-intent JSON and JSONL into project-local autopilot continuation.",
-        "acceptance_criteria": [
+        "acceptance_criteria": criteria if criteria is not None else [
             {
                 "id": "AC-STOP-BRIDGE",
                 "summary": "Stop adapter bootstraps .autopilot before returning a continuation payload.",
                 "source": "user-explicit",
+                "status": "unmet",
+                "admitted": True,
             }
         ],
         "decisions": [],
@@ -553,7 +573,11 @@ class AutopilotStateTest(unittest.TestCase):
             project = root / "ghost-alice-autopilot"
             project.mkdir()
             local_intent_root = project / ".tmp" / "session-intent"
-            _write_session_intent_run_source(local_intent_root, session_id="stale-local")
+            _write_session_intent_run_source(
+                local_intent_root,
+                session_id="stale-local",
+                criteria=[{"id": "AC1", "summary": "already done", "source": "user-explicit", "status": "met", "admitted": True}],
+            )
             sibling_intent_root = root / "ghost-alice" / ".tmp" / "session-intent"
             _write_session_intent_run_source(sibling_intent_root, decision_approval=True)
 
@@ -566,15 +590,23 @@ class AutopilotStateTest(unittest.TestCase):
 
         self.assertTrue(payload["continue"])
         self.assertIn("work-item: session-intent-session-1", payload["systemMessage"])
-        self.assertIn("/ghost-alice/.tmp/session-intent/", approved_run["approval_evidence"]["session_intent"]["state_path"])
+        self.assertIn(
+            "/ghost-alice/.tmp/session-intent/",
+            approved_run["approval_evidence"]["session_intent"]["state_path"].replace("\\", "/"),
+        )
 
-    def test_adapter_bootstraps_project_run_from_session_intent_iotrace_without_manual_approval(self):
+    def test_adapter_does_not_bootstrap_from_iotrace_when_no_admitted_unmet_criterion(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             project = root / "project"
             project.mkdir()
             intent_root = root / "session-intent"
-            state_path = _write_session_intent_run_source(intent_root)
+            # io-trace activity is present, but the only criterion is already met:
+            # io-trace alone must never bootstrap an autopilot run (the design-error guard).
+            _write_session_intent_run_source(
+                intent_root,
+                criteria=[{"id": "AC1", "summary": "already done", "source": "user-explicit", "status": "met", "admitted": True}],
+            )
             _write_io_trace(root, "session-1", command="apply_patch autopilot_state.py")
 
             payload = aps.adapter_payload_from_env({
@@ -585,19 +617,9 @@ class AutopilotStateTest(unittest.TestCase):
                 "GHOST_ALICE_AUTOPILOT_PLAN_PATH": ".tmp/implementation-plans/stop-bridge.md",
             })
             run_dir = project / ".autopilot"
-            approved_run = json.loads((run_dir / "approved-run.json").read_text(encoding="utf-8"))
-            items = aps.read_work_items(run_dir / "tasks.jsonl")
 
-        self.assertTrue(payload["continue"])
-        self.assertIn("work-item: session-intent-session-1", payload["systemMessage"])
-        self.assertIn("io-trace:", payload["systemMessage"])
-        self.assertIn("governance-signal:", payload["systemMessage"])
-        self.assertIn("observation_next_action:continue from latest io-trace", payload["systemMessage"])
-        self.assertEqual(approved_run["approval_evidence"]["decision"], "AUTO")
-        self.assertEqual(approved_run["approval_evidence"]["source"], "session-intent-io-trace")
-        self.assertEqual(approved_run["approval_evidence"]["governance_candidate"]["source"], "observation_signal")
-        self.assertEqual(approved_run["approval_evidence"]["session_intent"]["state_path"], str(state_path))
-        self.assertEqual(items[0]["status"], "running")
+        self.assertEqual(payload, {"continue": True, "systemMessage": ""})
+        self.assertFalse(run_dir.exists())
 
     def test_adapter_does_not_bootstrap_project_run_without_approval_or_runtime_material(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -605,7 +627,10 @@ class AutopilotStateTest(unittest.TestCase):
             project = root / "project"
             project.mkdir()
             intent_root = root / "session-intent"
-            _write_session_intent_run_source(intent_root)
+            _write_session_intent_run_source(
+                intent_root,
+                criteria=[{"id": "AC1", "summary": "already done", "source": "user-explicit", "status": "met", "admitted": True}],
+            )
 
             payload = aps.adapter_payload_from_env({
                 "PWD": str(project),
@@ -616,6 +641,39 @@ class AutopilotStateTest(unittest.TestCase):
 
         self.assertEqual(payload, {"continue": True, "systemMessage": ""})
         self.assertFalse(run_dir.exists())
+
+    def test_adapter_bootstraps_when_admitted_unmet_criterion_exists(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "project"
+            project.mkdir()
+            intent_root = root / "session-intent"
+            _write_session_intent_run_source(
+                intent_root,
+                criteria=[{
+                    "id": "AC1",
+                    "summary": "ship X",
+                    "source": "user-explicit",
+                    "status": "unmet",
+                    "admitted": True,
+                }],
+            )
+
+            payload = aps.adapter_payload_from_env({
+                "PWD": str(project),
+                "GHOST_ALICE_PLATFORM": "codex",
+                "GHOST_ALICE_SESSION_INTENT_ROOT": str(intent_root),
+                "GHOST_ALICE_AUTOPILOT_PLAN_PATH": ".tmp/implementation-plans/stop-bridge.md",
+            })
+            approved_run_path = project / ".autopilot" / "approved-run.json"
+            bootstrapped = approved_run_path.exists()
+            approved_run = json.loads(approved_run_path.read_text(encoding="utf-8")) if bootstrapped else {}
+
+        self.assertTrue(payload["continue"])
+        self.assertTrue(bootstrapped)
+        self.assertEqual(approved_run["approval_evidence"]["decision"], "AUTO")
+        self.assertEqual(approved_run["approval_evidence"]["source"], "admitted-unmet-criterion")
+        self.assertIn("AC1", approved_run["approval_evidence"]["open_criteria"])
 
     def test_adapter_payload_defaults_to_project_autopilot_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1078,6 +1136,118 @@ class AutopilotStateTest(unittest.TestCase):
         self.assertTrue(decision_removed)
         self.assertTrue(applied_decision_exists)
         self.assertIn("work-item: next", payload["systemMessage"])
+
+    def test_validated_continue_next_marks_admitted_criterion_met_in_ledger(self):
+        core_ledger = _locate_core_ledger_source()
+        if core_ledger is None:
+            self.skipTest("core session_intent_ledger.py not available for import-by-path")
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            repo = tmp / "repo"
+            # Mirror the repo-checkout layout so walk-up from the ledger finds core.
+            scripts_dir = repo / "session-intent-analyzer" / "scripts"
+            scripts_dir.mkdir(parents=True)
+            shutil.copy(core_ledger, scripts_dir / "session_intent_ledger.py")
+            intent_root = repo / ".tmp" / "session-intent"
+            state_path = _write_session_intent_run_source(
+                intent_root,
+                criteria=[{
+                    "id": "AC-TEST",
+                    "summary": "current item satisfies the test criterion",
+                    "source": "user-explicit",
+                    "status": "unmet",
+                    "admitted": True,
+                }],
+            )
+            run_dir = tmp / "run"
+            run_dir.mkdir()
+            run_record = _approved_run_record()
+            run_record["approval_evidence"] = {
+                "decision": "GO",
+                "source": "unit-test",
+                "session_intent": {
+                    "platform": "codex",
+                    "session_id": "session-1",
+                    "state_path": str(state_path),
+                },
+            }
+            (run_dir / "approved-run.json").write_text(json.dumps(run_record), encoding="utf-8")
+            aps.write_work_items(run_dir / "tasks.jsonl", [
+                _item("current", status="running"),
+                _item("next", depends_on=["current"]),
+            ])
+            (run_dir / "consistency-decision.json").write_text(
+                json.dumps(_decision_action(
+                    "current",
+                    "continue_next",
+                    completion_check_digest=VALID_COMPLETION_DIGEST,
+                    verdict="pass",
+                    evidence=VALID_COMPLETION_EVIDENCE,
+                )),
+                encoding="utf-8",
+            )
+
+            aps.advance_approved_run(run_dir)
+            ledger_state = json.loads(state_path.read_text(encoding="utf-8"))
+
+        ac = next(c for c in ledger_state["acceptance_criteria"] if c["id"] == "AC-TEST")
+        # A validated continue_next flips the admitted criterion to met via the core API.
+        self.assertEqual(ac["status"], "met")
+        self.assertEqual(ac["met_completion_check_digest"], "a" * 64)
+
+    def test_continue_next_without_reachable_core_ledger_continues_without_crash(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            # No core repo is mirrored, so import-by-path cannot resolve the ledger.
+            intent_root = tmp / "data" / "session-intent"
+            state_path = _write_session_intent_run_source(
+                intent_root,
+                criteria=[{
+                    "id": "AC-TEST",
+                    "summary": "current item satisfies the test criterion",
+                    "source": "user-explicit",
+                    "status": "unmet",
+                    "admitted": True,
+                }],
+            )
+            run_dir = tmp / "run"
+            run_dir.mkdir()
+            run_record = _approved_run_record()
+            run_record["approval_evidence"] = {
+                "decision": "GO",
+                "source": "unit-test",
+                "session_intent": {
+                    "platform": "codex",
+                    "session_id": "session-1",
+                    "state_path": str(state_path),
+                },
+            }
+            (run_dir / "approved-run.json").write_text(json.dumps(run_record), encoding="utf-8")
+            aps.write_work_items(run_dir / "tasks.jsonl", [
+                _item("current", status="running"),
+                _item("next", depends_on=["current"]),
+            ])
+            (run_dir / "consistency-decision.json").write_text(
+                json.dumps(_decision_action(
+                    "current",
+                    "continue_next",
+                    completion_check_digest=VALID_COMPLETION_DIGEST,
+                    verdict="pass",
+                    evidence=VALID_COMPLETION_EVIDENCE,
+                )),
+                encoding="utf-8",
+            )
+
+            payload = aps.advance_approved_run(run_dir)
+            items = aps.read_work_items(run_dir / "tasks.jsonl")
+            ledger_state = json.loads(state_path.read_text(encoding="utf-8"))
+
+        # The decision still applies (item completed) and the run keeps going; the
+        # criterion stays unmet because the met-flip is gracefully skipped.
+        self.assertEqual(items[0]["status"], "completed")
+        self.assertEqual(payload["continue"], True)
+        ac = next(c for c in ledger_state["acceptance_criteria"] if c["id"] == "AC-TEST")
+        self.assertEqual(ac["status"], "unmet")
 
     def test_continue_next_rejects_completion_evidence_without_criterion_binding(self):
         with tempfile.TemporaryDirectory() as tmp:
