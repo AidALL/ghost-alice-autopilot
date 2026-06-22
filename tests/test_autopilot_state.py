@@ -54,7 +54,16 @@ def _locate_core_ledger_source() -> Path | None:
         REPO_ROOT.parent / "ghost-alice" / "session-intent-analyzer" / "scripts" / "session_intent_ledger.py"
     )
     for candidate in candidates:
-        if candidate.is_file():
+        if not candidate.is_file():
+            continue
+        try:
+            source = candidate.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        # Only a core that exposes the met-writer can drive the import-by-path
+        # flip; otherwise the integration test would assert against an older
+        # core that gracefully skips (e.g. a CI sibling on an unpublished API).
+        if "def mark_acceptance_criterion_met" in source:
             return candidate
     return None
 
