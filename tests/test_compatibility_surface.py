@@ -56,6 +56,31 @@ RELEASE_PACKAGE_FILES = (
     "tests/test_live_semantic_e2e_harness.py",
     "tests/test_privileged_adapter.py",
 )
+BASH_FIRST_PUBLIC_DOC_PATTERNS = {
+    "PowerShell code fence": re.compile(r"```powershell", re.IGNORECASE),
+    "CMD code fence": re.compile(r"```cmd", re.IGNORECASE),
+    "native Windows install wrapper execution": re.compile(
+        r"(?m)(?:^\s*(?:\.\\)?install\.cmd(?:\s+|$)|`(?:\.\\)?install\.cmd\s+(?:-|--|\w))",
+        re.IGNORECASE,
+    ),
+    "PowerShell installer execution": re.compile(
+        r"(?m)(?:^\s*(?:\.\\)?install\.ps1(?:\s+|$)|`(?:\.\\)?install\.ps1\s+(?:-|--|\w))",
+        re.IGNORECASE,
+    ),
+    "PowerShell-style installer flag": re.compile(
+        r"(?<![A-Za-z0-9])-(?:Platform|Visibility|AgentVisibility|Uninstall|AddonSource|AddonTag|Status|Doctor|List|CleanupPending|PromptPlatform|Skills)\b"
+    ),
+}
+
+
+def _scan_lines(rel: str, patterns: dict[str, re.Pattern[str]]) -> list[str]:
+    text = (REPO_ROOT / rel).read_text(encoding="utf-8")
+    findings: list[str] = []
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        for label, pattern in patterns.items():
+            if pattern.search(line):
+                findings.append(f"{rel}:{line_number}: {label}: {line.strip()}")
+    return findings
 
 
 def _compatibility_matrix() -> dict:
@@ -349,6 +374,11 @@ class CompatibilitySurfaceTest(unittest.TestCase):
                 with self.subTest(rel=rel, phrase=phrase):
                     self.assertIn(phrase, text)
 
+    def test_public_install_docs_use_bash_first_command_surface(self) -> None:
+        findings: list[str] = []
+        for rel in ("README.md", "README_ko.md", "addons/autopilot-mode/skill/SKILL.md"):
+            findings.extend(_scan_lines(rel, BASH_FIRST_PUBLIC_DOC_PATTERNS))
+        self.assertEqual([], findings)
 
 if __name__ == "__main__":
     unittest.main()
