@@ -255,14 +255,14 @@ class CompatibilitySurfaceTest(unittest.TestCase):
         self.assertNotIn("p6-autopilot", text)
 
     def test_user_docs_warn_old_core_can_install_inert_skill_without_adapter(self) -> None:
-        english_expected = ("0.1.3", "inert", "without wiring the privileged adapter")
+        english_expected = ("0.2.0", "inert", "without wiring the privileged adapter")
         for rel in ("README.md", "addons/autopilot-mode/skill/SKILL.md"):
             text = (REPO_ROOT / rel).read_text(encoding="utf-8")
             for phrase in english_expected:
                 with self.subTest(rel=rel, phrase=phrase):
                     self.assertIn(phrase, text)
         korean = (REPO_ROOT / "README_ko.md").read_text(encoding="utf-8")
-        for phrase in ("0.1.3", "skill만 복사", "privileged adapter", "inert"):
+        for phrase in ("0.2.0", "skill만 복사", "privileged adapter", "inert"):
             with self.subTest(rel="README_ko.md", phrase=phrase):
                 self.assertIn(phrase, korean)
 
