@@ -1258,6 +1258,73 @@ class AutopilotStateTest(unittest.TestCase):
         ac = next(c for c in ledger_state["acceptance_criteria"] if c["id"] == "AC-TEST")
         self.assertEqual(ac["status"], "unmet")
 
+    def test_validated_continue_next_marks_every_criterion_in_a_multi_criterion_claim(self):
+        core_ledger = _locate_core_ledger_source()
+        if core_ledger is None:
+            self.skipTest("core session_intent_ledger.py with met-writer not available")
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            repo = tmp / "repo"
+            scripts_dir = repo / "session-intent-analyzer" / "scripts"
+            scripts_dir.mkdir(parents=True)
+            shutil.copy(core_ledger, scripts_dir / "session_intent_ledger.py")
+            intent_root = repo / ".tmp" / "session-intent"
+            state_path = _write_session_intent_run_source(
+                intent_root,
+                criteria=[
+                    {"id": "AC-TEST", "summary": "first", "source": "user-explicit", "status": "unmet", "admitted": True},
+                    {"id": "AC-TWO", "summary": "second", "source": "user-explicit", "status": "unmet", "admitted": True},
+                ],
+            )
+            run_dir = tmp / "run"
+            run_dir.mkdir()
+            run_record = _approved_run_record()
+            run_record["approval_evidence"] = {
+                "decision": "GO",
+                "source": "unit-test",
+                "session_intent": {
+                    "platform": "codex",
+                    "session_id": "session-1",
+                    "state_path": str(state_path),
+                },
+            }
+            (run_dir / "approved-run.json").write_text(json.dumps(run_record), encoding="utf-8")
+            aps.write_work_items(run_dir / "tasks.jsonl", [
+                _item("current", status="running"),
+                _item("next", depends_on=["current"]),
+            ])
+            evidence = ["\n".join([
+                "[completion-check]",
+                "- acceptance-criteria:",
+                "  - AC-TEST: first [source: user-explicit]",
+                "  - AC-TWO: second [source: user-explicit]",
+                "- claim-evidence-map:",
+                "  - claim: both items completed",
+                "    criterion: AC-TEST, AC-TWO",
+                "    evidence: tests/test_autopilot_state.py pass",
+                "    verdict: pass",
+                "- unverified:",
+                "  - none",
+            ])]
+            (run_dir / "consistency-decision.json").write_text(
+                json.dumps(_decision_action(
+                    "current",
+                    "continue_next",
+                    completion_check_digest=VALID_COMPLETION_DIGEST,
+                    verdict="pass",
+                    evidence=evidence,
+                )),
+                encoding="utf-8",
+            )
+
+            aps.advance_approved_run(run_dir)
+            ledger_state = json.loads(state_path.read_text(encoding="utf-8"))
+
+        by_id = {c["id"]: c for c in ledger_state["acceptance_criteria"]}
+        # A single claim binding multiple criteria flips every named criterion.
+        self.assertEqual(by_id["AC-TEST"]["status"], "met")
+        self.assertEqual(by_id["AC-TWO"]["status"], "met")
+
     def test_continue_next_rejects_completion_evidence_without_criterion_binding(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp)

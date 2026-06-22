@@ -436,7 +436,14 @@ def materialize_met_criteria_from_continue_next(
     evidence = applied_decision.get("evidence")
     if not isinstance(evidence, list):
         return []
-    criterion_ids = _extract_completion_claim_criteria("\n".join(str(line) for line in evidence))
+    # A single claim may bind several criteria ("criterion: AC1, AC2"); split the
+    # same way the continue_next validator does so each real ledger id is flipped.
+    raw_criteria = _extract_completion_claim_criteria("\n".join(str(line) for line in evidence))
+    criterion_ids: list[str] = []
+    for raw in raw_criteria:
+        for token in re.split(r"[,\s]+", str(raw).strip()):
+            if token and token not in criterion_ids:
+                criterion_ids.append(token)
     if not criterion_ids:
         return []
     state_path = Path(state_path_raw)
