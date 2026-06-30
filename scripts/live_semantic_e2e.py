@@ -11,7 +11,9 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import os
 import re
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -442,7 +444,7 @@ def _observation_classification(summary: Mapping[str, Any]) -> str:
     inference_status = summary.get("inference_status")
     semantic_status = summary.get("semantic_status")
     agent_activity = summary.get("agent_activity")
-    if inference_status == "auth-failed":
+    if inference_status in {"auth-failed", "config-failed"}:
         return "readiness-blocker"
     if agent_activity == "tool-loop-timeout":
         return "tool-loop-timeout"
@@ -662,6 +664,15 @@ def _looks_like_auth_failure(text: str, returncode: int) -> bool:
     return any(marker in lowered for marker in auth_markers)
 
 
+def _looks_like_config_failure(text: str, returncode: int) -> bool:
+    if returncode == 0:
+        return False
+    lowered = text.lower()
+    return "error loading config.toml" in lowered or (
+        "config.toml" in lowered and "unknown variant" in lowered
+    )
+
+
 def _codex_agent_activity(hook_events: dict[str, int], returncode: int, has_result: bool) -> str:
     tool_events = hook_events.get("PreToolUse", 0) + hook_events.get("PostToolUse", 0)
     if returncode == 124 and tool_events:
@@ -708,6 +719,11 @@ def parse_codex_outputs(
         invalid_fields = []
     elif _looks_like_auth_failure(log_text + "\n" + last_message, returncode):
         inference_status = "auth-failed"
+        semantic_status = "not-run"
+        missing_keys = []
+        invalid_fields = []
+    elif _looks_like_config_failure(log_text + "\n" + last_message, returncode):
+        inference_status = "config-failed"
         semantic_status = "not-run"
         missing_keys = []
         invalid_fields = []
@@ -759,30 +775,106 @@ def build_claude_command(
     ]
 
 
+def resolve_codex_command(
+    codex_bin: str,
+    *,
+    which=shutil.which,
+    platform: str = os.name,
+) -> list[str]:
+    requested = Path(codex_bin)
+    explicit_path = requested.is_absolute() or requested.parent != Path(".")
+    if explicit_path:
+        if requested.suffix.lower() == ".ps1":
+            pwsh = which("pwsh.exe") or which("pwsh")
+            if not pwsh:
+                return []
+            return [pwsh, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(requested)]
+        return [str(requested)]
+
+    if platform == "nt" and codex_bin.lower() == "codex":
+        cmd = which("codex.cmd")
+        if cmd:
+            return [cmd]
+        ps1 = which("codex.ps1")
+        if ps1:
+            pwsh = which("pwsh.exe") or which("pwsh")
+            if pwsh:
+                return [pwsh, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1]
+        exe = which("codex.exe")
+        if exe:
+            return [exe]
+
+    resolved = which(codex_bin)
+    return [resolved] if resolved else [codex_bin]
+
+
+def codex_supports_hook_trust(
+    codex_command: Sequence[str],
+    *,
+    cwd: Path,
+    timeout_sec: float = 15,
+) -> bool:
+    try:
+        completed = subprocess.run(
+            [*codex_command, "exec", "--help"],
+            cwd=str(cwd),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout_sec,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return "--dangerously-bypass-hook-trust" in (completed.stdout or "")
+
+
 def build_codex_command(
     scenario: LiveScenario,
     log_path: Path,
     last_message_path: Path,
+    *,
+    codex_bin: str = "codex",
+    codex_command: Sequence[str] | None = None,
+    hook_trust_supported: bool = False,
+    which=shutil.which,
+    platform: str = os.name,
 ) -> list[str]:
-    return [
-        "codex",
-        "exec",
+    resolved = list(codex_command) if codex_command is not None else resolve_codex_command(
+        codex_bin,
+        which=which,
+        platform=platform,
+    )
+    command = [*resolved, "exec"]
+    if hook_trust_supported:
+        command.append("--dangerously-bypass-hook-trust")
+    command.extend([
         "--sandbox",
         "read-only",
         "--skip-git-repo-check",
         "--output-last-message",
         str(last_message_path),
-        scenario.prompt,
-    ]
+        "-",
+    ])
+    return command
 
 
-def run_command_to_file(command: Sequence[str], output_path: Path, *, timeout_sec: float | None = None) -> int:
+def run_command_to_file(
+    command: Sequence[str],
+    output_path: Path,
+    *,
+    timeout_sec: float | None = None,
+    input_text: str | None = None,
+) -> int:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as handle:
         try:
             process = subprocess.run(
                 command,
-                stdin=subprocess.DEVNULL,
+                input=input_text,
+                stdin=subprocess.DEVNULL if input_text is None else None,
                 stdout=handle,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -826,8 +918,20 @@ def run_scenario(
     if runtime == "codex":
         log = out_dir / f"codex-{scenario.id}.log"
         last = out_dir / f"codex-{scenario.id}.txt"
-        command = build_codex_command(scenario, log, last)
-        returncode = run_command_to_file(command, log, timeout_sec=timeout_sec)
+        codex_command = resolve_codex_command("codex")
+        command = build_codex_command(
+            scenario,
+            log,
+            last,
+            codex_command=codex_command,
+            hook_trust_supported=codex_supports_hook_trust(codex_command, cwd=repo_root()),
+        )
+        returncode = run_command_to_file(
+            command,
+            log,
+            timeout_sec=timeout_sec,
+            input_text=scenario.prompt,
+        )
         summary = parse_codex_outputs(log, last, returncode=returncode, scenario=scenario)
         summary["scenario_id"] = scenario.id
         summary["output_file"] = str(log)
