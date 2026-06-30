@@ -396,6 +396,27 @@ def test_codex_auth_failure_is_not_reported_as_parse_failure(tmp_path: Path) -> 
     assert summary["missing_keys"] == []
 
 
+def test_codex_config_failure_is_not_reported_as_parse_failure(tmp_path: Path) -> None:
+    harness = _load_harness()
+    log = tmp_path / "codex.log"
+    last_message = tmp_path / "codex.txt"
+    scenario = harness.LiveScenario(id="codex-config", prompt="Return compact JSON.")
+    log.write_text(
+        "Error loading config.toml: unknown variant `default`, expected `fast` or `flex`\n"
+        "in `service_tier`\n",
+        encoding="utf-8",
+    )
+
+    summary = harness.parse_codex_outputs(log, last_message, returncode=1, scenario=scenario)
+    summary["scenario_id"] = scenario.id
+    signal = harness.observation_signal_from_summary(summary, scenario=scenario)
+
+    assert summary["inference_status"] == "config-failed"
+    assert summary["semantic_status"] == "not-run"
+    assert summary["missing_keys"] == []
+    assert signal["classification"] == "readiness-blocker"
+
+
 def test_codex_semantic_values_are_validated(tmp_path: Path) -> None:
     harness = _load_harness()
     log = tmp_path / "codex.log"
@@ -1002,3 +1023,29 @@ def test_command_builders_do_not_embed_secret_values(tmp_path: Path) -> None:
     assert "--output-last-message" in codex
     assert "--sandbox" in codex
     assert "read-only" in codex
+
+
+def test_codex_command_builder_prefers_cmd_and_conditional_hook_trust_on_windows(tmp_path: Path) -> None:
+    harness = _load_harness()
+    scenario = harness.LiveScenario(id="probe", prompt="Return compact JSON.")
+
+    def fake_which(name: str) -> str | None:
+        return {
+            "codex.cmd": r"C:\Users\try2q\AppData\Roaming\npm\codex.cmd",
+            "codex.ps1": r"C:\Users\try2q\AppData\Roaming\npm\codex.ps1",
+            "pwsh.exe": r"C:\Program Files\PowerShell\7\pwsh.exe",
+            "codex.exe": r"C:\Program Files\Codex\codex.exe",
+        }.get(name)
+
+    command = harness.build_codex_command(
+        scenario,
+        tmp_path / "codex.log",
+        tmp_path / "codex.txt",
+        hook_trust_supported=True,
+        platform="nt",
+        which=fake_which,
+    )
+
+    assert command[0].endswith("codex.cmd")
+    assert command[1] == "exec"
+    assert "--dangerously-bypass-hook-trust" in command
