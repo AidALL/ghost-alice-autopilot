@@ -54,6 +54,7 @@ RELEASE_PACKAGE_FILES = (
     "tests/test_compatibility_surface.py",
     "tests/test_governance_signal.py",
     "tests/test_live_semantic_e2e_harness.py",
+    "tests/test_live_semantic_e2e_unittest.py",
     "tests/test_privileged_adapter.py",
 )
 BASH_FIRST_PUBLIC_DOC_PATTERNS = {
