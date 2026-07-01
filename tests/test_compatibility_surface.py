@@ -90,6 +90,10 @@ def _compatibility_matrix() -> dict:
     return json.loads(MATRIX_PATH.read_text(encoding="utf-8"))
 
 
+def _addon_manifest() -> dict:
+    return json.loads((REPO_ROOT / "addons" / "autopilot-mode" / "addon.json").read_text(encoding="utf-8"))
+
+
 def _matrix_evidence(matrix: dict) -> list[str]:
     return [
         evidence
@@ -127,6 +131,12 @@ class CompatibilitySurfaceTest(unittest.TestCase):
                     check=False,
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_addon_manifest_version_matches_repo_version(self) -> None:
+        self.assertEqual(
+            (REPO_ROOT / "VERSION").read_text(encoding="utf-8").strip(),
+            _addon_manifest()["addon_version"],
+        )
 
     def test_compatibility_matrix_enumerates_required_targets(self) -> None:
         matrix = _compatibility_matrix()

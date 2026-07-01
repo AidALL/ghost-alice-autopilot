@@ -656,8 +656,18 @@ def _quarantine_rejected_decision(run_dir: Path, decision: Mapping[str, Any], re
     appended to the audit log. Best-effort: any IO error here must not mask the
     original validation error that the caller re-raises.
     """
+    rejected_path = run_dir / REJECTED_DECISION_FILE
+    if rejected_path.exists():
+        stem = rejected_path.name.removesuffix(".json")
+        for index in range(2, 1000):
+            candidate = run_dir / f"{stem}.{index}.json"
+            if not candidate.exists():
+                rejected_path = candidate
+                break
+        else:
+            rejected_path = run_dir / f"{stem}.{os.getpid()}.json"
     try:
-        os.replace(run_dir / DECISION_FILE, run_dir / REJECTED_DECISION_FILE)
+        os.replace(run_dir / DECISION_FILE, rejected_path)
     except OSError:
         return
     try:

@@ -948,6 +948,29 @@ class AutopilotStateTest(unittest.TestCase):
         self.assertTrue(rejected_exists)
         self.assertIn("consistency_decision_rejected", events)
 
+    def test_rejected_decision_quarantine_does_not_overwrite_prior_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            _write_run(run_dir, [_item("current", status="running")])
+            first_rejected = run_dir / "consistency-decision.rejected.json"
+            first_rejected.write_text("prior rejected evidence", encoding="utf-8")
+            (run_dir / "consistency-decision.json").write_text("{not json", encoding="utf-8")
+
+            with self.assertRaises(aps.AutopilotStateError):
+                aps.advance_approved_run(run_dir)
+
+            rejected_files = sorted(run_dir.glob("consistency-decision.rejected*.json"))
+            prior_content = first_rejected.read_text(encoding="utf-8")
+            new_rejections = [
+                path
+                for path in rejected_files
+                if path.name != "consistency-decision.rejected.json"
+            ]
+
+        self.assertEqual(prior_content, "prior rejected evidence")
+        self.assertTrue(new_rejections)
+        self.assertFalse((run_dir / "consistency-decision.json").exists())
+
     def test_repeated_missing_decision_escalates_to_user_meta(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp)
