@@ -4,22 +4,56 @@
 Dependencies: Python 3.11+ standard library only.
 """
 
-from __future__ import annotations
+import re
 
 from typing import Any, Mapping
 
 
-def format_io_trace_rows(rows: list[dict[str, Any]]) -> list[str]:
+def _portable_path(text: str, base_path: str | None = None, home_path: str | None = None) -> str:
+    # Platform-neutral rendering of a path/command for the continuation signal:
+    # backslashes -> forward slashes, then strip the run's project root ("." ) and
+    # the home dir ("~") so no drive-absolute or machine-specific prefix leaks
+    # across a cross-platform handoff. The audit log keeps the raw value.
+    if not text:
+        return text
+    result = text.replace("\\", "/")
+    replacements = []
+    if base_path:
+        replacements.append((base_path.replace("\\", "/").rstrip("/"), "."))
+    if home_path:
+        replacements.append((home_path.replace("\\", "/").rstrip("/"), "~"))
+    for prefix, token in sorted(replacements, key=lambda pair: len(pair[0]), reverse=True):
+        if prefix:
+            result = re.sub(r"(?i)" + re.escape(prefix) + r"(?=/|$)", lambda _m, t=token: t, result)
+    return result
+
+
+def format_io_trace_rows(
+    rows: list[dict[str, Any]],
+    *,
+    base_path: str | None = None,
+    home_path: str | None = None,
+) -> list[str]:
     lines: list[str] = []
     for row in rows:
         tool = str(row.get("tool") or "unknown")
-        path = str(row.get("path") or "n/a")
-        pattern = " ".join(str(row.get("pattern") or "").split())
+        path = _portable_path(str(row.get("path") or "n/a"), base_path, home_path)
+        op = str(row.get("op") or "")
+        pattern = _portable_path(" ".join(str(row.get("pattern") or "").split()), base_path, home_path)
         if len(pattern) > 180:
             pattern = pattern[:177] + "..."
-        summary = f"{tool} {path}"
-        if pattern:
-            summary = f"{summary} {pattern}"
+        if tool == "Bash":
+            # Neutral: prefer the structured op+path; never emit the raw shell
+            # command (per-runtime tool surface) when it was structured. Fall back
+            # to the path-stripped command only when no op could be extracted.
+            if op:
+                summary = f"{op} {path}" if path and path != "n/a" else op
+            else:
+                summary = f"{tool} {pattern}".strip() if pattern else tool
+        else:
+            summary = f"{tool} {path}"
+            if pattern:
+                summary = f"{summary} {pattern}"
         lines.append(f"- {summary}")
     return lines
 
@@ -45,6 +79,8 @@ def build_continuation_message(
     pending_decision: bool = False,
     io_trace_rows: list[dict[str, Any]] | None = None,
     governance_candidate: Mapping[str, Any] | None = None,
+    base_path: str | None = None,
+    home_path: str | None = None,
 ) -> str:
     lines = [
         "[autopilot]",
@@ -56,7 +92,7 @@ def build_continuation_message(
         lines.append("pending-decision: missing")
     if io_trace_rows:
         lines.append("io-trace:")
-        lines.extend(format_io_trace_rows(io_trace_rows))
+        lines.extend(format_io_trace_rows(io_trace_rows, base_path=base_path, home_path=home_path))
     compact_candidate = compact_governance_candidate(governance_candidate)
     if compact_candidate:
         lines.append("governance-signal:")
@@ -72,7 +108,7 @@ def build_continuation_message(
             lines.extend(f"- {value}" for value in evidence)
     source_locator = item.get("source_locator")
     if isinstance(source_locator, str) and source_locator.strip():
-        lines.append(f"source-locator: {source_locator.strip()}")
+        lines.append(f"source-locator: {_portable_path(source_locator.strip(), base_path, home_path)}")
     decision_context = item.get("decision_context")
     if isinstance(decision_context, list) and any(isinstance(value, str) and value for value in decision_context):
         lines.append("decision-context:")
@@ -82,7 +118,7 @@ def build_continuation_message(
         lines.append("open-questions:")
         lines.extend(f"- {value}" for value in open_questions if isinstance(value, str) and value)
     lines.append("allowed-surface:")
-    lines.extend(f"- {surface}" for surface in item["allowed_surface"])
+    lines.extend(f"- {_portable_path(str(surface), base_path, home_path)}" for surface in item["allowed_surface"])
     lines.append("acceptance-criteria:")
     lines.extend(f"- {criterion}" for criterion in item["acceptance_criteria"])
     reopen_target = item.get("completion", {}).get("reopen_target")

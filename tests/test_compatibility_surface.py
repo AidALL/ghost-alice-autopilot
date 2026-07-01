@@ -40,6 +40,7 @@ RELEASE_PACKAGE_FILES = (
     "addons/autopilot-mode/skill/adapters/autopilot_mode.py",
     "compatibility-matrix.json",
     "docs/release/2026-06-22-release-notes.md",
+    "docs/release/2026-07-01-release-notes.md",
     "addons/autopilot-mode/skill/adapters/autopilot_messages.py",
     "addons/autopilot-mode/skill/adapters/autopilot_state.py",
     "addons/autopilot-mode/skill/adapters/autopilot_work_items.py",
@@ -50,6 +51,7 @@ RELEASE_PACKAGE_FILES = (
     "scripts/fresh_install_e2e.py",
     "scripts/live_semantic_e2e.py",
     "tests/test_autopilot_session_bridge.py",
+    "tests/test_autopilot_messages.py",
     "tests/test_autopilot_state.py",
     "tests/test_compatibility_surface.py",
     "tests/test_governance_signal.py",
@@ -86,6 +88,10 @@ def _scan_lines(rel: str, patterns: dict[str, re.Pattern[str]]) -> list[str]:
 
 def _compatibility_matrix() -> dict:
     return json.loads(MATRIX_PATH.read_text(encoding="utf-8"))
+
+
+def _addon_manifest() -> dict:
+    return json.loads((REPO_ROOT / "addons" / "autopilot-mode" / "addon.json").read_text(encoding="utf-8"))
 
 
 def _matrix_evidence(matrix: dict) -> list[str]:
@@ -125,6 +131,12 @@ class CompatibilitySurfaceTest(unittest.TestCase):
                     check=False,
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_addon_manifest_version_matches_repo_version(self) -> None:
+        self.assertEqual(
+            (REPO_ROOT / "VERSION").read_text(encoding="utf-8").strip(),
+            _addon_manifest()["addon_version"],
+        )
 
     def test_compatibility_matrix_enumerates_required_targets(self) -> None:
         matrix = _compatibility_matrix()

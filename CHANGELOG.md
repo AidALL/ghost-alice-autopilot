@@ -6,6 +6,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## Unreleased
 
+Use this section for changes that have landed after the latest tagged public release.
+
+## [0.1.1] - 2026-07-01
+
+### Added
+
+- Live semantic Codex E2E unittest coverage for stdin prompt delivery, hook-trust flag support, runtime config failures, and Windows command shim resolution.
+- Release package tracking for the live semantic unittest surface.
+- Reset-N io-trace resume budget coverage for approved autopilot runs that lack a promoted consistency decision.
+- Platform-neutral continuation-signal rendering for structured Bash io-trace rows, source locators, and allowed surfaces.
+- Invalid consistency-decision quarantine coverage that preserves the rejected file as evidence while keeping fail-closed validation.
+
+### Changed
+
+- Codex live semantic smoke now resolves `.cmd` shims and runtime-supported flags more defensively across Windows and non-Windows command surfaces.
+- Prompt execution now feeds substantive prompts through stdin instead of depending on argv prompt handling.
+- Stop-hook continuation now replenishes the io-trace resume allowance only when the session-intent ledger advances, then escalates to `ask_user_meta` when the reset budget is exhausted.
+- Continuation messages now emit portable project/home-relative paths while stored work items and raw io-trace audit records remain absolute.
+
+### Fixed
+
+- Prevented config/runtime errors and unsupported hook-trust flags from being misclassified as governance pass/fail outcomes.
+- Kept compatibility-surface CI aligned with the files shipped by the addon.
+- Prevented an approved run with persistent io-trace material and no promoted decision from re-firing the same continuation forever.
+- Prevented an invalid promoted decision file from re-raising forever by moving it to `consistency-decision.rejected.json` before preserving the validation error.
+
+## [0.1.0] - 2026-06-22
+
 ### Added
 
 - Release-prep notes under `docs/release/2026-06-22-release-notes.md`.

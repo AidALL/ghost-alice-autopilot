@@ -46,11 +46,15 @@ CONDUCT_PLAN_FILE = "conduct-plan.json"
 APPLIED_CONDUCT_PLAN_FILE = "conduct-plan.applied.json"
 DECISION_FILE = "consistency-decision.json"
 APPLIED_DECISION_FILE = "consistency-decision.applied.json"
+REJECTED_DECISION_FILE = "consistency-decision.rejected.json"
 EVENTS_FILE = "events.jsonl"
 OFF_FILE = "OFF"
 LOCK_DIR = ".advance.lock"
 LOCK_TIMEOUT_SECONDS = 10.0
 LOCK_POLL_SECONDS = 0.02
+# Ceiling on io-trace-backed resumes of a decision-less running item; past it, escalate to ask_user_meta even while io-trace remains (else it re-fires forever). Platform-neutral.
+IOTRACE_RESUME_LIMIT_DEFAULT = 3
+IOTRACE_RESUME_LIMIT_ENV = "GHOST_ALICE_AUTOPILOT_IOTRACE_RESUME_LIMIT"
 NOOP_PAYLOAD = {"continue": True, "systemMessage": ""}
 CONSISTENCY_DECISION_SCHEMA = "autopilot-consistency-decision.v1"
 CONSISTENCY_DECISION_CANDIDATE_SCHEMA = "autopilot-consistency-decision-candidate.v1"
@@ -243,7 +247,7 @@ def _read_io_trace_rows(
             continue
         compact = {
             key: row[key]
-            for key in ("ts", "session", "tool", "path", "pattern")
+            for key in ("ts", "session", "tool", "path", "pattern", "op")
             if isinstance(row.get(key), str)
         }
         if compact:
@@ -525,6 +529,8 @@ def _bootstrap_from_session_intent_if_approved(
         or project_cwd / ".tmp" / "implementation-plans" / "autopilot-session-intent.md"
     )
     allowed_surfaces = [plan_path]
+    intent_events_path = resolved.get("events_path")
+    initial_watermark = _intent_events_count(Path(intent_events_path)) if intent_events_path else 0
     run_dir.mkdir(parents=True, exist_ok=True)
     _write_json_atomic(
         run_dir / APPROVED_RUN_FILE,
@@ -534,7 +540,11 @@ def _bootstrap_from_session_intent_if_approved(
             "approved": True,
             "status": "running",
             "scope": {"summary": SESSION_MATERIAL.run_summary(intent_state)},
-            "budget": {"remaining_steps": 3},
+            "budget": {"remaining_steps": 3, "intent_watermark": initial_watermark},
+            "intent_source": {
+                "events_path": str(intent_events_path) if intent_events_path else "",
+                "state_path": str(resolved["state_path"]),
+            },
             "allowed_surfaces": allowed_surfaces,
             "stop_conditions": list(DEFAULT_STOP_CONDITIONS),
             "approval_evidence": merged_approval,
@@ -637,6 +647,43 @@ def _validate_promoted_decision_file(decision: Mapping[str, Any]) -> None:
     _require_string(decision.get("loop_key"), "consistency decision loop_key")
 
 
+def _quarantine_rejected_decision(run_dir: Path, decision: Mapping[str, Any], reason: str) -> None:
+    """Move an unconsumable consistency-decision file aside and record why.
+
+    The strict validation still rejects (raises); this only stops the rejected
+    file from re-raising on every subsequent Stop (a permanent stall). The file
+    is renamed (preserved as evidence), never deleted, and the rejection is
+    appended to the audit log. Best-effort: any IO error here must not mask the
+    original validation error that the caller re-raises.
+    """
+    rejected_path = run_dir / REJECTED_DECISION_FILE
+    if rejected_path.exists():
+        stem = rejected_path.name.removesuffix(".json")
+        for index in range(2, 1000):
+            candidate = run_dir / f"{stem}.{index}.json"
+            if not candidate.exists():
+                rejected_path = candidate
+                break
+        else:
+            rejected_path = run_dir / f"{stem}.{os.getpid()}.json"
+    try:
+        os.replace(run_dir / DECISION_FILE, rejected_path)
+    except OSError:
+        return
+    try:
+        _append_event(
+            run_dir,
+            {
+                "schema_version": "autopilot-event.v1",
+                "event": "consistency_decision_rejected",
+                "schema_version_seen": decision.get("schema_version"),
+                "reason": reason,
+            },
+        )
+    except OSError:
+        pass
+
+
 def _apply_pending_decision(
     run_dir: Path,
     items: list[dict[str, Any]],
@@ -644,20 +691,31 @@ def _apply_pending_decision(
     decision_path = run_dir / DECISION_FILE
     if not decision_path.is_file():
         return items, None
-    decision = _read_json_object(decision_path)
-    _validate_promoted_decision_file(decision)
-    item_id = _require_string(decision.get("work_item_id"), "consistency decision work_item_id")
-    decision_value = _require_string(decision.get("decision"), "consistency decision decision")
-    evidence = decision.get("evidence")
-    evidence = _validate_string_list(evidence, "consistency decision evidence")
-    updated = apply_consistency_decision(
-        items,
-        item_id,
-        decision_value,
-        completion_check_digest=decision.get("completion_check_digest"),
-        verdict=decision.get("verdict"),
-        evidence=evidence,
-    )
+    decision: Mapping[str, Any] = {}
+    try:
+        decision = _read_json_object(decision_path)
+        _validate_promoted_decision_file(decision)
+        item_id = _require_string(decision.get("work_item_id"), "consistency decision work_item_id")
+        decision_value = _require_string(decision.get("decision"), "consistency decision decision")
+        evidence = _validate_string_list(decision.get("evidence"), "consistency decision evidence")
+        updated = apply_consistency_decision(
+            items,
+            item_id,
+            decision_value,
+            completion_check_digest=decision.get("completion_check_digest"),
+            verdict=decision.get("verdict"),
+            evidence=evidence,
+        )
+    except AutopilotStateError as exc:
+        # Reject (raise) an unconsumable decision -- fail-closed; the agent is not
+        # root and must not apply unverified state. But quarantine the offending
+        # file first so it does not re-raise on every subsequent Stop (a permanent
+        # stall): the rename preserves it as evidence, the event records the
+        # rejection, and the entrypoint still degrades to a non-blocking no-op.
+        # Fallback is correction before the next forward step; the audit log is
+        # never reduced.
+        _quarantine_rejected_decision(run_dir, decision, str(exc))
+        raise
     write_work_items(run_dir / TASKS_FILE, updated)
     os.replace(decision_path, run_dir / APPLIED_DECISION_FILE)
     _append_event(
@@ -715,6 +773,88 @@ def _missing_decision_resume_count(run_dir: Path, work_item_id: str) -> int:
         if event.get("event") == "resume_running_item_without_decision"
         and event.get("work_item_id") == work_item_id
     )
+
+
+def _iotrace_resumes_since_last_replenish(run_dir: Path, work_item_id: str) -> int:
+    # "Reset N" budget: count io-trace resumes for this item since the last
+    # session-intent replenish. A new intent epoch (replenish event) resets the
+    # allowance to the base limit, rather than accumulating a lifetime ceiling.
+    count = 0
+    for event in _read_jsonl_objects(run_dir / EVENTS_FILE):
+        if event.get("work_item_id") != work_item_id:
+            continue
+        name = event.get("event")
+        if name == "resume_budget_replenished":
+            count = 0
+        elif name == "resume_running_item_from_iotrace":
+            count += 1
+    return count
+
+
+def _iotrace_resume_limit(source: Mapping[str, str] | None) -> int:
+    try:
+        value = int(str((source or {}).get(IOTRACE_RESUME_LIMIT_ENV)).strip())
+    except (TypeError, ValueError):
+        return IOTRACE_RESUME_LIMIT_DEFAULT
+    return value if value >= 1 else IOTRACE_RESUME_LIMIT_DEFAULT
+
+
+# --- intent-driven resume budget --------------------------------------------
+# The resume ceiling is not a dead static count: it is replenished whenever the
+# session-intent ledger advances (a new user input, or new work the agent routed
+# through session-intent-analyzer -> new intent-events lines). Each advance resets
+# the allowance to the base limit (reset-N); with no new intent the ceiling holds
+# and the run escalates to ask_user_meta instead of re-firing forever. Platform-neutral.
+def _intent_events_count(events_path: Path) -> int:
+    try:
+        text = events_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return 0
+    return sum(1 for line in text.splitlines() if line.strip())
+
+
+def _run_intent_events_path(run: Mapping[str, Any]) -> Path | None:
+    intent_source = run.get("intent_source")
+    if not isinstance(intent_source, Mapping):
+        return None
+    events = intent_source.get("events_path")
+    return Path(events) if isinstance(events, str) and events.strip() else None
+
+
+def _last_intent_watermark(run_dir: Path, run: Mapping[str, Any], work_item_id: str) -> int:
+    seen = [
+        event.get("intent_events_seen")
+        for event in _read_jsonl_objects(run_dir / EVENTS_FILE)
+        if event.get("event") == "resume_budget_replenished"
+        and event.get("work_item_id") == work_item_id
+        and isinstance(event.get("intent_events_seen"), int)
+        and not isinstance(event.get("intent_events_seen"), bool)
+    ]
+    if seen:
+        return max(seen)
+    budget = run.get("budget")
+    base = budget.get("intent_watermark") if isinstance(budget, Mapping) else None
+    return base if isinstance(base, int) and not isinstance(base, bool) else 0
+
+
+def _maybe_replenish_resume_budget(run_dir: Path, run: Mapping[str, Any], work_item_id: str) -> bool:
+    events_path = _run_intent_events_path(run)
+    if events_path is None:
+        return False
+    current = _intent_events_count(events_path)
+    if current <= _last_intent_watermark(run_dir, run, work_item_id):
+        return False
+    _append_event(
+        run_dir,
+        {
+            "schema_version": "autopilot-event.v1",
+            "event": "resume_budget_replenished",
+            "run_id": run.get("run_id"),
+            "work_item_id": work_item_id,
+            "intent_events_seen": current,
+        },
+    )
+    return True
 
 
 def _session_id_from_run(run: Mapping[str, Any], source: Mapping[str, str] | None) -> str | None:
@@ -811,6 +951,9 @@ def _advance_approved_run_locked(root: Path, source: Mapping[str, str] | None = 
     if not _approved_run_allows_continue(run):
         return _noop_payload()
     io_trace_rows = _io_trace_rows_for_run(run, source)
+    # Platform-neutral rendering context for the continuation signal.
+    signal_base = str(root.parent)
+    signal_home = str((source or {}).get("HOME") or Path.home())
 
     items = read_work_items(tasks_path) if tasks_path.is_file() else []
     items, applied_decision = _apply_pending_decision(root, items)
@@ -834,7 +977,9 @@ def _advance_approved_run_locked(root: Path, source: Mapping[str, str] | None = 
             if _work_item_within_run_surfaces(run, running_item):
                 governance_candidate = _io_trace_candidate_for_item(run, running_item, source, io_trace_rows)
                 if _missing_decision_resume_count(root, running_item["id"]) >= 1:
-                    if io_trace_rows:
+                    _maybe_replenish_resume_budget(root, run, running_item["id"])
+                    resume_limit = _iotrace_resume_limit(source)
+                    if io_trace_rows and _iotrace_resumes_since_last_replenish(root, running_item["id"]) < resume_limit:
                         _append_iotrace_resume_event(root, run, running_item, governance_candidate)
                         return {
                             "continue": True,
@@ -844,9 +989,15 @@ def _advance_approved_run_locked(root: Path, source: Mapping[str, str] | None = 
                                 pending_decision=True,
                                 io_trace_rows=io_trace_rows,
                                 governance_candidate=governance_candidate,
+                                base_path=signal_base,
+                                home_path=signal_home,
                             ),
                         }
-                    evidence = ["loop-guard: repeated missing decision"]
+                    evidence = (
+                        [f"loop-guard: io-trace resume limit reached ({resume_limit})"]
+                        if io_trace_rows
+                        else ["loop-guard: repeated missing decision"]
+                    )
                     updated = apply_consistency_decision(
                         items,
                         running_item["id"],
@@ -889,6 +1040,8 @@ def _advance_approved_run_locked(root: Path, source: Mapping[str, str] | None = 
                         pending_decision=True,
                         io_trace_rows=io_trace_rows,
                         governance_candidate=governance_candidate,
+                        base_path=signal_base,
+                        home_path=signal_home,
                     ),
                 }
         _append_event(
@@ -934,6 +1087,8 @@ def _advance_approved_run_locked(root: Path, source: Mapping[str, str] | None = 
             selected_item,
             io_trace_rows=io_trace_rows,
             governance_candidate=governance_candidate,
+            base_path=signal_base,
+            home_path=signal_home,
         ),
     }
 
