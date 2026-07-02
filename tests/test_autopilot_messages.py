@@ -48,6 +48,11 @@ class FormatIoTraceRowsTest(unittest.TestCase):
         lines = msgs.format_io_trace_rows([row], home_path="C:\\Users\\try2q")
         self.assertEqual(lines, ["- Grep ~/proj TODO"])
 
+    def test_non_bash_pattern_keeps_regex_backslashes(self):
+        row = {"tool": "Grep", "path": "C:\\Users\\try2q\\proj", "pattern": r"C:\d+\w+"}
+        lines = msgs.format_io_trace_rows([row], home_path="C:\\Users\\try2q")
+        self.assertEqual(lines, [r"- Grep ~/proj C:\d+\w+"])
+
 
 class BuildContinuationMessageNeutralityTest(unittest.TestCase):
     def _item(self):

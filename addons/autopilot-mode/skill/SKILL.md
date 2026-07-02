@@ -3,7 +3,7 @@ name: autopilot-mode
 description: "Use when a Ghost-ALICE autonomous run has approved run state or current-session runtime material and verified work items must continue through the privileged adapter."
 compatibility:
   - "Python 3.11+ standard library"
-  - "Ghost-ALICE core 0.2.0+ with privileged adapter support"
+  - "Ghost-ALICE core 0.2.1+ with privileged adapter support"
   - "Claude Code or Codex hooks installed by the Ghost-ALICE core installer"
 ---
 
@@ -14,16 +14,16 @@ autopilot-mode is a Ghost-ALICE addon for approved autonomous continuation. The 
 ## Critical Rules
 
 - Installation is not runtime activation. Installing this addon only registers a privileged adapter hook. The adapter is a no-op until an approved run state exists.
-- Ghost-ALICE core must be 0.2.0 or newer. Older core installers may copy this skill without wiring the privileged adapter; that install is inert and should be removed before upgrading.
+- Ghost-ALICE core must be 0.2.1 or newer. Older core installers may copy this skill without wiring the privileged adapter, runtime-core audit, or ledger met-flip path required by the current addon contract; that install is inert or incomplete and should be removed before upgrading.
 - The adapter accepts no arguments. Any argv value is rejected with exit code 64.
 - The adapter reads project-local state from `<cwd>/.autopilot/` by default. `GHOST_ALICE_AUTOPILOT_RUN_DIR` can point at a different run directory.
 - Runtime activation requires `approved-run.json` with `approved: true`, `status: "running"`, a positive `budget.remaining_steps`, non-empty `scope`, non-empty `allowed_surfaces`, non-empty `stop_conditions`, and non-empty `approval_evidence`.
 - `skill/scripts/autopilot_session_bridge.py` can bootstrap approved run state from `current-session.json`, `intent-state.json`, and `intent-events.jsonl` for Codex or Claude only when explicit approval evidence is supplied. In an installed skill, run it as `scripts/autopilot_session_bridge.py` from the skill root; in a source checkout, the repository wrapper at `scripts/autopilot_session_bridge.py` delegates to the skill-local bridge.
-- The Stop adapter can also materialize current-session `.autopilot/` state when `intent-state.json` plus io-trace or open conduct feedback provide current runtime material. That path records `approval_evidence.decision: "AUTO"` and feeds io-trace through the existing `autopilot-observation-signal.v1` receptor.
+- The Stop adapter can also materialize current-session `.autopilot/` state when `intent-state.json` records admitted, not-yet-met acceptance criteria. That path records `approval_evidence.decision: "AUTO"` (`source: "admitted-unmet-criterion"`); io-trace material alone never bootstraps a run and is fed through the existing `autopilot-observation-signal.v1` receptor.
 - `tasks.jsonl` is the durable source of truth. The ready queue is derived from task status and dependencies; `ready` and `reopened` items can be selected when dependencies are satisfied, and work items are never popped.
 - A pause file at `.autopilot/OFF` disables continuation without deleting state.
 - `autopilot_governance_signal.py` writes evidence-backed `consistency-decision.candidate.json` and `conduct-plan.candidate.json` files first. Candidate files are diagnostic and are not adapter-consumable.
-- Promotion creates adapter-consumable `consistency-decision.json`; the adapter requires `schema_version: "autopilot-consistency-decision.v1"`, `promotion_state: "promoted"`, promotion evidence, candidate id, evidence digest, state hash, decision key, and loop key.
+- Promotion creates adapter-consumable `consistency-decision.json`; the adapter requires `schema_version: "autopilot-consistency-decision.v1"`, `promotion_state: "promoted"`, `promotion_evidence.decision`, `promotion_evidence.source`, `candidate_id`, `governance_signal_digest`, `state_hash`, `decision_key`, and `loop_key`. `promotion_evidence.decision` accepts `go`, `approve`, `approved`, `promote`, `promoted`, or `direct`; use `direct` only for a current-turn before-stop resolution without a candidate.
 - Every continuation message includes a `before-stop` contract. The executing agent must promote or write `.autopilot/consistency-decision.json` when a completion, retry, or reopen decision is resolved; if not, the next Stop hook consumes current io-trace before escalating.
 - If a running item has no decision file on the next Stop hook, the adapter resumes that same item with `pending-decision: missing` instead of returning a silent no-op. A repeated missing decision escalates to `ask_user_meta` only when neither io-trace nor work state can resolve the next action.
 - `conduct-plan.json` is an approved handoff from the conduct-feedback planning path. The adapter imports `autopilot-conduct-plan.v2` `proposed_queue_items` only when the plan has `promotion_state: "approved"`, approval evidence, source candidate id, and evidence digest.
@@ -102,7 +102,7 @@ python3 scripts/autopilot_session_bridge.py \
 
 ## Consistency Decisions
 
-`consistency-decision.candidate.json` uses `schema_version: "autopilot-consistency-decision-candidate.v1"`, `promotion_state: "candidate"`, and `action_file_allowed: false`. `consistency-decision.json` is adapter-consumable only after promotion. The adapter accepts these promoted decisions:
+`consistency-decision.candidate.json` uses `schema_version: "autopilot-consistency-decision-candidate.v1"`, `promotion_state: "candidate"`, and `action_file_allowed: false`. `consistency-decision.json` is adapter-consumable only after promotion. Prefer `scripts/autopilot_governance_signal.py promote-decision` when a candidate exists; if a completion decision must be written directly, it still needs the full promoted action schema: `schema_version`, `decision_id`, `work_item_id`, `decision`, `promotion_state: "promoted"`, `promotion_evidence.decision`, `promotion_evidence.source`, `candidate_id`, `governance_signal_digest`, `decision_key`, `state_hash`, `loop_key`, and `evidence`. `promotion_evidence.decision` must be one of `go`, `approve`, `approved`, `promote`, `promoted`, or `direct`; use `direct` only for a current-turn before-stop resolution without a candidate. The `evidence` field must be a JSON array of strings. Do not nest `verdict`, `completion_check_digest`, or `text` inside `evidence`. The adapter accepts these promoted decisions:
 
 - `continue_next`
 - `retry_same_unit`
@@ -146,7 +146,12 @@ observer-prohibited-actions:
 - <prohibited action>
 before-stop:
 - continue from the latest io-trace when no promoted consistency decision exists.
-- write .autopilot/consistency-decision.json when a completion/retry/reopen decision is resolved.
+- promote a candidate with scripts/autopilot_governance_signal.py promote-decision when a candidate exists.
+- otherwise write .autopilot/consistency-decision.json only with the full promoted schema when a completion/retry/reopen decision is resolved.
+- promoted schema requires schema_version, decision_id, work_item_id, decision, promotion_state: promoted, promotion_evidence.decision, promotion_evidence.source, candidate_id, governance_signal_digest, decision_key, state_hash, loop_key, and evidence.
+- promotion_evidence.decision must be one of go, approve, approved, promote, promoted, or direct; use direct only for a current-turn before-stop resolution without a candidate.
+- evidence must be a JSON array of strings; do not nest verdict, completion_check_digest, or text inside evidence.
+- for continue_next, put verdict and completion_check_digest at top level and put the full [completion-check] block in evidence strings.
 - use continue_next only after [completion-check] with verdict pass, sha256 completion_check_digest, acceptance-criteria, and criterion-bound claim-evidence-map evidence.
 - use retry_same_unit or reopen_micro/reopen_meso/reopen_macro when verification fails or drift remains.
 - use ask_user_meta only when neither io-trace nor work state can resolve the next action.
@@ -168,7 +173,7 @@ Repository `compatibility-matrix.json` is the compatibility SSOT for this addon.
 
 ## Operating It
 
-- Start: create `.autopilot/approved-run.json` and `.autopilot/tasks.jsonl` after the user explicitly approves the autonomous run, or let the Stop adapter materialize current-session state from session-intent plus io-trace/open conduct feedback. If the approved work comes from conduct feedback, create `conduct-plan.candidate.json` first, then use promotion to place the approved `conduct-plan.json` in the same run directory; the adapter creates `tasks.jsonl` when it imports the plan.
+- Start: create `.autopilot/approved-run.json` and `.autopilot/tasks.jsonl` after the user explicitly approves the autonomous run, or let the Stop adapter materialize current-session state when session intent records admitted, unmet acceptance criteria (io-trace alone never bootstraps a run). If the approved work comes from conduct feedback, create `conduct-plan.candidate.json` first, then use promotion to place the approved `conduct-plan.json` in the same run directory; the adapter creates `tasks.jsonl` when it imports the plan.
 - Pause: create `.autopilot/OFF`.
 - Resume: remove `.autopilot/OFF`.
 - Stop: set `approved-run.json` `status` to `stopped`, set `approved` to false, set `budget.remaining_steps` to 0, or remove the approved run file.

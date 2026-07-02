@@ -16,7 +16,7 @@ Language: [English](./README.md) | Korean
 - Ghost-ALICE installer를 통해 core-owned `[adapter:autopilot-mode] continue` hook을 등록한다.
 - 프로젝트 로컬 `.autopilot/` 실행 상태를 읽는다.
 - 명시적 승인 후 session-intent ledger file에서 `.autopilot/`을 부트스트랩하는 `skill/scripts/autopilot_session_bridge.py`와 repository wrapper `scripts/autopilot_session_bridge.py`를 제공한다.
-- Stop adapter가 별도 receptor를 만들지 않고 session-intent와 io-trace 또는 open conduct feedback에서 current-session `.autopilot/` state를 materialize할 수 있다.
+- Stop adapter가 별도 receptor를 만들지 않고, session intent에 admitted 상태의 미충족 acceptance criteria가 기록되어 있거나 open conduct feedback이 승인된 conduct plan을 제공할 때 current-session `.autopilot/` state를 materialize한다. io-trace 자료만으로는 run을 부트스트랩하지 않으며 `autopilot-observation-signal.v1` receptor를 통한 observation으로만 처리된다.
 - `autopilot_governance_signal.py`로 evidence-backed governance candidate와 promotion을 만든다.
 - 승인된 `conduct-plan.json` proposal queue를 durable `tasks.jsonl` work item으로 가져온다.
 - no-op payload 또는 다음 work-item message를 출력한다.
@@ -29,7 +29,7 @@ Language: [English](./README.md) | Korean
 런타임 흐름:
 
 1. Ghost-ALICE core installer가 이 애드온을 설치하고 privileged adapter hook을 배선한다.
-2. 프로젝트는 사용자 승인 후 `.autopilot/approved-run.json`과 `.autopilot/tasks.jsonl`을 만든다. conduct-feedback 실행은 승인된 `.autopilot/conduct-plan.json`을 대신 제공할 수 있다. package bridge `skill/scripts/autopilot_session_bridge.py` 또는 repository wrapper `scripts/autopilot_session_bridge.py`는 caller가 명시적 approval evidence를 제공할 때 `current-session.json`, `intent-state.json`, `intent-events.jsonl`에서 이 run state를 만들 수 있다. Stop adapter는 session-intent와 io-trace 또는 open conduct feedback이 runtime material을 제공할 때 current session을 materialize할 수도 있다.
+2. 프로젝트는 사용자 승인 후 `.autopilot/approved-run.json`과 `.autopilot/tasks.jsonl`을 만든다. conduct-feedback 실행은 승인된 `.autopilot/conduct-plan.json`을 대신 제공할 수 있다. package bridge `skill/scripts/autopilot_session_bridge.py` 또는 repository wrapper `scripts/autopilot_session_bridge.py`는 caller가 명시적 approval evidence를 제공할 때 `current-session.json`, `intent-state.json`, `intent-events.jsonl`에서 이 run state를 만들 수 있다. Stop adapter는 session intent에 admitted 상태의 미충족 acceptance criteria가 기록되어 있거나 승인된 conduct plan이 있을 때 current session을 materialize할 수도 있다. io-trace material만으로는 bootstrap approval이 되지 않으며 observation/resume material로만 쓰인다.
 3. 에이전트가 멈추면 adapter가 `.autopilot/`을 읽는다.
 4. governance signal은 먼저 `consistency-decision.candidate.json` 또는 `conduct-plan.candidate.json`을 쓴다. 이 candidate file은 adapter-consumable이 아니다.
 5. promotion만 adapter-consumable `consistency-decision.json` 또는 승인된 `conduct-plan.json`을 만든다.
@@ -63,7 +63,7 @@ Language: [English](./README.md) | Korean
 - `conduct-plan.candidate.json`은 `schema_version: "autopilot-conduct-plan-candidate.v1"`, `promotion_state: "candidate"`, `action_file_allowed: false`를 사용한다.
 - candidate schema가 adapter-consumable 경로에 잘못 놓여도 adapter는 이를 거부한다.
 
-promotion은 adapter-consumable file을 만드는 경계다. `promote-decision`은 `schema_version: "autopilot-consistency-decision.v1"`, `promotion_state: "promoted"`, promotion evidence, candidate id, evidence digest, state hash, decision key, loop key를 포함한 `consistency-decision.json`을 쓴다. `promote-conduct-plan`은 `promotion_state: "approved"`, approval evidence, source candidate id, evidence digest를 포함한 승인 `conduct-plan.json`을 쓴다.
+promotion은 adapter-consumable file을 만드는 경계다. `promote-decision`은 `schema_version: "autopilot-consistency-decision.v1"`, `promotion_state: "promoted"`, `promotion_evidence.decision`, `promotion_evidence.source`, `candidate_id`, `governance_signal_digest`, `state_hash`, `decision_key`, `loop_key`를 포함한 `consistency-decision.json`을 쓴다. `promotion_evidence.decision`은 `go`, `approve`, `approved`, `promote`, `promoted`, `direct`를 허용한다. `direct`는 candidate가 없는 current-turn before-stop resolution에만 사용한다. 모든 promoted decision에서 `evidence`는 JSON array of strings이어야 한다. `verdict`, `completion_check_digest`, `text`를 `evidence` 안에 중첩하지 않는다. `promote-conduct-plan`은 `promotion_state: "approved"`, approval evidence, source candidate id, evidence digest를 포함한 승인 `conduct-plan.json`을 쓴다.
 
 promotion command는 `--run-dir`로 `.autopilot/tasks.jsonl`과 `.autopilot/events.jsonl`을 읽을 수 있다. retry cap 또는 repeated decision/state loop가 확인되면 같은 결정을 반복하지 않고 `ask_user_meta`로 escalate한다.
 
@@ -83,12 +83,13 @@ bridge는 `--platform codex`와 `--platform claude`를 지원한다. bridge는
 metadata를 `approved-run.json` approval evidence에 보존한다.
 
 Stop adapter에는 별도의 automatic current-session path가 있다. 프로젝트에
-`.autopilot/` run state가 없지만 session ledger가 current work를 가리키고
-io-trace 또는 open conduct feedback이 있으면 adapter는
-`approval_evidence.decision: "AUTO"`를 쓰고 io-trace를
-`autopilot_governance_signal.py`의 기존 `autopilot-observation-signal.v1`
-receptor로 보낸다. Observation candidate는 diagnostic 상태로 남고
-adapter-consumable action file로 promote되지 않는다.
+`.autopilot/` run state가 없고 session ledger에 admitted 상태이면서 아직
+met되지 않은 acceptance criteria가 기록되어 있으면 adapter는
+`approval_evidence.decision: "AUTO"`(`source: "admitted-unmet-criterion"`)로
+run state를 bootstrap한다. io-trace 존재만으로는 run을 bootstrap하지 않으며,
+io-trace는 `autopilot_governance_signal.py`의 기존
+`autopilot-observation-signal.v1` receptor로 보낸다. Observation candidate는
+diagnostic 상태로 남고 adapter-consumable action file로 promote되지 않는다.
 
 ```bash
 /opt/homebrew/bin/python3 scripts/autopilot_session_bridge.py \
@@ -102,11 +103,11 @@ adapter-consumable action file로 promote되지 않는다.
 
 ## 요구사항
 
-- privileged adapter를 지원하는 Ghost-ALICE core 0.2.0 이상.
+- privileged adapter를 지원하는 Ghost-ALICE core 0.2.1 이상.
 - Python 3.11+.
 - Ghost-ALICE core installer로 설치된 Claude Code 또는 Codex hook.
 
-Ghost-ALICE core 0.2.0 미만에는 이 애드온을 설치하지 않는다. 오래된 core installer는 skill만 복사하고 privileged adapter를 배선하지 않을 수 있다. 이 설치는 inert 상태이므로 업그레이드 전에 제거한다.
+Ghost-ALICE core 0.2.1 미만에는 이 애드온을 설치하지 않는다. 오래된 core installer는 skill만 복사하고 privileged adapter, runtime-core audit, ledger met-flip path를 배선하지 못할 수 있다. 이 설치는 inert 또는 incomplete 상태이므로 업그레이드 전에 제거한다.
 
 ## Compatibility Matrix
 
@@ -200,7 +201,12 @@ acceptance-criteria:
 - the next continuation message names unit-1
 before-stop:
 - continue from the latest io-trace when no promoted consistency decision exists.
-- write .autopilot/consistency-decision.json when a completion/retry/reopen decision is resolved.
+- promote a candidate with scripts/autopilot_governance_signal.py promote-decision when a candidate exists.
+- otherwise write .autopilot/consistency-decision.json only with the full promoted schema when a completion/retry/reopen decision is resolved.
+- promoted schema requires schema_version, decision_id, work_item_id, decision, promotion_state: promoted, promotion_evidence.decision, promotion_evidence.source, candidate_id, governance_signal_digest, decision_key, state_hash, loop_key, and evidence.
+- promotion_evidence.decision must be one of go, approve, approved, promote, promoted, or direct; use direct only for a current-turn before-stop resolution without a candidate.
+- evidence must be a JSON array of strings; do not nest verdict, completion_check_digest, or text inside evidence.
+- for continue_next, put verdict and completion_check_digest at top level and put the full [completion-check] block in evidence strings.
 - use continue_next only after [completion-check] with verdict pass, sha256 completion_check_digest, acceptance-criteria, and criterion-bound claim-evidence-map evidence.
 - use retry_same_unit or reopen_micro/reopen_meso/reopen_macro when verification fails or drift remains.
 - use ask_user_meta only when neither io-trace nor work state can resolve the next action.
@@ -208,7 +214,7 @@ prompt:
 Implement the first approved demo unit.
 ```
 
-다음 stop 이벤트는 promoted `.autopilot/consistency-decision.json`을 소비한다. `continue_next`는 `sha256:<64-hex>` `completion_check_digest`와 `[completion-check]`, `acceptance-criteria`, 그리고 known acceptance-criteria criterion id를 참조하는 `claim-evidence-map` entry를 포함한 evidence text가 있을 때만 running item을 완료한다. `retry_same_unit`은 concrete evidence가 있을 때만 같은 item을 다시 queue에 넣는다. `reopen_micro`, `reopen_meso`, `reopen_macro`는 같은 item을 open 상태로 유지하고 다음 continuation message에 요청된 focus layer를 표면화한다. running item에 decision file이 없으면 adapter는 silent no-op 대신 `pending-decision: missing`으로 같은 item을 재개하고, repeated missing decision은 io-trace와 work state 어느 쪽으로도 next action을 resolved할 수 없을 때만 `ask_user_meta`로 escalate한다.
+다음 stop 이벤트는 promoted `.autopilot/consistency-decision.json`을 소비한다. 직접 completion decision을 쓸 때도 `before-stop` block에 명시된 full promoted action schema를 포함해야 한다. 일부 필드만 손으로 쓴 decision은 거부되고 `.autopilot/consistency-decision.rejected.json`으로 보존된다. `continue_next`는 `sha256:<64-hex>` `completion_check_digest`와 `[completion-check]`, `acceptance-criteria`, 그리고 known acceptance-criteria criterion id를 참조하는 `claim-evidence-map` entry를 포함한 evidence text가 있을 때만 running item을 완료한다. `retry_same_unit`은 concrete evidence가 있을 때만 같은 item을 다시 queue에 넣는다. `reopen_micro`, `reopen_meso`, `reopen_macro`는 같은 item을 open 상태로 유지하고 다음 continuation message에 요청된 focus layer를 표면화한다. running item에 decision file이 없으면 adapter는 silent no-op 대신 `pending-decision: missing`으로 같은 item을 재개하고, repeated missing decision은 io-trace와 work state 어느 쪽으로도 next action을 resolved할 수 없을 때만 `ask_user_meta`로 escalate한다.
 
 ## 일시정지, 재개, 중지
 

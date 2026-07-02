@@ -5,6 +5,7 @@
     { "name": "autopilot-mode", "source": "skill", "skill_dir": "skill" }
   ],
   "platforms": ["claude", "codex"],
+  "min_core_version": "0.2.1",
   "depends_on_core": [
     "session-intent-analyzer",
     "task-router",

@@ -229,6 +229,39 @@ class OfficialAutopilotAddonTest(unittest.TestCase):
         self.assertIn("work-item: next", payload["systemMessage"])
         self.assertIn("Do next", payload["systemMessage"])
 
+    def test_adapter_script_surfaces_state_errors_instead_of_silent_noop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "run"
+            running = _work_item("next")
+            running["status"] = "running"
+            _write_approved_run(run_dir, [running])
+            (run_dir / "events.jsonl").write_text("{not-json\n", encoding="utf-8")
+            script = (
+                AUTOPILOT_SOURCE
+                / "addons"
+                / "autopilot-mode"
+                / "skill"
+                / "adapters"
+                / "autopilot_mode.py"
+            )
+            env = os.environ.copy()
+            env["GHOST_ALICE_AUTOPILOT_RUN_DIR"] = str(run_dir)
+
+            result = subprocess.run(
+                [sys.executable, str(script)],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            payload = json.loads(result.stdout)
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(payload["continue"])
+        self.assertIn("autopilot-mode adapter error", payload["systemMessage"])
+        self.assertIn("invalid JSON", payload["systemMessage"])
+        self.assertNotEqual(payload, {"continue": True, "systemMessage": ""})
+
     def test_adapter_script_imports_conduct_plan_before_no_ready_item(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp) / "run"

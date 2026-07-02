@@ -39,7 +39,8 @@ def format_io_trace_rows(
         tool = str(row.get("tool") or "unknown")
         path = _portable_path(str(row.get("path") or "n/a"), base_path, home_path)
         op = str(row.get("op") or "")
-        pattern = _portable_path(" ".join(str(row.get("pattern") or "").split()), base_path, home_path)
+        raw_pattern = " ".join(str(row.get("pattern") or "").split())
+        pattern = _portable_path(raw_pattern, base_path, home_path) if tool == "Bash" else raw_pattern
         if len(pattern) > 180:
             pattern = pattern[:177] + "..."
         if tool == "Bash":
@@ -139,7 +140,12 @@ def build_continuation_message(
     lines.extend([
         "before-stop:",
         "- continue from the latest io-trace when no promoted consistency decision exists.",
-        "- write .autopilot/consistency-decision.json when a completion/retry/reopen decision is resolved.",
+        "- promote a candidate with scripts/autopilot_governance_signal.py promote-decision when a candidate exists.",
+        "- otherwise write .autopilot/consistency-decision.json only with the full promoted schema when a completion/retry/reopen decision is resolved.",
+        "- promoted schema requires schema_version, decision_id, work_item_id, decision, promotion_state: promoted, promotion_evidence.decision, promotion_evidence.source, candidate_id, governance_signal_digest, decision_key, state_hash, loop_key, and evidence.",
+        "- promotion_evidence.decision must be one of go, approve, approved, promote, promoted, or direct; use direct only for a current-turn before-stop resolution without a candidate.",
+        "- evidence must be a JSON array of strings; do not nest verdict, completion_check_digest, or text inside evidence.",
+        "- for continue_next, put verdict and completion_check_digest at top level and put the full [completion-check] block in evidence strings.",
         "- use continue_next only after [completion-check] with verdict pass, sha256 completion_check_digest, acceptance-criteria, and criterion-bound claim-evidence-map evidence.",
         "- use retry_same_unit or reopen_micro/reopen_meso/reopen_macro when verification fails or drift remains.",
         "- use ask_user_meta only when neither io-trace nor work state can resolve the next action.",

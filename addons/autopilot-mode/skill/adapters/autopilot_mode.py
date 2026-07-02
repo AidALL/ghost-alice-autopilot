@@ -73,7 +73,14 @@ def main() -> int:
         payload = autopilot_state.adapter_payload_from_env(_env_with_hook_cwd(hook_input))
     except Exception as exc:  # pragma: no cover - defensive hook fallback
         sys.stderr.write(f"autopilot-mode adapter fell back to no-op: {exc}\n")
-        payload = {"continue": True, "systemMessage": ""}
+        payload = {
+            "continue": True,
+            "systemMessage": (
+                "[autopilot-mode adapter error]\n"
+                f"error: {exc}\n"
+                "recovery-action: inspect and repair the .autopilot run state before continuing autopilot."
+            ),
+        }
     sys.stdout.write(json.dumps(_format_payload_for_hook(payload, hook_input)) + "\n")
     return 0
 

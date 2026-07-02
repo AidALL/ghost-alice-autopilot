@@ -94,6 +94,10 @@ def _addon_manifest() -> dict:
     return json.loads((REPO_ROOT / "addons" / "autopilot-mode" / "addon.json").read_text(encoding="utf-8"))
 
 
+def _top_level_addons_manifest() -> dict:
+    return json.loads((REPO_ROOT / "addons-manifest.json").read_text(encoding="utf-8"))
+
+
 def _matrix_evidence(matrix: dict) -> list[str]:
     return [
         evidence
@@ -137,6 +141,12 @@ class CompatibilitySurfaceTest(unittest.TestCase):
             (REPO_ROOT / "VERSION").read_text(encoding="utf-8").strip(),
             _addon_manifest()["addon_version"],
         )
+
+    def test_addon_manifest_core_floor_matches_public_contract(self) -> None:
+        self.assertEqual(_addon_manifest()["min_core_version"], "0.2.1")
+        entry = _top_level_addons_manifest()["addons"][0]
+        self.assertEqual(entry["id"], "autopilot-mode")
+        self.assertEqual(entry["min_core_version"], "0.2.1")
 
     def test_compatibility_matrix_enumerates_required_targets(self) -> None:
         matrix = _compatibility_matrix()
@@ -268,19 +278,49 @@ class CompatibilitySurfaceTest(unittest.TestCase):
         self.assertNotIn("p6-autopilot", text)
 
     def test_user_docs_warn_old_core_can_install_inert_skill_without_adapter(self) -> None:
-        english_expected = ("0.2.0", "inert", "without wiring the privileged adapter")
+        english_expected = ("0.2.1", "inert", "without wiring the privileged adapter")
         for rel in ("README.md", "addons/autopilot-mode/skill/SKILL.md"):
             text = (REPO_ROOT / rel).read_text(encoding="utf-8")
             for phrase in english_expected:
                 with self.subTest(rel=rel, phrase=phrase):
                     self.assertIn(phrase, text)
         korean = (REPO_ROOT / "README_ko.md").read_text(encoding="utf-8")
-        for phrase in ("0.2.0", "skill만 복사", "privileged adapter", "inert"):
+        for phrase in ("0.2.1", "skill만 복사", "privileged adapter", "inert"):
             with self.subTest(rel="README_ko.md", phrase=phrase):
                 self.assertIn(phrase, korean)
 
+    def test_public_docs_do_not_describe_io_trace_as_bootstrap_condition(self) -> None:
+        stale_phrases = (
+            "session-intent plus io-trace or open conduct feedback",
+            "session-intent plus io-trace/open conduct feedback",
+            "session-intent와 io-trace 또는 open conduct feedback",
+        )
+        for rel in ("README.md", "README_ko.md", "addons/autopilot-mode/skill/SKILL.md"):
+            text = (REPO_ROOT / rel).read_text(encoding="utf-8")
+            for phrase in stale_phrases:
+                with self.subTest(rel=rel, phrase=phrase):
+                    self.assertNotIn(phrase, text)
+            with self.subTest(rel=rel, phrase="admitted-unmet-criterion"):
+                self.assertIn("admitted-unmet-criterion", text)
+
     def test_user_docs_require_before_stop_consistency_decision(self) -> None:
-        required_phrases = ("before-stop", "consistency-decision.json", "reopen_micro", "reopen_macro")
+        required_phrases = (
+            "before-stop",
+            "consistency-decision.json",
+            "scripts/autopilot_governance_signal.py promote-decision",
+            "promotion_evidence.decision",
+            "promotion_evidence.source",
+            "governance_signal_digest",
+            "decision_key",
+            "state_hash",
+            "loop_key",
+            "promotion_evidence.decision must be one of",
+            "direct only for a current-turn before-stop resolution",
+            "evidence must be a JSON array of strings",
+            "put verdict and completion_check_digest at top level",
+            "reopen_micro",
+            "reopen_macro",
+        )
         for rel in ("README.md", "README_ko.md", "addons/autopilot-mode/skill/SKILL.md"):
             text = (REPO_ROOT / rel).read_text(encoding="utf-8")
             for phrase in required_phrases:
