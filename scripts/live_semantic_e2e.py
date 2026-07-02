@@ -580,6 +580,12 @@ def observation_signal_from_summary(
     }
 
 
+def result_is_successful(result: Mapping[str, Any]) -> bool:
+    """Return true only when a live run produced a complete semantic observation."""
+
+    return _observation_classification(result) == "semantic-observation"
+
+
 def _count_hook_event(events: dict[str, int], name: str | None) -> None:
     if not name:
         return
@@ -995,10 +1001,11 @@ def main(argv: Sequence[str] | None = None) -> int:
             results.append(result)
             if args.jsonl:
                 print(json.dumps({"live_semantic_e2e_result": result}, ensure_ascii=False, sort_keys=True), flush=True)
+    exit_code = 0 if all(result_is_successful(result) for result in results) else 1
     if args.jsonl:
-        return 0
+        return exit_code
     print(json.dumps({"live_semantic_e2e": results}, ensure_ascii=False, indent=2, sort_keys=True))
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":

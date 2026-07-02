@@ -507,6 +507,27 @@ class AutopilotStateTest(unittest.TestCase):
     def test_adapter_payload_without_run_dir_is_noop(self):
         self.assertEqual(aps.adapter_payload_from_env({}), {"continue": True, "systemMessage": ""})
 
+    def test_bootstrap_then_advance_bootstraps_under_run_dir_lock(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "run"
+            root.mkdir()
+            original_bootstrap = aps._bootstrap_from_session_intent_if_approved
+            try:
+                observed = {}
+
+                def fake_bootstrap(run_dir, source, project_cwd):
+                    observed["locked"] = (Path(run_dir) / aps.LOCK_DIR).is_dir()
+                    _write_run(Path(run_dir), [_item("next")])
+
+                aps._bootstrap_from_session_intent_if_approved = fake_bootstrap
+
+                payload = aps._bootstrap_then_advance(root, {}, Path(tmp))
+            finally:
+                aps._bootstrap_from_session_intent_if_approved = original_bootstrap
+
+        self.assertTrue(observed["locked"])
+        self.assertIn("work-item: next", payload["systemMessage"])
+
     def test_adapter_bootstraps_project_run_from_session_intent_with_approval_env(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1413,6 +1434,19 @@ class AutopilotStateTest(unittest.TestCase):
 
         self.assertIn("before-stop:", payload["systemMessage"])
         self.assertIn(".autopilot/consistency-decision.json", payload["systemMessage"])
+        self.assertIn("promotion_evidence.decision", payload["systemMessage"])
+        self.assertIn("promotion_evidence.source", payload["systemMessage"])
+        self.assertIn("decision_id", payload["systemMessage"])
+        self.assertIn("candidate_id", payload["systemMessage"])
+        self.assertIn("governance_signal_digest", payload["systemMessage"])
+        self.assertIn("state_hash", payload["systemMessage"])
+        self.assertIn("decision_key", payload["systemMessage"])
+        self.assertIn("loop_key", payload["systemMessage"])
+        self.assertIn("promotion_evidence.decision must be one of", payload["systemMessage"])
+        self.assertIn("direct only for a current-turn before-stop resolution", payload["systemMessage"])
+        self.assertIn("evidence must be a JSON array of strings", payload["systemMessage"])
+        self.assertIn("put verdict and completion_check_digest at top level", payload["systemMessage"])
+        self.assertIn("scripts/autopilot_governance_signal.py promote-decision", payload["systemMessage"])
         self.assertIn("continue_next", payload["systemMessage"])
         self.assertIn("retry_same_unit", payload["systemMessage"])
         self.assertIn("reopen_micro", payload["systemMessage"])
@@ -1734,6 +1768,29 @@ class AutopilotStateTest(unittest.TestCase):
 
                 with self.assertRaisesRegex(aps.AutopilotStateError, "promotion_evidence"):
                     aps.advance_approved_run(run_dir)
+
+    def test_promoted_consistency_decision_accepts_direct_resolution_evidence(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            decision = _decision_action(
+                "current",
+                "continue_next",
+                completion_check_digest=VALID_COMPLETION_DIGEST,
+                verdict="pass",
+                evidence=VALID_COMPLETION_EVIDENCE,
+            )
+            decision["promotion_evidence"] = {
+                "decision": "DIRECT",
+                "source": "codex-current-turn-verification",
+            }
+            _write_run(run_dir, [_item("current", status="running")], decision=decision)
+
+            payload = aps.advance_approved_run(run_dir)
+            items = aps.read_work_items(run_dir / "tasks.jsonl")
+
+        self.assertEqual(payload, {"continue": True, "systemMessage": ""})
+        self.assertEqual(items[0]["status"], "completed")
+        self.assertEqual(items[0]["completion"]["state"], "completed")
 
     def test_retry_decision_requeues_same_item_without_popping_it(self):
         with tempfile.TemporaryDirectory() as tmp:

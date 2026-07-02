@@ -62,7 +62,7 @@ OBSERVATION_SIGNAL_SCHEMA = "autopilot-observation-signal.v1"
 AUTO_APPROVAL_ENV = "GHOST_ALICE_AUTOPILOT_APPROVAL_EVIDENCE_JSON"
 IO_TRACE_FILE_ENV = "GHOST_ALICE_IO_TRACE_FILE"
 AUTOPILOT_APPROVAL_DECISION_IDS = frozenset({"autopilot-run-approval", "autopilot-approval"})
-PROMOTION_DECISIONS = frozenset({"go", "approve", "approved", "promote", "promoted"})
+PROMOTION_DECISIONS = frozenset({"go", "approve", "approved", "promote", "promoted", "direct"})
 
 
 def _load_session_material_module():
@@ -1111,9 +1111,11 @@ def _bootstrap_then_advance(
     source: Mapping[str, str],
     project_cwd: Path,
 ) -> dict[str, Any]:
-    if not _run_state_available(root):
-        _bootstrap_from_session_intent_if_approved(root, source, project_cwd)
-    return advance_approved_run(root, source)
+    root.mkdir(parents=True, exist_ok=True)
+    with _run_dir_lock(root):
+        if not _run_state_available(root):
+            _bootstrap_from_session_intent_if_approved(root, source, project_cwd)
+        return _advance_approved_run_locked(root, source)
 
 
 def adapter_payload_from_env(env: Mapping[str, str] | None = None) -> dict[str, Any]:

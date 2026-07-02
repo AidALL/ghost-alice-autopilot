@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -90,6 +92,39 @@ class LiveSemanticE2EWindowsConfigTests(unittest.TestCase):
 
         self.assertEqual(command[-1], "-")
         self.assertNotIn(scenario.prompt, command)
+
+    def test_execute_returns_nonzero_when_any_scenario_observes_regression(self) -> None:
+        harness = _load_harness()
+        scenario = harness.LiveScenario(id="schema-drift", prompt="Return compact JSON.")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with (
+                mock.patch.object(harness, "select_scenarios", return_value=[scenario]),
+                mock.patch.object(
+                    harness,
+                    "run_scenario",
+                    return_value={
+                        "runtime": "codex",
+                        "scenario_id": scenario.id,
+                        "inference_status": "ok",
+                        "semantic_status": "schema-mismatch",
+                        "hook_status": "complete",
+                    },
+                ),
+                mock.patch("sys.stdout", new_callable=io.StringIO) as stdout,
+            ):
+                rc = harness.main([
+                    "--runtime",
+                    "codex",
+                    "--execute",
+                    "--jsonl",
+                    "--out-dir",
+                    tmp,
+                ])
+
+        self.assertEqual(rc, 1)
+        line = json.loads(stdout.getvalue().splitlines()[0])
+        self.assertEqual(line["live_semantic_e2e_result"]["semantic_status"], "schema-mismatch")
 
 
 if __name__ == "__main__":

@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   tests:
-    name: pytest
+    name: unit tests
     runs-on: ubuntu-latest
     steps:
       - name: Check out addon
@@ -30,10 +30,10 @@ jobs:
           python-version: "3.11"
 
       - name: Install test dependencies
-        run: python -m pip install --upgrade pip pytest
+        run: python -m pip install --upgrade pip
 
       - name: Run addon tests
         working-directory: ghost-alice-autopilot
         env:
           GHOST_ALICE_CORE_REPO: ${{ github.workspace }}/ghost-alice
-        run: python -m pytest -p no:cacheprovider tests -q
+        run: python -m unittest discover -s tests -p "test_*.py"
