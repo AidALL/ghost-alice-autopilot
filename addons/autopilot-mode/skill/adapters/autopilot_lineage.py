@@ -10,7 +10,6 @@ from pathlib import Path
 from typing import Any, Mapping
 
 
-APPROVAL_DECISIONS = frozenset({"go", "approve", "approved", "auto"})
 STOPWORDS = frozenset({
     "about",
     "after",
@@ -113,24 +112,6 @@ def _is_meta_audit_intent(text: str) -> bool:
     return any(marker in normalized for marker in META_AUDIT_MARKERS)
 
 
-def _current_has_autopilot_approval(intent_state: Mapping[str, Any]) -> bool:
-    decisions = intent_state.get("decisions")
-    if not isinstance(decisions, list):
-        return False
-    for raw in decisions:
-        if not isinstance(raw, Mapping) or raw.get("superseded") is True:
-            continue
-        decision_id = str(raw.get("id") or "").strip()
-        kind = str(raw.get("kind") or raw.get("type") or "").strip()
-        if decision_id not in {"autopilot-run-approval", "autopilot-approval"} and kind != "autopilot_run_approval":
-            continue
-        decision = str(raw.get("decision") or "").strip().lower()
-        source = raw.get("source")
-        if decision in APPROVAL_DECISIONS and isinstance(source, str) and source.strip():
-            return True
-    return False
-
-
 def _first_open_item_id(items: list[dict[str, Any]]) -> str:
     for status in ("running", "ready", "reopened"):
         for item in items:
@@ -211,7 +192,7 @@ def stale_continuation_source_intent_event(
     if not explicit_session or not run_session or explicit_session != run_session:
         return None
     intent_state = current_intent.get("intent_state")
-    if not isinstance(intent_state, Mapping) or _current_has_autopilot_approval(intent_state):
+    if not isinstance(intent_state, Mapping):
         return None
     state_path = current_intent.get("state_path")
     if not state_path:
@@ -241,8 +222,6 @@ def stale_continuation_event(
         return None
     run_session = _run_session_id(run)
     current_session = str(current_intent.get("session_id") or intent_state.get("session_id") or "").strip()
-    if _current_has_autopilot_approval(intent_state):
-        return None
     run_summary = _run_summary(run)
     current_summary = _current_summary(intent_state)
     state_path = current_intent.get("state_path")
