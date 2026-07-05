@@ -1254,6 +1254,265 @@ class AutopilotStateTest(unittest.TestCase):
         self.assertEqual(events[-1]["work_item_id"], "physical-ai-followup")
         self.assertEqual(events[-1]["current_session_id"], "gitlab-local")
 
+    def test_explicit_new_session_without_current_intent_parks_old_running_item(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_dir = root / "run"
+            intent_root = root / "session-intent"
+            old_state = _write_current_intent_state(
+                intent_root,
+                session_id="old-git-repair",
+                current_goal="Repair git pull failure caused by a stale upstream branch.",
+            )
+            _write_run_with_intent_source(
+                run_dir,
+                [_item("git-pull-repair", status="running")],
+                state_path=old_state,
+                session_id="old-git-repair",
+                summary="Repair git pull failure caused by a stale upstream branch.",
+            )
+            before = (run_dir / "tasks.jsonl").read_text(encoding="utf-8")
+
+            payload = aps.adapter_payload_from_env({
+                "GHOST_ALICE_AUTOPILOT_RUN_DIR": str(run_dir),
+                "GHOST_ALICE_PLATFORM": "codex",
+                "GHOST_ALICE_SESSION_INTENT_ROOT": str(intent_root),
+                "GHOST_ALICE_SESSION_ID": "fresh-natural-chat",
+            })
+            after = (run_dir / "tasks.jsonl").read_text(encoding="utf-8")
+            events = [
+                json.loads(line)
+                for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(payload, {"continue": True, "systemMessage": ""})
+        self.assertEqual(after, before)
+        self.assertEqual(events[-1]["event"], "stale_continuation_parked")
+        self.assertEqual(events[-1]["work_item_id"], "git-pull-repair")
+        self.assertEqual(events[-1]["run_session_id"], "old-git-repair")
+        self.assertEqual(events[-1]["current_session_id"], "fresh-natural-chat")
+        self.assertEqual(events[-1]["current_summary"], "")
+
+    def test_digest_only_new_session_parks_old_running_item_before_resume(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_dir = root / "run"
+            intent_root = root / "session-intent"
+            old_state = _write_current_intent_state(
+                intent_root,
+                session_id="old-git-repair",
+                current_goal="Repair git pull failure caused by a stale upstream branch.",
+            )
+            _write_run_with_intent_source(
+                run_dir,
+                [_item("git-pull-repair", status="running")],
+                state_path=old_state,
+                session_id="old-git-repair",
+                summary="Repair git pull failure caused by a stale upstream branch.",
+            )
+            _write_digest_only_intent_state(
+                intent_root,
+                session_id="fresh-natural-chat",
+                event_count=1,
+            )
+            before = (run_dir / "tasks.jsonl").read_text(encoding="utf-8")
+
+            payload = aps.adapter_payload_from_env({
+                "GHOST_ALICE_AUTOPILOT_RUN_DIR": str(run_dir),
+                "GHOST_ALICE_PLATFORM": "codex",
+                "GHOST_ALICE_SESSION_INTENT_ROOT": str(intent_root),
+                "GHOST_ALICE_SESSION_ID": "fresh-natural-chat",
+            })
+            after = (run_dir / "tasks.jsonl").read_text(encoding="utf-8")
+            events = [
+                json.loads(line)
+                for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(payload, {"continue": True, "systemMessage": ""})
+        self.assertEqual(after, before)
+        self.assertEqual(events[-1]["event"], "stale_continuation_parked")
+        self.assertEqual(events[-1]["work_item_id"], "git-pull-repair")
+        self.assertEqual(events[-1]["run_session_id"], "old-git-repair")
+        self.assertEqual(events[-1]["current_session_id"], "fresh-natural-chat")
+        self.assertEqual(events[-1]["current_summary"], "")
+
+    def test_same_session_without_current_intent_parks_old_running_item(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_dir = root / "run"
+            intent_root = root / "session-intent"
+            old_state = _write_current_intent_state(
+                intent_root,
+                session_id="fresh-natural-chat",
+                current_goal="Repair git pull failure caused by a stale upstream branch.",
+            )
+            _write_run_with_intent_source(
+                run_dir,
+                [_item("git-pull-repair", status="running")],
+                state_path=old_state,
+                session_id="fresh-natural-chat",
+                summary="Repair git pull failure caused by a stale upstream branch.",
+            )
+            before = (run_dir / "tasks.jsonl").read_text(encoding="utf-8")
+
+            payload = aps.adapter_payload_from_env({
+                "GHOST_ALICE_AUTOPILOT_RUN_DIR": str(run_dir),
+                "GHOST_ALICE_PLATFORM": "codex",
+                "GHOST_ALICE_SESSION_INTENT_ROOT": str(intent_root),
+                "GHOST_ALICE_SESSION_ID": "fresh-natural-chat",
+            })
+            after = (run_dir / "tasks.jsonl").read_text(encoding="utf-8")
+            events = [
+                json.loads(line)
+                for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(payload, {"continue": True, "systemMessage": ""})
+        self.assertEqual(after, before)
+        self.assertEqual(events[-1]["event"], "stale_continuation_parked")
+        self.assertEqual(events[-1]["work_item_id"], "git-pull-repair")
+        self.assertEqual(events[-1]["run_session_id"], "fresh-natural-chat")
+        self.assertEqual(events[-1]["current_session_id"], "fresh-natural-chat")
+        self.assertEqual(events[-1]["current_summary"], "Repair git pull failure caused by a stale upstream branch.")
+        self.assertIn("approved run source intent", events[-1]["reason"])
+
+    def test_same_session_digest_only_parks_old_running_item_before_resume(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_dir = root / "run"
+            intent_root = root / "session-intent"
+            old_state = _write_current_intent_state(
+                intent_root,
+                session_id="fresh-natural-chat",
+                current_goal="Repair git pull failure caused by a stale upstream branch.",
+            )
+            _write_run_with_intent_source(
+                run_dir,
+                [_item("git-pull-repair", status="running")],
+                state_path=old_state,
+                session_id="fresh-natural-chat",
+                summary="Repair git pull failure caused by a stale upstream branch.",
+            )
+            _write_digest_only_intent_state(
+                intent_root,
+                session_id="fresh-natural-chat",
+                event_count=1,
+            )
+            before = (run_dir / "tasks.jsonl").read_text(encoding="utf-8")
+
+            payload = aps.adapter_payload_from_env({
+                "GHOST_ALICE_AUTOPILOT_RUN_DIR": str(run_dir),
+                "GHOST_ALICE_PLATFORM": "codex",
+                "GHOST_ALICE_SESSION_INTENT_ROOT": str(intent_root),
+                "GHOST_ALICE_SESSION_ID": "fresh-natural-chat",
+            })
+            after = (run_dir / "tasks.jsonl").read_text(encoding="utf-8")
+            events = [
+                json.loads(line)
+                for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(payload, {"continue": True, "systemMessage": ""})
+        self.assertEqual(after, before)
+        self.assertEqual(events[-1]["event"], "stale_continuation_parked")
+        self.assertEqual(events[-1]["work_item_id"], "git-pull-repair")
+        self.assertEqual(events[-1]["run_session_id"], "fresh-natural-chat")
+        self.assertEqual(events[-1]["current_session_id"], "fresh-natural-chat")
+        self.assertEqual(events[-1]["current_summary"], "")
+
+    def test_same_session_changed_goal_parks_previous_running_item(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_dir = root / "run"
+            intent_root = root / "session-intent"
+            state_path = _write_current_intent_state(
+                intent_root,
+                session_id="codex-session",
+                current_goal="Repair git pull failure caused by a stale upstream branch.",
+                summary="Repair git pull failure caused by a stale upstream branch.",
+            )
+            _write_run_with_intent_source(
+                run_dir,
+                [_item("git-pull-repair", status="running")],
+                state_path=state_path,
+                session_id="codex-session",
+                summary="Repair git pull failure caused by a stale upstream branch.",
+            )
+            _write_current_intent_state(
+                intent_root,
+                session_id="codex-session",
+                current_goal="Answer whether autopilot caused unnecessary side effects after the git pull repair.",
+                summary="Assess whether the previous autopilot runtime handling over-executed beyond the git pull repair.",
+            )
+            before = (run_dir / "tasks.jsonl").read_text(encoding="utf-8")
+
+            payload = aps.adapter_payload_from_env({
+                "GHOST_ALICE_AUTOPILOT_RUN_DIR": str(run_dir),
+                "GHOST_ALICE_PLATFORM": "codex",
+                "GHOST_ALICE_SESSION_INTENT_ROOT": str(intent_root),
+                "GHOST_ALICE_SESSION_ID": "codex-session",
+            })
+            after = (run_dir / "tasks.jsonl").read_text(encoding="utf-8")
+            events = [
+                json.loads(line)
+                for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(payload, {"continue": True, "systemMessage": ""})
+        self.assertEqual(after, before)
+        self.assertEqual(events[-1]["event"], "stale_continuation_parked")
+        self.assertEqual(events[-1]["work_item_id"], "git-pull-repair")
+        self.assertEqual(events[-1]["run_session_id"], "codex-session")
+        self.assertEqual(events[-1]["current_session_id"], "codex-session")
+
+    def test_same_session_mid_run_prompt_injection_parks_previous_running_item(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_dir = root / "run"
+            intent_root = root / "session-intent"
+            state_path = _write_current_intent_state(
+                intent_root,
+                session_id="codex-session",
+                current_goal="Prepare a weekly meeting agenda and action item list.",
+                summary="Continue preparing the weekly operations meeting agenda.",
+            )
+            _write_run_with_intent_source(
+                run_dir,
+                [_item("meeting-agenda-followup", status="running")],
+                state_path=state_path,
+                session_id="codex-session",
+                summary="Prepare a weekly meeting agenda and action item list.",
+            )
+            _write_current_intent_state(
+                intent_root,
+                session_id="codex-session",
+                current_goal="Draft a polite vendor email about a delayed delivery.",
+                summary="Write a non-technical vendor reply about delivery delay.",
+            )
+            before = (run_dir / "tasks.jsonl").read_text(encoding="utf-8")
+
+            payload = aps.adapter_payload_from_env({
+                "GHOST_ALICE_AUTOPILOT_RUN_DIR": str(run_dir),
+                "GHOST_ALICE_PLATFORM": "codex",
+                "GHOST_ALICE_SESSION_INTENT_ROOT": str(intent_root),
+                "GHOST_ALICE_SESSION_ID": "codex-session",
+            })
+            after = (run_dir / "tasks.jsonl").read_text(encoding="utf-8")
+            events = [
+                json.loads(line)
+                for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(payload, {"continue": True, "systemMessage": ""})
+        self.assertEqual(after, before)
+        self.assertEqual(events[-1]["event"], "stale_continuation_parked")
+        self.assertEqual(events[-1]["work_item_id"], "meeting-agenda-followup")
+        self.assertEqual(events[-1]["run_session_id"], "codex-session")
+        self.assertEqual(events[-1]["current_session_id"], "codex-session")
+        self.assertIn("vendor email", events[-1]["current_summary"])
+        self.assertIn("outside the approved autopilot objective lineage", events[-1]["reason"])
+
     def test_same_objective_current_intent_allows_running_item_to_continue(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

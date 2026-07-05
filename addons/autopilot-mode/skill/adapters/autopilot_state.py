@@ -27,7 +27,11 @@ from autopilot_intent_recovery import (
     semantic_delta_starvation_event,
     unmet_admitted_criteria_evidence,
 )
-from autopilot_lineage import stale_continuation_event
+from autopilot_lineage import (
+    stale_continuation_event,
+    stale_continuation_missing_intent_event,
+    stale_continuation_source_intent_event,
+)
 from autopilot_work_items import (
     APPROVAL_DECISIONS,
     COMPLETION_CHECK_DIGEST_PATTERN,
@@ -982,6 +986,15 @@ def _advance_approved_run_locked(root: Path, source: Mapping[str, str] | None = 
         }
     items = _apply_pending_conduct_plan(root, items)
     current_intent = _current_intent_for_source(source, project_cwd)
+    if current_intent is None:
+        parked_event = stale_continuation_missing_intent_event(
+            run,
+            items,
+            str((source or {}).get("GHOST_ALICE_SESSION_ID") or ""),
+        )
+        if parked_event is not None:
+            _append_event(root, parked_event)
+            return _noop_payload()
     starvation_event = semantic_delta_starvation_event(current_intent)
     if starvation_event is not None:
         _append_event(root, starvation_event)
@@ -998,6 +1011,15 @@ def _advance_approved_run_locked(root: Path, source: Mapping[str, str] | None = 
     if not ready_queue:
         running_items = [item for item in items if item["status"] == "running"]
         if running_items:
+            parked_event = stale_continuation_source_intent_event(
+                run,
+                items,
+                current_intent,
+                str((source or {}).get("GHOST_ALICE_SESSION_ID") or ""),
+            )
+            if parked_event is not None:
+                _append_event(root, parked_event)
+                return _noop_payload()
             running_item = running_items[0]
             if _work_item_within_run_surfaces(run, running_item):
                 governance_candidate = _io_trace_candidate_for_item(run, running_item, source, io_trace_rows)
