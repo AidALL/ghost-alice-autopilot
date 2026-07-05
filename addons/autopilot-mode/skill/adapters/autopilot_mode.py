@@ -41,6 +41,13 @@ def _stop_hook_input(hook_input: dict) -> bool:
     return hook_input.get("hook_event_name") == "Stop" or hook_input.get("hookEventName") == "Stop"
 
 
+def _first_text(*values: object) -> str:
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
 def _format_payload_for_hook(payload: dict, hook_input: dict) -> dict:
     message = payload.get("systemMessage")
     if not message or not _stop_hook_input(hook_input):
@@ -53,6 +60,14 @@ def _format_payload_for_hook(payload: dict, hook_input: dict) -> dict:
 
 def _env_with_hook_cwd(hook_input: dict) -> dict[str, str]:
     env = dict(os.environ)
+    hook_session_id = _first_text(
+        hook_input.get("session_id"),
+        hook_input.get("sessionId"),
+        hook_input.get("conversation_id"),
+        hook_input.get("thread_id"),
+    )
+    if hook_session_id and not env.get("GHOST_ALICE_SESSION_ID"):
+        env["GHOST_ALICE_SESSION_ID"] = hook_session_id
     if env.get("GHOST_ALICE_AUTOPILOT_RUN_DIR") or env.get("GHOST_ALICE_AUTOPILOT_CWD"):
         return env
     cwd = hook_input.get("cwd")

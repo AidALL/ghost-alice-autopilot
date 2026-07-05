@@ -320,9 +320,13 @@ def apply_consistency_decision(
         raise AutopilotStateError(f"unknown consistency decision {decision!r}")
     updated = validate_work_items(copy.deepcopy(list(items)))
     item = _find_item(updated, item_id)
-    if item["status"] != "running":
+    allowed_source_statuses = {"running"}
+    if decision == "continue_next":
+        allowed_source_statuses = {"running", "ready", "reopened"}
+    if item["status"] not in allowed_source_statuses:
         raise AutopilotStateError(
-            f"consistency decision state transition {decision!r} requires running work item {item_id!r}; "
+            f"consistency decision state transition {decision!r} requires "
+            f"{', '.join(sorted(allowed_source_statuses))} work item {item_id!r}; "
             f"found {item['status']!r}"
         )
 

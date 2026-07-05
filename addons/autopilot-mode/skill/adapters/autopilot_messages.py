@@ -178,3 +178,26 @@ def build_meta_intervention_message(
         "Ask the user for a meta-level decision before continuing this autonomous run.",
     ])
     return "\n".join(lines)
+
+
+def build_semantic_delta_starvation_message(event: Mapping[str, Any]) -> str:
+    lines = [
+        "[autopilot]",
+        "decision: reopen_macro",
+        "evidence:",
+        f"- semantic-delta-starvation: {event.get('digest_only_count', 0)} consecutive digest-only user inputs",
+    ]
+    session_id = event.get("session_id")
+    if isinstance(session_id, str) and session_id.strip():
+        lines.append(f"- session_id: {session_id.strip()}")
+    latest_event_id = event.get("latest_event_id")
+    if isinstance(latest_event_id, str) and latest_event_id.strip():
+        lines.append(f"- latest_event_id: {latest_event_id.strip()}")
+    state_path = event.get("state_path")
+    if isinstance(state_path, str) and state_path.strip():
+        lines.append(f"- state_path: {state_path.strip()}")
+    lines.extend([
+        "prompt:",
+        "Before stopping, run the session-intent-analyzer recovery path for the current turn: record the current goal, constraints, decisions, acceptance criteria, and open conduct feedback as a semantic delta, then continue the actual work from that updated intent state.",
+    ])
+    return "\n".join(lines)

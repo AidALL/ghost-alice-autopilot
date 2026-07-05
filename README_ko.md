@@ -16,6 +16,7 @@ Language: [English](./README.md) | Korean
 - Ghost-ALICE installer를 통해 core-owned `[adapter:autopilot-mode] continue` hook을 등록한다.
 - 프로젝트 로컬 `.autopilot/` 실행 상태를 읽는다.
 - 명시적 승인 후 session-intent ledger file에서 `.autopilot/`을 부트스트랩하는 `skill/scripts/autopilot_session_bridge.py`와 repository wrapper `scripts/autopilot_session_bridge.py`를 제공한다.
+- Stop hook bootstrap은 session lineage에 묶인다. hook이 명시적 session id를 제공하면 다른 session의 오래된 `current-session.json` pointer로 fallback하지 않는다.
 - Stop adapter가 별도 receptor를 만들지 않고, session intent에 admitted 상태의 미충족 acceptance criteria가 기록되어 있거나 open conduct feedback이 승인된 conduct plan을 제공할 때 current-session `.autopilot/` state를 materialize한다. io-trace 자료만으로는 run을 부트스트랩하지 않으며 `autopilot-observation-signal.v1` receptor를 통한 observation으로만 처리된다.
 - `autopilot_governance_signal.py`로 evidence-backed governance candidate와 promotion을 만든다.
 - 승인된 `conduct-plan.json` proposal queue를 durable `tasks.jsonl` work item으로 가져온다.
@@ -277,6 +278,7 @@ compatibility-matrix.json
 addons/autopilot-mode/
   addon.json
   skill/SKILL.md
+  skill/adapters/autopilot_lineage.py
   skill/adapters/autopilot_messages.py
   skill/adapters/autopilot_mode.py
   skill/adapters/autopilot_state.py

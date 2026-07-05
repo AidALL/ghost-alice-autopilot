@@ -25,6 +25,8 @@ autopilot-mode is a Ghost-ALICE addon for approved autonomous continuation. The 
 - `autopilot_governance_signal.py` writes evidence-backed `consistency-decision.candidate.json` and `conduct-plan.candidate.json` files first. Candidate files are diagnostic and are not adapter-consumable.
 - Promotion creates adapter-consumable `consistency-decision.json`; the adapter requires `schema_version: "autopilot-consistency-decision.v1"`, `promotion_state: "promoted"`, `promotion_evidence.decision`, `promotion_evidence.source`, `candidate_id`, `governance_signal_digest`, `state_hash`, `decision_key`, and `loop_key`. `promotion_evidence.decision` accepts `go`, `approve`, `approved`, `promote`, `promoted`, or `direct`; use `direct` only for a current-turn before-stop resolution without a candidate.
 - Every continuation message includes a `before-stop` contract. The executing agent must promote or write `.autopilot/consistency-decision.json` when a completion, retry, or reopen decision is resolved; if not, the next Stop hook consumes current io-trace before escalating.
+- Before surfacing continuation, the adapter reconciles the run's source session-intent with the current session-intent. Same-session or same-objective discovered work continues; unrelated current intent parks the stale continuation as no-op evidence instead of injecting the old work into the current chat.
+- When a hook provides an explicit session id, bootstrap considers only that session's intent state. It must not fall back to an older `current-session.json` pointer with admitted criteria from another session.
 - If a running item has no decision file on the next Stop hook, the adapter resumes that same item with `pending-decision: missing` instead of returning a silent no-op. A repeated missing decision escalates to `ask_user_meta` only when neither io-trace nor work state can resolve the next action.
 - `conduct-plan.json` is an approved handoff from the conduct-feedback planning path. The adapter imports `autopilot-conduct-plan.v2` `proposed_queue_items` only when the plan has `promotion_state: "approved"`, approval evidence, source candidate id, and evidence digest.
 - Imported conduct plan items preserve `observer_agent_required` and `observer_contract`; observer requirements are surfaced in the continuation message.
@@ -183,6 +185,7 @@ Repository `compatibility-matrix.json` is the compatibility SSOT for this addon.
 
 ```text
 skill/adapters/autopilot_messages.py
+skill/adapters/autopilot_lineage.py
 skill/adapters/autopilot_mode.py
 skill/adapters/autopilot_state.py
 skill/adapters/autopilot_work_items.py

@@ -19,8 +19,15 @@ from typing import Any, Mapping
 from autopilot_messages import (
     build_continuation_message,
     build_meta_intervention_message,
+    build_semantic_delta_starvation_message,
     compact_governance_candidate,
 )
+from autopilot_intent_recovery import (
+    open_conduct_feedback_evidence,
+    semantic_delta_starvation_event,
+    unmet_admitted_criteria_evidence,
+)
+from autopilot_lineage import stale_continuation_event
 from autopilot_work_items import (
     APPROVAL_DECISIONS,
     COMPLETION_CHECK_DIGEST_PATTERN,
@@ -358,28 +365,6 @@ def _approval_from_session_decisions(intent_state: Mapping[str, Any]) -> dict[st
     return None
 
 
-def _unmet_admitted_criteria_evidence(intent_state: Mapping[str, Any]) -> dict[str, Any] | None:
-    criteria = intent_state.get("acceptance_criteria")
-    if not isinstance(criteria, list):
-        return None
-    open_ids = [
-        str(criterion.get("id")).strip()
-        for criterion in criteria
-        if isinstance(criterion, Mapping)
-        and criterion.get("admitted") is True
-        and str(criterion.get("status") or "unmet").lower() != "met"
-        and str(criterion.get("id") or "").strip()
-    ]
-    if not open_ids:
-        return None
-    return {
-        "decision": "AUTO",
-        "source": "admitted-unmet-criterion",
-        "reason": "session intent has admitted, not-yet-met acceptance criteria",
-        "open_criteria": open_ids,
-    }
-
-
 def _project_cwd_from_env(source: Mapping[str, str]) -> Path:
     explicit = str(source.get("GHOST_ALICE_AUTOPILOT_CWD") or source.get("PWD") or "").strip()
     return Path(explicit).expanduser() if explicit else Path.cwd()
@@ -424,19 +409,23 @@ def _iter_current_session_intents(
     project_cwd: Path,
 ):
     explicit_session = str(source.get("GHOST_ALICE_SESSION_ID") or "").strip()
+    if explicit_session:
+        for root in _session_intent_root_candidates(source, project_cwd):
+            for platform in _platform_candidates(source):
+                state_path = root / platform / _safe_id(explicit_session) / "intent-state.json"
+                if not state_path.is_file():
+                    continue
+                intent_state = _try_read_json_object(state_path)
+                yield {
+                    "platform": platform,
+                    "session_id": explicit_session,
+                    "state_path": state_path,
+                    "events_path": state_path.parent / "intent-events.jsonl",
+                    "intent_state": intent_state,
+                }
+        return
     for root in _session_intent_root_candidates(source, project_cwd):
         for platform in _platform_candidates(source):
-            if explicit_session:
-                state_path = root / platform / _safe_id(explicit_session) / "intent-state.json"
-                if state_path.is_file():
-                    intent_state = _try_read_json_object(state_path)
-                    yield {
-                        "platform": platform,
-                        "session_id": explicit_session,
-                        "state_path": state_path,
-                        "events_path": state_path.parent / EVENTS_FILE.replace("events", "intent-events"),
-                        "intent_state": intent_state,
-                    }
             pointer_path = root / platform / "current-session.json"
             pointer = _try_read_json_object(pointer_path)
             if pointer.get("schema_version") != "session-intent-current.v1":
@@ -474,12 +463,22 @@ def _run_state_available(run_dir: Path) -> bool:
     )
 
 
+def _has_explicit_session_intent_context(source: Mapping[str, str], project_cwd: Path) -> bool:
+    if str(source.get("GHOST_ALICE_SESSION_ID") or "").strip():
+        return True
+    if str(source.get("GHOST_ALICE_SESSION_INTENT_ROOT") or "").strip():
+        return True
+    return (project_cwd / ".tmp" / "session-intent").is_dir()
+
+
 def _bootstrap_from_session_intent_if_approved(
     run_dir: Path,
     source: Mapping[str, str],
     project_cwd: Path,
 ) -> bool:
     if (run_dir / OFF_FILE).exists() or _run_state_available(run_dir):
+        return False
+    if not _has_explicit_session_intent_context(source, project_cwd):
         return False
     resolved = None
     approval = None
@@ -490,7 +489,8 @@ def _bootstrap_from_session_intent_if_approved(
         candidate_approval = (
             _approval_from_env(source)
             or _approval_from_session_decisions(intent_state)
-            or _unmet_admitted_criteria_evidence(intent_state)
+            or unmet_admitted_criteria_evidence(intent_state)
+            or open_conduct_feedback_evidence(intent_state)
         )
         if candidate_approval is None:
             continue
@@ -878,6 +878,17 @@ def _io_trace_rows_for_run(run: Mapping[str, Any], source: Mapping[str, str] | N
     return _read_io_trace_rows(source, session_id=_session_id_from_run(run, source), limit=8)
 
 
+def _current_intent_for_source(source: Mapping[str, str] | None, project_cwd: Path) -> dict[str, Any] | None:
+    if source is None:
+        return None
+    if not _has_explicit_session_intent_context(source, project_cwd):
+        return None
+    for candidate in _iter_current_session_intents(source, project_cwd):
+        if isinstance(candidate.get("intent_state"), Mapping):
+            return candidate
+    return None
+
+
 def _io_trace_candidate_for_item(
     run: Mapping[str, Any],
     item: Mapping[str, Any],
@@ -954,6 +965,7 @@ def _advance_approved_run_locked(root: Path, source: Mapping[str, str] | None = 
     # Platform-neutral rendering context for the continuation signal.
     signal_base = str(root.parent)
     signal_home = str((source or {}).get("HOME") or Path.home())
+    project_cwd = _project_cwd_from_env(source or {})
 
     items = read_work_items(tasks_path) if tasks_path.is_file() else []
     items, applied_decision = _apply_pending_decision(root, items)
@@ -969,6 +981,19 @@ def _advance_approved_run_locked(root: Path, source: Mapping[str, str] | None = 
             ),
         }
     items = _apply_pending_conduct_plan(root, items)
+    current_intent = _current_intent_for_source(source, project_cwd)
+    starvation_event = semantic_delta_starvation_event(current_intent)
+    if starvation_event is not None:
+        _append_event(root, starvation_event)
+        return {
+            "continue": True,
+            "systemMessage": build_semantic_delta_starvation_message(starvation_event),
+        }
+    parked_event = stale_continuation_event(run, items, current_intent)
+    if parked_event is not None:
+        _append_event(root, parked_event)
+        return _noop_payload()
+
     ready_queue = derive_ready_queue(items)
     if not ready_queue:
         running_items = [item for item in items if item["status"] == "running"]

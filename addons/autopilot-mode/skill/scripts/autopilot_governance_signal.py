@@ -56,6 +56,21 @@ VERIFICATION_MARKERS = (
     "source backed",
     "unverified",
 )
+HIGH_IMPACT_CONDUCT_MARKERS = (
+    "report-instead-of-execute",
+    "plan instead of executing",
+    "talk instead of execute",
+    "talk-only",
+    "no-op",
+    "noop",
+    "stale intent",
+    "stale goal",
+    "wrong objective",
+    "goal drift",
+    "scope drift",
+    "unverified",
+    "verification failure",
+)
 
 
 def _utc_now() -> str:
@@ -541,6 +556,30 @@ def _safe_id(value: str) -> str:
     return safe or "conduct-feedback"
 
 
+def _conduct_feedback_text(feedback: Mapping[str, Any]) -> str:
+    parts: list[str] = []
+    for key in ("id", "summary", "corrective_rule", "failure_mode", "category", "evidence"):
+        value = feedback.get(key)
+        if isinstance(value, str):
+            parts.append(value)
+        elif isinstance(value, (list, tuple, dict)):
+            try:
+                parts.append(json.dumps(value, ensure_ascii=True, sort_keys=True))
+            except TypeError:
+                continue
+    return "\n".join(parts).lower()
+
+
+def _conduct_feedback_requires_followup(feedback: Mapping[str, Any]) -> bool:
+    occurrence_count = feedback.get("occurrence_count", 1)
+    if not isinstance(occurrence_count, int) or isinstance(occurrence_count, bool):
+        occurrence_count = 1
+    if occurrence_count >= 2:
+        return True
+    text = _conduct_feedback_text(feedback)
+    return any(marker in text for marker in HIGH_IMPACT_CONDUCT_MARKERS)
+
+
 def conduct_plan_candidate_from_governance(
     *,
     intent_state: Mapping[str, Any],
@@ -552,10 +591,7 @@ def conduct_plan_candidate_from_governance(
     selected_feedback: dict[str, Any] | None = None
     for entry in _as_list(intent_state.get("conduct_feedback")):
         feedback = _as_mapping(entry)
-        occurrence_count = feedback.get("occurrence_count", 1)
-        if not isinstance(occurrence_count, int) or isinstance(occurrence_count, bool):
-            occurrence_count = 1
-        if feedback.get("status") in {None, "open", "active"} and occurrence_count >= 2:
+        if feedback.get("status") in {None, "open", "active"} and _conduct_feedback_requires_followup(feedback):
             selected_feedback = feedback
             break
     if selected_feedback is None:

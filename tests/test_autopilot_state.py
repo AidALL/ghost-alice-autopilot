@@ -13,6 +13,7 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -20,6 +21,7 @@ ADAPTER_DIR = REPO_ROOT / "addons" / "autopilot-mode" / "skill" / "adapters"
 sys.path.insert(0, str(ADAPTER_DIR))
 
 import autopilot_state as aps  # noqa: E402
+import autopilot_mode as apm  # noqa: E402
 
 VALID_COMPLETION_DIGEST = "sha256:" + ("a" * 64)
 VALID_SIGNAL_DIGEST = "sha256:" + ("b" * 64)
@@ -249,6 +251,142 @@ def _write_session_intent_run_source(
     return state_path
 
 
+def _write_current_intent_state(
+    root: Path,
+    *,
+    session_id: str,
+    current_goal: str,
+    summary: str | None = None,
+    platform: str = "codex",
+    event_count: int = 2,
+) -> Path:
+    session_dir = root / platform / session_id
+    session_dir.mkdir(parents=True, exist_ok=True)
+    state_path = session_dir / "intent-state.json"
+    state = {
+        "schema_version": "session-intent-ledger.v1",
+        "platform": platform,
+        "session_id": session_id,
+        "current_goal": current_goal,
+        "user_intent_summary": summary or current_goal,
+        "acceptance_criteria": [
+            {
+                "id": "AC-CURRENT",
+                "summary": f"Complete current goal for {session_id}.",
+                "source": "user-explicit",
+                "status": "unmet",
+                "admitted": True,
+            }
+        ],
+        "constraints": [],
+        "decisions": [],
+        "conduct_feedback": [],
+    }
+    state_path.write_text(json.dumps(state), encoding="utf-8")
+    events = [
+        {
+            "event": "intent-updated",
+            "event_id": f"evt-{session_id}-{index}",
+            "platform": platform,
+            "session_id": session_id,
+            "source": "agent",
+            "delta_keys": ["current_goal", "user_intent_summary"],
+            "intent_delta_digest": "sha256:" + (str(index % 10) * 64),
+            "intent_delta_status": "recorded",
+        }
+        for index in range(1, event_count + 1)
+    ]
+    (session_dir / "intent-events.jsonl").write_text(
+        "\n".join(json.dumps(event, sort_keys=True) for event in events) + "\n",
+        encoding="utf-8",
+    )
+    (root / platform / "current-session.json").write_text(
+        json.dumps({
+            "schema_version": "session-intent-current.v1",
+            "platform": platform,
+            "session_id": session_id,
+            "state_path": str(state_path),
+        }),
+        encoding="utf-8",
+    )
+    return state_path
+
+
+def _write_digest_only_intent_state(
+    root: Path,
+    *,
+    session_id: str,
+    platform: str = "codex",
+    event_count: int = 1,
+) -> Path:
+    session_dir = root / platform / session_id
+    session_dir.mkdir(parents=True, exist_ok=True)
+    state_path = session_dir / "intent-state.json"
+    state_path.write_text(
+        json.dumps({
+            "schema_version": "session-intent-ledger.v1",
+            "platform": platform,
+            "session_id": session_id,
+            "current_goal": "",
+            "user_intent_summary": "",
+            "acceptance_criteria": [],
+            "constraints": [],
+            "decisions": [],
+            "conduct_feedback": [],
+            "intake_status": "observed",
+            "last_semantic_delta_status": "not-provided",
+        }),
+        encoding="utf-8",
+    )
+    (session_dir / "intent-events.jsonl").write_text(
+        "\n".join(
+            json.dumps({
+                "event": "user-input-observed",
+                "event_id": f"evt-digest-only-{index}",
+                "platform": platform,
+                "session_id": session_id,
+                "source": "hook",
+                "input_digest": "sha256:" + (str(index % 10) * 64),
+                "input_char_count": 100,
+                "intent_delta_status": "not-provided",
+            })
+            for index in range(1, event_count + 1)
+        ) + "\n",
+        encoding="utf-8",
+    )
+    return state_path
+
+
+def _write_run_with_intent_source(
+    run_dir: Path,
+    items: list[dict],
+    *,
+    state_path: Path,
+    session_id: str,
+    summary: str,
+) -> None:
+    run_dir.mkdir(parents=True, exist_ok=True)
+    events_path = state_path.parent / "intent-events.jsonl"
+    run = _approved_run_record()
+    run["scope"] = {"summary": summary}
+    run["intent_source"] = {
+        "state_path": str(state_path),
+        "events_path": str(events_path),
+    }
+    run["approval_evidence"] = {
+        "decision": "AUTO",
+        "source": "admitted-unmet-criterion",
+        "session_intent": {
+            "platform": "codex",
+            "session_id": session_id,
+            "state_path": str(state_path),
+            "events_path": str(events_path),
+        },
+    }
+    (run_dir / "approved-run.json").write_text(json.dumps(run), encoding="utf-8")
+    aps.write_work_items(run_dir / "tasks.jsonl", items)
+
+
 def _decision_action(
     work_item_id: str,
     decision: str,
@@ -406,17 +544,26 @@ class AutopilotStateTest(unittest.TestCase):
         self.assertEqual(updated[0]["completion"]["state"], "completed")
         self.assertEqual(updated[0]["completion"]["completion_check_digest"], VALID_COMPLETION_DIGEST)
 
+    def test_continue_next_accepts_valid_completion_for_ready_or_reopened_target(self):
+        for status in ("ready", "reopened"):
+            with self.subTest(status=status):
+                items = [_item("a", status=status)]
+
+                updated = aps.apply_consistency_decision(
+                    items,
+                    "a",
+                    "continue_next",
+                    completion_check_digest=VALID_COMPLETION_DIGEST,
+                    verdict="pass",
+                    evidence=VALID_COMPLETION_EVIDENCE,
+                )
+
+                self.assertEqual(updated[0]["status"], "completed")
+                self.assertEqual(updated[0]["completion"]["state"], "completed")
+                self.assertEqual(updated[0]["completion"]["completion_check_digest"], VALID_COMPLETION_DIGEST)
+
     def test_consistency_decision_rejects_non_running_targets(self):
         cases = [
-            (
-                "ready",
-                "continue_next",
-                {
-                    "completion_check_digest": VALID_COMPLETION_DIGEST,
-                    "verdict": "pass",
-                    "evidence": VALID_COMPLETION_EVIDENCE,
-                },
-            ),
             ("completed", "retry_same_unit", {}),
             ("not_applicable", "reopen_macro", {}),
         ]
@@ -719,6 +866,156 @@ class AutopilotStateTest(unittest.TestCase):
         self.assertEqual(approved_run["approval_evidence"]["source"], "admitted-unmet-criterion")
         self.assertIn("AC1", approved_run["approval_evidence"]["open_criteria"])
 
+    def test_adapter_treats_legacy_user_explicit_criterion_as_admitted_unmet(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "project"
+            project.mkdir()
+            intent_root = root / "session-intent"
+            _write_session_intent_run_source(
+                intent_root,
+                criteria=[{
+                    "id": "AC-LEGACY",
+                    "summary": "ship legacy criterion",
+                    "source": "user-explicit",
+                }],
+            )
+
+            payload = aps.adapter_payload_from_env({
+                "PWD": str(project),
+                "GHOST_ALICE_PLATFORM": "codex",
+                "GHOST_ALICE_SESSION_INTENT_ROOT": str(intent_root),
+                "GHOST_ALICE_AUTOPILOT_PLAN_PATH": ".tmp/implementation-plans/stop-bridge.md",
+            })
+            approved_run_path = project / ".autopilot" / "approved-run.json"
+            approved_run = json.loads(approved_run_path.read_text(encoding="utf-8")) if approved_run_path.exists() else {}
+
+        self.assertTrue(payload["continue"])
+        self.assertEqual(approved_run["approval_evidence"]["source"], "admitted-unmet-criterion")
+        self.assertIn("AC-LEGACY", approved_run["approval_evidence"]["open_criteria"])
+
+    def test_adapter_bootstraps_repeated_open_conduct_feedback_without_unmet_criteria(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "project"
+            project.mkdir()
+            intent_root = root / "session-intent"
+            _write_session_intent_run_source(
+                intent_root,
+                repeated_conduct_feedback=True,
+                criteria=[{
+                    "id": "AC1",
+                    "summary": "already done",
+                    "source": "user-explicit",
+                    "status": "met",
+                    "admitted": True,
+                }],
+            )
+
+            payload = aps.adapter_payload_from_env({
+                "PWD": str(project),
+                "GHOST_ALICE_PLATFORM": "codex",
+                "GHOST_ALICE_SESSION_INTENT_ROOT": str(intent_root),
+                "GHOST_ALICE_AUTOPILOT_PLAN_PATH": ".tmp/implementation-plans/stop-bridge.md",
+                "GHOST_ALICE_AUTOPILOT_CURRENT_WORK_ITEM_ID": "current",
+            })
+            run_dir = project / ".autopilot"
+            approved_run = json.loads((run_dir / "approved-run.json").read_text(encoding="utf-8"))
+            events = [
+                json.loads(line)
+                for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertTrue(payload["continue"])
+        self.assertIn("work-item: conduct-stop-event-noop", payload["systemMessage"])
+        self.assertIn("observer-agent: required", payload["systemMessage"])
+        self.assertEqual(approved_run["approval_evidence"]["decision"], "AUTO")
+        self.assertEqual(approved_run["approval_evidence"]["source"], "open-conduct-feedback")
+        self.assertIn("stop-event-noop", approved_run["approval_evidence"]["open_feedback"])
+        self.assertEqual(
+            [event["event"] for event in events],
+            ["session_intent_bootstrapped", "conduct_plan_imported", "continue_next_item"],
+        )
+
+    def test_adapter_bootstraps_single_severe_conduct_feedback_without_waiting_for_repeat(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "project"
+            project.mkdir()
+            intent_root = root / "session-intent"
+            state_path = _write_session_intent_run_source(
+                intent_root,
+                criteria=[{
+                    "id": "AC1",
+                    "summary": "already done",
+                    "source": "user-explicit",
+                    "status": "met",
+                    "admitted": True,
+                }],
+            )
+            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state["conduct_feedback"] = [{
+                "id": "report-instead-of-execute",
+                "status": "open",
+                "summary": "The agent reported a plan instead of executing the requested work.",
+                "occurrence_count": 1,
+            }]
+            state_path.write_text(json.dumps(state), encoding="utf-8")
+
+            payload = aps.adapter_payload_from_env({
+                "PWD": str(project),
+                "GHOST_ALICE_PLATFORM": "codex",
+                "GHOST_ALICE_SESSION_INTENT_ROOT": str(intent_root),
+                "GHOST_ALICE_AUTOPILOT_PLAN_PATH": ".tmp/implementation-plans/stop-bridge.md",
+                "GHOST_ALICE_AUTOPILOT_CURRENT_WORK_ITEM_ID": "current",
+            })
+            approved_run = json.loads((project / ".autopilot" / "approved-run.json").read_text(encoding="utf-8"))
+
+        self.assertTrue(payload["continue"])
+        self.assertIn("work-item: conduct-report-instead-of-execute", payload["systemMessage"])
+        self.assertIn("observer-agent: required", payload["systemMessage"])
+        self.assertEqual(approved_run["approval_evidence"]["source"], "open-conduct-feedback")
+        self.assertIn("report-instead-of-execute", approved_run["approval_evidence"]["open_feedback"])
+
+    def test_explicit_session_id_blocks_stale_pointer_bootstrap(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "project"
+            project.mkdir()
+            intent_root = root / "session-intent"
+            _write_session_intent_run_source(
+                intent_root,
+                session_id="stale-doc-review",
+                criteria=[{
+                    "id": "AC-STALE",
+                    "summary": "old admitted criterion",
+                    "source": "user-explicit",
+                    "status": "unmet",
+                    "admitted": True,
+                }],
+            )
+            _write_digest_only_intent_state(intent_root, session_id="fresh-physical-ai")
+
+            payload = aps.adapter_payload_from_env({
+                "PWD": str(project),
+                "GHOST_ALICE_PLATFORM": "codex",
+                "GHOST_ALICE_SESSION_INTENT_ROOT": str(intent_root),
+                "GHOST_ALICE_SESSION_ID": "fresh-physical-ai",
+            })
+
+        self.assertEqual(payload, {"continue": True, "systemMessage": ""})
+        self.assertFalse((project / ".autopilot" / "approved-run.json").exists())
+
+    def test_hook_input_session_id_is_passed_to_adapter_env(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            env = apm._env_with_hook_cwd({
+                "session_id": "fresh-physical-ai",
+                "cwd": "/tmp/fresh-physical-ai",
+            })
+
+        self.assertEqual(env["GHOST_ALICE_SESSION_ID"], "fresh-physical-ai")
+        self.assertEqual(env["GHOST_ALICE_AUTOPILOT_CWD"], "/tmp/fresh-physical-ai")
+
     def test_adapter_payload_defaults_to_project_autopilot_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
             project = Path(tmp)
@@ -871,6 +1168,171 @@ class AutopilotStateTest(unittest.TestCase):
         self.assertEqual([item["status"] for item in items], ["ready", "running"])
         self.assertEqual(events[0]["event"], "resume_running_item_without_decision")
         self.assertEqual(events[0]["run_id"], "run-1")
+
+    def test_existing_run_ignores_ambient_home_current_session_without_explicit_context(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "project"
+            home = root / "home"
+            project.mkdir()
+            run_dir = project / ".autopilot"
+            _write_run(run_dir, [_item("next")])
+            ambient_root = home / "ghost-alice" / ".tmp" / "session-intent"
+            state_path = _write_digest_only_intent_state(
+                ambient_root,
+                session_id="ambient-digest-only",
+                event_count=3,
+            )
+            (ambient_root / "codex" / "current-session.json").write_text(
+                json.dumps({
+                    "schema_version": "session-intent-current.v1",
+                    "platform": "codex",
+                    "session_id": "ambient-digest-only",
+                    "state_path": str(state_path),
+                }),
+                encoding="utf-8",
+            )
+
+            payload = aps.adapter_payload_from_env({
+                "GHOST_ALICE_AUTOPILOT_RUN_DIR": str(run_dir),
+                "GHOST_ALICE_PLATFORM": "codex",
+                "HOME": str(home),
+                "PWD": str(project),
+            })
+            items = aps.read_work_items(run_dir / "tasks.jsonl")
+            events = [
+                json.loads(line)
+                for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertTrue(payload["continue"])
+        self.assertIn("work-item: next", payload["systemMessage"])
+        self.assertNotIn("semantic-delta-starvation", payload["systemMessage"])
+        self.assertEqual(items[0]["status"], "running")
+        self.assertEqual(events[-1]["event"], "continue_next_item")
+
+    def test_stale_running_item_is_parked_when_current_intent_is_unrelated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_dir = root / "run"
+            intent_root = root / "session-intent"
+            old_state = _write_current_intent_state(
+                intent_root,
+                session_id="physical-ai-research",
+                current_goal="Research physical AI regulation status and future outlook.",
+                summary="Produce a multi-step source-backed physical AI regulation outlook.",
+            )
+            _write_run_with_intent_source(
+                run_dir,
+                [_item("physical-ai-followup", status="running")],
+                state_path=old_state,
+                session_id="physical-ai-research",
+                summary="Research physical AI regulation status and future outlook.",
+            )
+            _write_current_intent_state(
+                intent_root,
+                session_id="gitlab-local",
+                current_goal="Assess whether a spare company computer can host local GitLab.",
+                summary="Answer GitLab local hosting feasibility and operational requirements.",
+            )
+            before = (run_dir / "tasks.jsonl").read_text(encoding="utf-8")
+
+            payload = aps.adapter_payload_from_env({
+                "GHOST_ALICE_AUTOPILOT_RUN_DIR": str(run_dir),
+                "GHOST_ALICE_PLATFORM": "codex",
+                "GHOST_ALICE_SESSION_INTENT_ROOT": str(intent_root),
+            })
+            after = (run_dir / "tasks.jsonl").read_text(encoding="utf-8")
+            events = [
+                json.loads(line)
+                for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertEqual(payload, {"continue": True, "systemMessage": ""})
+        self.assertEqual(after, before)
+        self.assertEqual(events[-1]["event"], "stale_continuation_parked")
+        self.assertEqual(events[-1]["work_item_id"], "physical-ai-followup")
+        self.assertEqual(events[-1]["current_session_id"], "gitlab-local")
+
+    def test_same_objective_current_intent_allows_running_item_to_continue(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_dir = root / "run"
+            intent_root = root / "session-intent"
+            old_state = _write_current_intent_state(
+                intent_root,
+                session_id="physical-ai-research",
+                current_goal="Research physical AI regulation status and future outlook.",
+            )
+            _write_run_with_intent_source(
+                run_dir,
+                [_item("physical-ai-followup", status="running")],
+                state_path=old_state,
+                session_id="physical-ai-research",
+                summary="Research physical AI regulation status and future outlook.",
+            )
+            _write_current_intent_state(
+                intent_root,
+                session_id="physical-ai-deeper-followup",
+                current_goal="Research physical AI regulation status and future outlook with deeper regulatory sources.",
+                summary="Continue the same physical AI regulation outlook with additional source checks.",
+            )
+
+            payload = aps.adapter_payload_from_env({
+                "GHOST_ALICE_AUTOPILOT_RUN_DIR": str(run_dir),
+                "GHOST_ALICE_PLATFORM": "codex",
+                "GHOST_ALICE_SESSION_INTENT_ROOT": str(intent_root),
+            })
+            items = aps.read_work_items(run_dir / "tasks.jsonl")
+
+        self.assertTrue(payload["continue"])
+        self.assertIn("work-item: physical-ai-followup", payload["systemMessage"])
+        self.assertIn("pending-decision: missing", payload["systemMessage"])
+        self.assertEqual(items[0]["status"], "running")
+
+    def test_digest_only_current_session_escalates_before_stale_noop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            run_dir = root / "run"
+            intent_root = root / "session-intent"
+            old_state = _write_current_intent_state(
+                intent_root,
+                session_id="old-review",
+                current_goal="Review an old document branch.",
+            )
+            completed = _item("old-review-item", status="ready")
+            completed["status"] = "completed"
+            completed["completion"]["state"] = "completed"
+            completed["completion"]["verdict"] = "pass"
+            _write_run_with_intent_source(
+                run_dir,
+                [completed],
+                state_path=old_state,
+                session_id="old-review",
+                summary="Review an old document branch.",
+            )
+            _write_digest_only_intent_state(
+                intent_root,
+                session_id="current-autopilot-debug",
+                event_count=3,
+            )
+
+            payload = aps.adapter_payload_from_env({
+                "GHOST_ALICE_AUTOPILOT_RUN_DIR": str(run_dir),
+                "GHOST_ALICE_PLATFORM": "codex",
+                "GHOST_ALICE_SESSION_INTENT_ROOT": str(intent_root),
+                "GHOST_ALICE_SESSION_ID": "current-autopilot-debug",
+            })
+            events = [
+                json.loads(line)
+                for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+
+        self.assertTrue(payload["continue"])
+        self.assertIn("semantic-delta-starvation", payload["systemMessage"])
+        self.assertIn("session-intent-analyzer", payload["systemMessage"])
+        self.assertEqual(events[-1]["event"], "semantic_delta_starvation")
+        self.assertEqual(events[-1]["session_id"], "current-autopilot-debug")
 
     def test_decision_candidate_file_is_not_adapter_consumable(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1477,6 +1939,40 @@ class AutopilotStateTest(unittest.TestCase):
         self.assertTrue(decision_removed)
         self.assertTrue(applied_decision_exists)
         self.assertIn("work-item: next", payload["systemMessage"])
+
+    def test_ready_continue_next_decision_from_real_session_is_applied_before_no_ready_item(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            _write_run(
+                run_dir,
+                [_item("release-readiness-pass", status="ready")],
+                decision=_decision_action(
+                    "release-readiness-pass",
+                    "continue_next",
+                    completion_check_digest=VALID_COMPLETION_DIGEST,
+                    verdict="pass",
+                    evidence=VALID_COMPLETION_EVIDENCE,
+                ),
+            )
+
+            payload = aps.advance_approved_run(run_dir)
+            items = aps.read_work_items(run_dir / "tasks.jsonl")
+            events = [
+                json.loads(line)
+                for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+            ]
+            decision_removed = not (run_dir / "consistency-decision.json").exists()
+            applied_decision_exists = (run_dir / "consistency-decision.applied.json").is_file()
+            rejected_decision_exists = (run_dir / "consistency-decision.rejected.json").exists()
+
+        self.assertEqual(payload, {"continue": True, "systemMessage": ""})
+        self.assertEqual(items[0]["status"], "completed")
+        self.assertEqual(items[0]["completion"]["state"], "completed")
+        self.assertEqual(items[0]["completion"]["completion_check_digest"], VALID_COMPLETION_DIGEST)
+        self.assertTrue(decision_removed)
+        self.assertTrue(applied_decision_exists)
+        self.assertFalse(rejected_decision_exists)
+        self.assertEqual([event["event"] for event in events], ["consistency_decision_applied", "no_ready_item"])
 
     def test_validated_continue_next_marks_admitted_criterion_met_in_ledger(self):
         core_ledger = _locate_core_ledger_source()

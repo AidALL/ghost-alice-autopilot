@@ -37,6 +37,8 @@ RELEASE_PACKAGE_FILES = (
     "addons-manifest.json",
     "addons/autopilot-mode/addon.json",
     "addons/autopilot-mode/skill/SKILL.md",
+    "addons/autopilot-mode/skill/adapters/autopilot_intent_recovery.py",
+    "addons/autopilot-mode/skill/adapters/autopilot_lineage.py",
     "addons/autopilot-mode/skill/adapters/autopilot_mode.py",
     "compatibility-matrix.json",
     "docs/release/2026-06-22-release-notes.md",
@@ -360,6 +362,7 @@ class CompatibilitySurfaceTest(unittest.TestCase):
 
     def test_public_docs_list_release_adapter_helper_modules(self) -> None:
         required_files = (
+            "skill/adapters/autopilot_lineage.py",
             "skill/adapters/autopilot_messages.py",
             "skill/adapters/autopilot_work_items.py",
             "skill/scripts/autopilot_session_bridge.py",
