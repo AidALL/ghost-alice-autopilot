@@ -77,17 +77,16 @@
       "id": "agent-platform-claude",
       "kind": "agent-platform",
       "name": "Claude Code",
-      "status": "simulated-local",
+      "status": "verified-local",
       "full_compatibility_blocker": false,
       "evidence": [
         "install status covers addon-registry ok, autopilot-mode skill/adapter content_hash-match, and overall ok for the Claude surface",
         "installed-copy smoke covers the Claude skill bridge writing approved run state and the adapter emitting a continuation payload",
         "fresh install E2E covers install/status and temporary HOME lifecycle for the Claude surface",
-        "live semantic E2E has no successful Claude semantic result attached; status remains simulated-local until a credentialed Claude runtime run passes"
+        "scripts/live_semantic_e2e.py --runtime both --scenario-source intent --execute --jsonl produces Claude inference_status=ok, semantic_status=parsed, and hook_status=complete across the intent scenario set",
+        "the core blind controller confirms Claude passes five purpose-hidden fresh-session cases with all evaluator dimensions passing"
       ],
-      "next_evidence_required": [
-        "run Claude live semantic E2E with working Claude credentials and attach command, exit code, and semantic_status evidence"
-      ]
+      "next_evidence_required": []
     },
     {
       "id": "agent-platform-codex",
@@ -101,6 +100,7 @@
         "fresh install E2E covers default install/status, Codex status, installed adapter smoke, Claude lifecycle uninstall, and overall uninstall cleanup",
         "scripts/live_semantic_e2e.py --runtime both --scenario-source intent --execute --jsonl --timeout-sec 180 produces Codex inference_status=ok, semantic_status=parsed, and hook_status=complete",
         "candidate-boundary check keeps Codex live observation signals candidate-only with action_file_allowed false and direct promotion false",
+        "the core blind controller confirms Codex passes five purpose-hidden fresh-session cases with all evaluator dimensions passing",
         "tests/test_autopilot_session_bridge.py verifies --platform codex bridges current-session.json, intent-state.json, and intent-events.jsonl into approval-gated .autopilot run state"
       ],
       "next_evidence_required": []

@@ -43,6 +43,7 @@ RELEASE_PACKAGE_FILES = (
     "compatibility-matrix.json",
     "docs/release/2026-06-22-release-notes.md",
     "docs/release/2026-07-01-release-notes.md",
+    "docs/release/2026-08-17-release-notes.md",
     "addons/autopilot-mode/skill/adapters/autopilot_messages.py",
     "addons/autopilot-mode/skill/adapters/autopilot_state.py",
     "addons/autopilot-mode/skill/adapters/autopilot_work_items.py",
@@ -50,15 +51,20 @@ RELEASE_PACKAGE_FILES = (
     "addons/autopilot-mode/skill/scripts/autopilot_session_bridge.py",
     "addons/autopilot-mode/skill/scripts/autopilot_session_material.py",
     "scripts/autopilot_session_bridge.py",
+    "scripts/check_prose_wrapping.py",
     "scripts/fresh_install_e2e.py",
     "scripts/live_semantic_e2e.py",
+    "scripts/project_runtime.py",
+    "scripts/run_project_tests.py",
     "tests/test_autopilot_session_bridge.py",
     "tests/test_autopilot_messages.py",
     "tests/test_autopilot_state.py",
+    "tests/test_check_prose_wrapping.py",
     "tests/test_compatibility_surface.py",
     "tests/test_governance_signal.py",
     "tests/test_live_semantic_e2e_harness.py",
     "tests/test_live_semantic_e2e_unittest.py",
+    "tests/test_project_runtime.py",
     "tests/test_privileged_adapter.py",
 )
 BASH_FIRST_PUBLIC_DOC_PATTERNS = {
@@ -124,6 +130,15 @@ def _tracked_release_surface() -> list[str]:
 
 
 class CompatibilitySurfaceTest(unittest.TestCase):
+    def test_ci_uses_repo_local_project_test_runner(self) -> None:
+        workflow = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(
+            encoding="utf-8"
+        )
+
+        self.assertIn("python -m pip install --upgrade pip pytest", workflow)
+        self.assertIn("python scripts/run_project_tests.py tests", workflow)
+        self.assertNotIn("python -m unittest discover", workflow)
+
     def test_release_package_files_are_in_git_index(self) -> None:
         self.assertEqual(sorted(RELEASE_PACKAGE_FILES), _tracked_release_surface())
         for rel in RELEASE_PACKAGE_FILES:
@@ -145,10 +160,10 @@ class CompatibilitySurfaceTest(unittest.TestCase):
         )
 
     def test_addon_manifest_core_floor_matches_public_contract(self) -> None:
-        self.assertEqual(_addon_manifest()["min_core_version"], "0.2.1")
+        self.assertEqual(_addon_manifest()["min_core_version"], "0.2.2")
         entry = _top_level_addons_manifest()["addons"][0]
         self.assertEqual(entry["id"], "autopilot-mode")
-        self.assertEqual(entry["min_core_version"], "0.2.1")
+        self.assertEqual(entry["min_core_version"], "0.2.2")
 
     def test_compatibility_matrix_enumerates_required_targets(self) -> None:
         matrix = _compatibility_matrix()
@@ -186,16 +201,29 @@ class CompatibilitySurfaceTest(unittest.TestCase):
             with self.subTest(evidence=evidence):
                 self.assertIsNone(dated_run_pattern.search(evidence))
 
-    def test_claude_live_semantic_gap_stays_next_evidence_not_stale_evidence(self) -> None:
+    def test_claude_install_wording_matches_verified_matrix_evidence(self) -> None:
         matrix = _compatibility_matrix()
         by_id = {target["id"]: target for target in matrix["targets"]}
         claude = by_id["agent-platform-claude"]
 
-        self.assertEqual(claude["status"], "simulated-local")
-        self.assertIn("Claude live semantic E2E", " ".join(claude["next_evidence_required"]))
+        self.assertEqual(claude["status"], "verified-local")
+        self.assertIs(claude["full_compatibility_blocker"], False)
+        self.assertFalse(claude["next_evidence_required"])
         evidence = "\n".join(claude["evidence"])
-        self.assertNotIn("api_error_status", evidence)
-        self.assertNotIn("401", evidence)
+        for token in (
+            "scripts/live_semantic_e2e.py --runtime both --scenario-source intent --execute",
+            "inference_status=ok",
+            "semantic_status=parsed",
+            "hook_status=complete",
+            "core blind controller",
+            "five purpose-hidden",
+        ):
+            with self.subTest(token=token):
+                self.assertIn(token, evidence)
+        for rel in ("README.md", "README_ko.md", "addons/autopilot-mode/skill/SKILL.md"):
+            text = (REPO_ROOT / rel).read_text(encoding="utf-8")
+            with self.subTest(rel=rel):
+                self.assertIn("Claude Code: `verified-local`", text)
 
     def test_public_docs_surface_unverified_compatibility_targets(self) -> None:
         required_phrases = (
@@ -280,14 +308,14 @@ class CompatibilitySurfaceTest(unittest.TestCase):
         self.assertNotIn("p6-autopilot", text)
 
     def test_user_docs_warn_old_core_can_install_inert_skill_without_adapter(self) -> None:
-        english_expected = ("0.2.1", "inert", "without wiring the privileged adapter")
+        english_expected = ("0.2.2", "inert", "without wiring the privileged adapter")
         for rel in ("README.md", "addons/autopilot-mode/skill/SKILL.md"):
             text = (REPO_ROOT / rel).read_text(encoding="utf-8")
             for phrase in english_expected:
                 with self.subTest(rel=rel, phrase=phrase):
                     self.assertIn(phrase, text)
         korean = (REPO_ROOT / "README_ko.md").read_text(encoding="utf-8")
-        for phrase in ("0.2.1", "skill만 복사", "privileged adapter", "inert"):
+        for phrase in ("0.2.2", "skill만 복사", "privileged adapter", "inert"):
             with self.subTest(rel="README_ko.md", phrase=phrase):
                 self.assertIn(phrase, korean)
 
@@ -336,6 +364,19 @@ class CompatibilitySurfaceTest(unittest.TestCase):
             "conduct-plan.candidate.json",
             "promotion",
             "adapter-consumable",
+        )
+        for rel in ("README.md", "README_ko.md", "addons/autopilot-mode/skill/SKILL.md"):
+            text = (REPO_ROOT / rel).read_text(encoding="utf-8")
+            for phrase in required_phrases:
+                with self.subTest(rel=rel, phrase=phrase):
+                    self.assertIn(phrase, text)
+
+    def test_docs_describe_state_aware_decision_promotion(self) -> None:
+        required_phrases = (
+            "target work-item status",
+            "`continue_next` accepts `running`, `ready`, or `reopened`",
+            "all other decisions require `running`",
+            "without creating `consistency-decision.json`",
         )
         for rel in ("README.md", "README_ko.md", "addons/autopilot-mode/skill/SKILL.md"):
             text = (REPO_ROOT / rel).read_text(encoding="utf-8")
@@ -408,6 +449,8 @@ class CompatibilitySurfaceTest(unittest.TestCase):
             "hook_status=complete",
             "action_file_allowed false",
             "direct promotion false",
+            "core blind controller",
+            "five purpose-hidden",
         )
         for token in required_evidence_tokens:
             with self.subTest(token=token):

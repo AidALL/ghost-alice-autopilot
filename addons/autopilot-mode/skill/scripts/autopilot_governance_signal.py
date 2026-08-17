@@ -5,13 +5,14 @@ This script intentionally separates diagnostic/candidate outputs from
 adapter-consumable action files. The adapter still consumes only promoted
 `consistency-decision.json` and approved `conduct-plan.json` files.
 
-Dependencies: Python 3.11+ standard library only.
+Dependencies: Python 3.11+ standard library plus the sibling work-item adapter contract.
 """
 
 from __future__ import annotations
 
 import argparse
 import hashlib
+import importlib.util
 import json
 import os
 import tempfile
@@ -492,11 +493,22 @@ def _action_from_candidate(
     return {key: value for key, value in payload.items() if value is not None}
 
 
+def _allowed_source_statuses_for_consistency_decision(decision: str) -> frozenset[str]:
+    adapter_path = Path(__file__).resolve().parents[1] / "adapters" / "autopilot_work_items.py"
+    spec = importlib.util.spec_from_file_location("autopilot_work_items_contract", adapter_path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"unable to load work-item contract from {adapter_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return frozenset(module.allowed_source_statuses_for_consistency_decision(decision))
+
+
 def promote_candidate_to_action(
     candidate: Mapping[str, Any] | None,
     *,
     prior_loop_keys: Iterable[str] | None = None,
     current_attempt: int = 0,
+    work_item_status: str | None = None,
     promotion_evidence: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     """Promote an evidence-backed candidate into an adapter-consumable action."""
@@ -507,25 +519,21 @@ def promote_candidate_to_action(
     loop_guard = _as_mapping(candidate.get("loop_guard"))
     loop_key = loop_guard.get("loop_key")
     prior = set(prior_loop_keys or [])
-    if isinstance(loop_key, str) and loop_key in prior:
-        return _action_from_candidate(
-            candidate,
-            decision="ask_user_meta",
-            evidence=[*evidence, "loop-guard: repeated decision/state"],
-            promotion_evidence=promotion_evidence,
-        )
-
     decision = candidate["decision"]
+    if isinstance(loop_key, str) and loop_key in prior:
+        decision = "ask_user_meta"
+        evidence = [*evidence, "loop-guard: repeated decision/state"]
     max_retry_attempts = loop_guard.get("max_retry_attempts", DEFAULT_RETRY_ATTEMPT_CAP)
     if not isinstance(max_retry_attempts, int) or isinstance(max_retry_attempts, bool):
         max_retry_attempts = DEFAULT_RETRY_ATTEMPT_CAP
-    if decision == "retry_same_unit" and current_attempt >= max_retry_attempts:
-        return _action_from_candidate(
-            candidate,
-            decision="ask_user_meta",
-            evidence=[*evidence, f"loop-guard: retry attempt cap {max_retry_attempts} reached"],
-            promotion_evidence=promotion_evidence,
-        )
+    if candidate["decision"] == "retry_same_unit" and current_attempt >= max_retry_attempts:
+        decision = "ask_user_meta"
+        evidence = [*evidence, f"loop-guard: retry attempt cap {max_retry_attempts} reached"]
+
+    if work_item_status is not None:
+        allowed_statuses = _allowed_source_statuses_for_consistency_decision(decision)
+        if work_item_status not in allowed_statuses:
+            return None
 
     return _action_from_candidate(candidate, decision=decision, evidence=evidence, promotion_evidence=promotion_evidence)
 
@@ -533,9 +541,13 @@ def promote_candidate_to_action(
 def _promotion_context_from_run_dir(run_dir: str | Path, work_item_id: str) -> dict[str, Any]:
     root = Path(run_dir)
     current_attempt = 0
+    work_item_status = None
     for item in _read_jsonl_objects(root / "tasks.jsonl"):
-        if item.get("id") == work_item_id and isinstance(item.get("attempt"), int):
-            current_attempt = item["attempt"]
+        if item.get("id") == work_item_id:
+            if isinstance(item.get("attempt"), int):
+                current_attempt = item["attempt"]
+            if isinstance(item.get("status"), str):
+                work_item_status = item["status"]
             break
     prior_loop_keys: list[str] = []
     for event in _read_jsonl_objects(root / "events.jsonl"):
@@ -546,7 +558,11 @@ def _promotion_context_from_run_dir(run_dir: str | Path, work_item_id: str) -> d
         loop_key = event.get("loop_key")
         if isinstance(loop_key, str) and loop_key:
             prior_loop_keys.append(loop_key)
-    return {"current_attempt": current_attempt, "prior_loop_keys": prior_loop_keys}
+    return {
+        "current_attempt": current_attempt,
+        "prior_loop_keys": prior_loop_keys,
+        "work_item_status": work_item_status,
+    }
 
 
 def _safe_id(value: str) -> str:
@@ -698,11 +714,14 @@ def _cmd_decision_candidate(args: argparse.Namespace) -> int:
 
 def _cmd_promote_decision(args: argparse.Namespace) -> int:
     candidate = _read_json_object(args.candidate)
-    context = {"current_attempt": 0, "prior_loop_keys": []}
-    if args.run_dir:
-        work_item_id = candidate.get("work_item_id")
-        if isinstance(work_item_id, str):
-            context = _promotion_context_from_run_dir(args.run_dir, work_item_id)
+    work_item_id = candidate.get("work_item_id")
+    if not isinstance(work_item_id, str):
+        return 3
+    run_dir = args.run_dir or Path(args.candidate).parent
+    context = _promotion_context_from_run_dir(run_dir, work_item_id)
+    work_item_status = context["work_item_status"]
+    if not isinstance(work_item_status, str):
+        return 3
     current_attempt = args.current_attempt
     if current_attempt is None:
         current_attempt = int(context["current_attempt"])
@@ -711,6 +730,7 @@ def _cmd_promote_decision(args: argparse.Namespace) -> int:
         candidate,
         prior_loop_keys=prior_loop_keys,
         current_attempt=current_attempt,
+        work_item_status=work_item_status,
     )
     if action is None:
         return 3

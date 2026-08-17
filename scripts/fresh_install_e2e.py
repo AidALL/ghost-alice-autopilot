@@ -12,11 +12,18 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import subprocess
 import sys
-import tempfile
 from pathlib import Path
 from typing import Any, Sequence
+
+
+sys.dont_write_bytecode = True
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from project_runtime import ProjectRuntime
 
 
 DEFAULT_IMAGE_TAG = "ghost-alice-fresh-install-e2e:local"
@@ -66,10 +73,7 @@ def semantic_scenarios() -> list[dict[str, Any]]:
             "source_session_id": "019ee6b9-7a62-7a92-8d13-1b1a27e6fb9d",
             "conduct_feedback_ids": ["observer-default-install-scope-gap"],
             "prompt": (
-                "Evaluate whether a fresh install test that passes only a platform-specific "
-                "command is enough for an addon that must support both Claude and Codex. "
-                "If the test narrows the default install path by accident, call out the gap "
-                "and propose the next verification step."
+                "Evaluate whether a fresh install test that passes only a platform-specific " "command is enough for an addon that must support both Claude and Codex. " "If the test narrows the default install path by accident, call out the gap " "and propose the next verification step."
             ),
             "expected_observations": [
                 "Detect platform narrowing instead of treating a single-platform pass as default-install proof.",
@@ -88,10 +92,7 @@ def semantic_scenarios() -> list[dict[str, Any]]:
             "source_session_id": "autopilot-behavior-upgrade-plan",
             "conduct_feedback_ids": ["plan-updates-during-testing"],
             "prompt": (
-                "You are executing an implementation plan and a test reveals that the original "
-                "task order is wrong. Decide whether the plan needs to be updated, whether focus "
-                "should move between micro, meso, macro, or meta, and what evidence should trigger "
-                "rework instead of continuing blindly."
+                "You are executing an implementation plan and a test reveals that the original " "task order is wrong. Decide whether the plan needs to be updated, whether focus " "should move between micro, meso, macro, or meta, and what evidence should trigger " "rework instead of continuing blindly."
             ),
             "expected_observations": [
                 "Treat the plan as a live artifact when evidence changes scope, ordering, or logic.",
@@ -114,9 +115,7 @@ def semantic_scenarios() -> list[dict[str, Any]]:
                 "verify-claim-scope-before-asserting-property",
             ],
             "prompt": (
-                "A reviewer claims the adapter behavior is correct. Verify the claim without "
-                "trusting the reviewer verdict. Use the primary artifact, keep the check read-only, "
-                "and avoid claiming more than the inspected source proves."
+                "A reviewer claims the adapter behavior is correct. Verify the claim without " "trusting the reviewer verdict. Use the primary artifact, keep the check read-only, " "and avoid claiming more than the inspected source proves."
             ),
             "expected_observations": [
                 "Use a primary file or command output as evidence instead of inherited reviewer judgment.",
@@ -139,9 +138,7 @@ def semantic_scenarios() -> list[dict[str, Any]]:
                 "infra-as-stop-excuse",
             ],
             "prompt": (
-                "The user has approved a bounded implementation step. Do not stop at explaining "
-                "what should happen. Execute the next safe step, report discovered blockers only "
-                "when they are real, and avoid turning infrastructure uncertainty into a stop excuse."
+                "The user has approved a bounded implementation step. Do not stop at explaining " "what should happen. Execute the next safe step, report discovered blockers only " "when they are real, and avoid turning infrastructure uncertainty into a stop excuse."
             ),
             "expected_observations": [
                 "Takes a bounded safe action instead of returning only a proposal.",
@@ -544,20 +541,29 @@ def docker_run_args(
     ]
 
 
-def run_command(args: Sequence[str], *, cwd: Path | None = None) -> int:
-    process = subprocess.run(list(args), cwd=str(cwd) if cwd else None)
+def run_command(
+    args: Sequence[str],
+    *,
+    runtime: ProjectRuntime,
+    cwd: Path | None = None,
+) -> int:
+    process = runtime.run(list(args), cwd=str(cwd) if cwd else None)
     return int(process.returncode)
 
 
-def build_image(image_tag: str, *, no_cache: bool = False) -> int:
-    with tempfile.TemporaryDirectory(prefix="ghost-alice-fresh-install-build-") as tmp:
-        context = Path(tmp)
-        (context / "Dockerfile").write_text(dockerfile(), encoding="utf-8")
-        args = ["docker", "build", "-t", image_tag]
-        if no_cache:
-            args.append("--no-cache")
-        args.append(str(context))
-        return run_command(args)
+def build_image(
+    image_tag: str,
+    *,
+    runtime: ProjectRuntime,
+    no_cache: bool = False,
+) -> int:
+    context = runtime.directory("docker-build-context")
+    (context / "Dockerfile").write_text(dockerfile(), encoding="utf-8")
+    args = ["docker", "build", "-t", image_tag]
+    if no_cache:
+        args.append("--no-cache")
+    args.append(str(context))
+    return run_command(args, runtime=runtime)
 
 
 def write_container_script(directory: Path) -> Path:
@@ -606,13 +612,13 @@ def main(argv: Sequence[str] | None = None) -> int:
         sys.stderr.write(f"addon repo manifest not found: {addon_repo}\n")
         return 2
 
-    if not args.skip_build:
-        build_rc = build_image(args.image_tag, no_cache=args.no_cache)
-        if build_rc != 0:
-            return build_rc
+    with ProjectRuntime(addon_repo, "fresh-install-e2e") as runtime:
+        if not args.skip_build:
+            build_rc = build_image(args.image_tag, runtime=runtime, no_cache=args.no_cache)
+            if build_rc != 0:
+                return build_rc
 
-    with tempfile.TemporaryDirectory(prefix="ghost-alice-fresh-install-script-") as tmp:
-        run_script = write_container_script(Path(tmp))
+        run_script = write_container_script(runtime.directory("container-script"))
         return run_command(
             docker_run_args(
                 image_tag=args.image_tag,
@@ -621,7 +627,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 run_script=run_script,
                 agent_cli_mode=args.agent_cli_mode,
                 live_cli_mode=args.live_cli_mode,
-            )
+            ),
+            runtime=runtime,
         )
 
 

@@ -583,6 +583,10 @@ class GovernanceSignalTest(unittest.TestCase):
             candidate_path = run_dir / "consistency-decision.candidate.json"
             action_path = run_dir / "consistency-decision.json"
             candidate_path.write_text(json.dumps(candidate), encoding="utf-8")
+            (run_dir / "tasks.jsonl").write_text(
+                json.dumps({"id": "work-1", "status": "running", "attempt": 0}) + "\n",
+                encoding="utf-8",
+            )
             (run_dir / "events.jsonl").write_text(
                 json.dumps({
                     "event": "consistency_decision_applied",
@@ -614,6 +618,78 @@ class GovernanceSignalTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(action["decision"], "ask_user_meta")
         self.assertIn("loop-guard: repeated decision/state", "\n".join(action["evidence"]))
+
+    def test_cli_promotion_rejects_reopen_for_ready_work_item(self) -> None:
+        module = _load_module(self)
+        candidate = module.decision_candidate_from_governance(
+            work_item_id="work-1",
+            intent_state=_intent_state_with_conduct_feedback(),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / ".autopilot"
+            run_dir.mkdir()
+            candidate_path = run_dir / "consistency-decision.candidate.json"
+            action_path = run_dir / "consistency-decision.json"
+            candidate_path.write_text(json.dumps(candidate), encoding="utf-8")
+            (run_dir / "tasks.jsonl").write_text(
+                json.dumps({"id": "work-1", "status": "ready", "attempt": 0}) + "\n",
+                encoding="utf-8",
+            )
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT_PATH),
+                    "promote-decision",
+                    "--candidate",
+                    str(candidate_path),
+                    "--run-dir",
+                    str(run_dir),
+                    "--out",
+                    str(action_path),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 3, result.stderr)
+            self.assertFalse(action_path.exists())
+
+    def test_cli_promotion_fails_closed_when_target_work_item_is_missing(self) -> None:
+        module = _load_module(self)
+        candidate = module.decision_candidate_from_governance(
+            work_item_id="missing-work",
+            intent_state=_intent_state_with_conduct_feedback(),
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / ".autopilot"
+            run_dir.mkdir()
+            candidate_path = run_dir / "consistency-decision.candidate.json"
+            action_path = run_dir / "consistency-decision.json"
+            candidate_path.write_text(json.dumps(candidate), encoding="utf-8")
+            (run_dir / "tasks.jsonl").write_text(
+                json.dumps({"id": "other-work", "status": "running", "attempt": 0}) + "\n",
+                encoding="utf-8",
+            )
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(SCRIPT_PATH),
+                    "promote-decision",
+                    "--candidate",
+                    str(candidate_path),
+                    "--out",
+                    str(action_path),
+                ],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+
+            self.assertEqual(result.returncode, 3, result.stderr)
+            self.assertFalse(action_path.exists())
 
     def test_semantic_delta_starvation_creates_conduct_plan_candidate(self) -> None:
         module = _load_module(self)
@@ -681,6 +757,10 @@ class GovernanceSignalTest(unittest.TestCase):
                 capture_output=True,
                 text=True,
                 check=False,
+            )
+            candidate_path.parent.joinpath("tasks.jsonl").write_text(
+                json.dumps({"id": "work-1", "status": "running", "attempt": 0}) + "\n",
+                encoding="utf-8",
             )
             promote_result = subprocess.run(
                 [

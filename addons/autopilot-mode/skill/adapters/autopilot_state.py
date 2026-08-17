@@ -95,7 +95,7 @@ def _noop_payload() -> dict[str, Any]:
 
 
 @contextmanager
-def _run_dir_lock(run_dir: Path):
+def _run_dir_lock(run_dir: Path, permission_denied_noop: bool = False):
     lock_dir = run_dir / LOCK_DIR
     deadline = time.monotonic() + LOCK_TIMEOUT_SECONDS
     while True:
@@ -106,8 +106,13 @@ def _run_dir_lock(run_dir: Path):
             if time.monotonic() >= deadline:
                 raise AutopilotStateError(f"timed out waiting for autopilot run lock {lock_dir}") from exc
             time.sleep(LOCK_POLL_SECONDS)
+        except PermissionError:
+            if permission_denied_noop:
+                yield False
+                return
+            raise
     try:
-        yield
+        yield True
     finally:
         try:
             lock_dir.rmdir()
@@ -370,8 +375,8 @@ def _approval_from_session_decisions(intent_state: Mapping[str, Any]) -> dict[st
 
 
 def _project_cwd_from_env(source: Mapping[str, str]) -> Path:
-    explicit = str(source.get("GHOST_ALICE_AUTOPILOT_CWD") or source.get("PWD") or "").strip()
-    return Path(explicit).expanduser() if explicit else Path.cwd()
+    candidate = Path(str(source.get("GHOST_ALICE_AUTOPILOT_CWD") or source.get("PWD") or "").strip())
+    return candidate if candidate.is_absolute() else Path.cwd()
 
 
 def _session_intent_root_candidates(source: Mapping[str, str], project_cwd: Path) -> list[Path]:
@@ -711,13 +716,7 @@ def _apply_pending_decision(
             evidence=evidence,
         )
     except AutopilotStateError as exc:
-        # Reject (raise) an unconsumable decision -- fail-closed; the agent is not
-        # root and must not apply unverified state. But quarantine the offending
-        # file first so it does not re-raise on every subsequent Stop (a permanent
-        # stall): the rename preserves it as evidence, the event records the
-        # rejection, and the entrypoint still degrades to a non-blocking no-op.
-        # Fallback is correction before the next forward step; the audit log is
-        # never reduced.
+        # Reject (raise) an unconsumable decision -- fail-closed; the agent is not root and must not apply unverified state. But quarantine the offending file first so it does not re-raise on every subsequent Stop (a permanent stall): the rename preserves it as evidence, the event records the rejection, and the entrypoint still degrades to a non-blocking no-op. Fallback is correction before the next forward step; the audit log is never reduced.
         _quarantine_rejected_decision(run_dir, decision, str(exc))
         raise
     write_work_items(run_dir / TASKS_FILE, updated)
@@ -780,9 +779,7 @@ def _missing_decision_resume_count(run_dir: Path, work_item_id: str) -> int:
 
 
 def _iotrace_resumes_since_last_replenish(run_dir: Path, work_item_id: str) -> int:
-    # "Reset N" budget: count io-trace resumes for this item since the last
-    # session-intent replenish. A new intent epoch (replenish event) resets the
-    # allowance to the base limit, rather than accumulating a lifetime ceiling.
+    # "Reset N" budget: count io-trace resumes for this item since the last session-intent replenish. A new intent epoch (replenish event) resets the allowance to the base limit, rather than accumulating a lifetime ceiling.
     count = 0
     for event in _read_jsonl_objects(run_dir / EVENTS_FILE):
         if event.get("work_item_id") != work_item_id:
@@ -804,11 +801,7 @@ def _iotrace_resume_limit(source: Mapping[str, str] | None) -> int:
 
 
 # --- intent-driven resume budget --------------------------------------------
-# The resume ceiling is not a dead static count: it is replenished whenever the
-# session-intent ledger advances (a new user input, or new work the agent routed
-# through session-intent-analyzer -> new intent-events lines). Each advance resets
-# the allowance to the base limit (reset-N); with no new intent the ceiling holds
-# and the run escalates to ask_user_meta instead of re-firing forever. Platform-neutral.
+# The resume ceiling is not a dead static count: it is replenished whenever the session-intent ledger advances (a new user input, or new work the agent routed through session-intent-analyzer -> new intent-events lines). Each advance resets the allowance to the base limit (reset-N); with no new intent the ceiling holds and the run escalates to ask_user_meta instead of re-firing forever. Platform-neutral.
 def _intent_events_count(events_path: Path) -> int:
     try:
         text = events_path.read_text(encoding="utf-8")
@@ -1154,12 +1147,17 @@ def advance_approved_run(run_dir: str | Path, env: Mapping[str, str] | None = No
 
 
 def _bootstrap_then_advance(
-    root: Path,
-    source: Mapping[str, str],
-    project_cwd: Path,
+    root: Path, source: Mapping[str, str], project_cwd: Path, *, derived_run_dir: bool = False,
 ) -> dict[str, Any]:
-    root.mkdir(parents=True, exist_ok=True)
-    with _run_dir_lock(root):
+    try:
+        root.mkdir(parents=True, exist_ok=True)
+    except PermissionError:
+        if derived_run_dir:
+            return _noop_payload()
+        raise
+    with _run_dir_lock(root, permission_denied_noop=derived_run_dir) as acquired:
+        if not acquired:
+            return _noop_payload()
         if not _run_state_available(root):
             _bootstrap_from_session_intent_if_approved(root, source, project_cwd)
         return _advance_approved_run_locked(root, source)
@@ -1171,20 +1169,19 @@ def adapter_payload_from_env(env: Mapping[str, str] | None = None) -> dict[str, 
         return _noop_payload()
     prefer_process_cwd = env is None
     project_cwd = _project_cwd_from_env(source)
-    run_dir = source.get("GHOST_ALICE_AUTOPILOT_RUN_DIR")
-    if run_dir:
+    if run_dir := source.get("GHOST_ALICE_AUTOPILOT_RUN_DIR"):
         return _bootstrap_then_advance(Path(run_dir).expanduser(), source, project_cwd)
-    explicit_cwd = source.get("GHOST_ALICE_AUTOPILOT_CWD")
-    if explicit_cwd:
-        explicit_project = Path(explicit_cwd).expanduser()
-        return _bootstrap_then_advance(explicit_project / ".autopilot", source, explicit_project)
-    cwd_run_dir = Path.cwd() / ".autopilot"
+    if explicit_cwd := source.get("GHOST_ALICE_AUTOPILOT_CWD"):
+        if not (explicit_project := Path(explicit_cwd)).is_absolute():
+            raise ValueError("GHOST_ALICE_AUTOPILOT_CWD must be an absolute path")
+        return _bootstrap_then_advance(explicit_project / ".autopilot", source, explicit_project, derived_run_dir=True)
+    cwd_run_dir = (Path.cwd() if prefer_process_cwd else project_cwd) / ".autopilot"
     pwd = source.get("PWD")
     if pwd:
         if prefer_process_cwd and _run_state_available(cwd_run_dir):
             return advance_approved_run(cwd_run_dir, source)
-        pwd_project = Path(pwd).expanduser()
-        return _bootstrap_then_advance(pwd_project / ".autopilot", source, pwd_project)
+        if (pwd_project := Path(pwd)).is_absolute():
+            return _bootstrap_then_advance(pwd_project / ".autopilot", source, pwd_project, derived_run_dir=True)
     if _run_state_available(cwd_run_dir):
         return advance_approved_run(cwd_run_dir, source)
-    return _bootstrap_then_advance(cwd_run_dir, source, project_cwd)
+    return _bootstrap_then_advance(cwd_run_dir, source, project_cwd, derived_run_dir=True)

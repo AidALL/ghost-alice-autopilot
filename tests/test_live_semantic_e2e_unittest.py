@@ -62,8 +62,6 @@ class LiveSemanticE2EWindowsConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             command = harness.build_codex_command(
-                scenario,
-                root / "codex.log",
                 root / "codex.txt",
                 hook_trust_supported=True,
                 platform="nt",
@@ -84,14 +82,23 @@ class LiveSemanticE2EWindowsConfigTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             command = harness.build_codex_command(
-                scenario,
-                root / "codex.log",
                 root / "codex.txt",
                 codex_command=["codex"],
             )
 
         self.assertEqual(command[-1], "-")
         self.assertNotIn(scenario.prompt, command)
+        self.assertIn("--ephemeral", command)
+
+    def test_claude_command_builder_reads_prompt_from_stdin_without_persistence(self) -> None:
+        harness = _load_harness()
+        scenario = harness.LiveScenario(id="probe", prompt="Authentic user prompt.")
+
+        command = harness.build_claude_command()
+
+        self.assertNotIn(scenario.prompt, command)
+        self.assertIn("-p", command)
+        self.assertIn("--no-session-persistence", command)
 
     def test_execute_returns_nonzero_when_any_scenario_observes_regression(self) -> None:
         harness = _load_harness()
@@ -111,6 +118,7 @@ class LiveSemanticE2EWindowsConfigTests(unittest.TestCase):
                         "hook_status": "complete",
                     },
                 ),
+                mock.patch.object(harness, "repo_root", return_value=Path(tmp)),
                 mock.patch("sys.stdout", new_callable=io.StringIO) as stdout,
             ):
                 rc = harness.main([

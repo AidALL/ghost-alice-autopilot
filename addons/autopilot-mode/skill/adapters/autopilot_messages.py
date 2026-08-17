@@ -10,10 +10,7 @@ from typing import Any, Mapping
 
 
 def _portable_path(text: str, base_path: str | None = None, home_path: str | None = None) -> str:
-    # Platform-neutral rendering of a path/command for the continuation signal:
-    # backslashes -> forward slashes, then strip the run's project root ("." ) and
-    # the home dir ("~") so no drive-absolute or machine-specific prefix leaks
-    # across a cross-platform handoff. The audit log keeps the raw value.
+    # Platform-neutral rendering of a path/command for the continuation signal: backslashes -> forward slashes, then strip the run's project root ("." ) and the home dir ("~") so no drive-absolute or machine-specific prefix leaks across a cross-platform handoff. The audit log keeps the raw value.
     if not text:
         return text
     result = text.replace("\\", "/")
@@ -41,12 +38,8 @@ def format_io_trace_rows(
         op = str(row.get("op") or "")
         raw_pattern = " ".join(str(row.get("pattern") or "").split())
         pattern = _portable_path(raw_pattern, base_path, home_path) if tool == "Bash" else raw_pattern
-        if len(pattern) > 180:
-            pattern = pattern[:177] + "..."
         if tool == "Bash":
-            # Neutral: prefer the structured op+path; never emit the raw shell
-            # command (per-runtime tool surface) when it was structured. Fall back
-            # to the path-stripped command only when no op could be extracted.
+            # Neutral: prefer the structured op+path; never emit the raw shell command (per-runtime tool surface) when it was structured. Fall back to the path-stripped command only when no op could be extracted.
             if op:
                 summary = f"{op} {path}" if path and path != "n/a" else op
             else:

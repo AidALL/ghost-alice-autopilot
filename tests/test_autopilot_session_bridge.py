@@ -343,9 +343,7 @@ class AutopilotSessionBridgeTest(unittest.TestCase):
             items[0]["open_questions"],
             ["release-scope: Full release is blocked until Linux and Windows compatibility evidence exists."],
         )
-        # The stored work-item source_locator (above) stays absolute (audit truth);
-        # the emitted continuation SIGNAL is portablized: project-relative path,
-        # forward slashes, no absolute base leak (platform-neutral handoff).
+        # The stored work-item source_locator (above) stays absolute (audit truth); the emitted continuation SIGNAL is portablized: project-relative path, forward slashes, no absolute base leak (platform-neutral handoff).
         self.assertIn(
             "session-intent/codex/session-1/intent-state.json#intent-state",
             payload["systemMessage"],

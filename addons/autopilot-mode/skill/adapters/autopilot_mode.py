@@ -48,6 +48,16 @@ def _first_text(*values: object) -> str:
     return ""
 
 
+def _first_absolute_path_text(*values: object) -> str:
+    for value in values:
+        if not isinstance(value, str) or not value.strip():
+            continue
+        candidate = Path(value.strip())
+        if candidate.is_absolute():
+            return str(candidate)
+    return ""
+
+
 def _format_payload_for_hook(payload: dict, hook_input: dict) -> dict:
     message = payload.get("systemMessage")
     if not message or not _stop_hook_input(hook_input):
@@ -70,11 +80,14 @@ def _env_with_hook_cwd(hook_input: dict) -> dict[str, str]:
         env["GHOST_ALICE_SESSION_ID"] = hook_session_id
     if env.get("GHOST_ALICE_AUTOPILOT_RUN_DIR") or env.get("GHOST_ALICE_AUTOPILOT_CWD"):
         return env
-    cwd = hook_input.get("cwd")
-    if isinstance(cwd, str) and cwd.strip():
-        env["GHOST_ALICE_AUTOPILOT_CWD"] = cwd
-    else:
-        env["GHOST_ALICE_AUTOPILOT_CWD"] = str(Path.cwd())
+    platform = env.get("GHOST_ALICE_PLATFORM", "").strip().lower()
+    project_cwd = _first_absolute_path_text(
+        env.get("CLAUDE_PROJECT_DIR") if platform != "codex" else None,
+        hook_input.get("cwd"),
+    )
+    if not project_cwd:
+        project_cwd = str(Path.cwd())
+    env["GHOST_ALICE_AUTOPILOT_CWD"] = project_cwd
     return env
 
 

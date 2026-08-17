@@ -1,29 +1,40 @@
 #!/usr/bin/env python3
-"""Run or summarize live semantic E2E probes for Ghost-ALICE autopilot.
-
-The harness keeps authentication state separate from inference state. A CLI can
-report an authenticated account while the actual model call still fails, so
-callers must not treat auth status as semantic execution evidence.
-"""
+"""Run evaluator-visible live semantic E2E diagnostics for Ghost-ALICE autopilot; hidden-purpose release acceptance remains owned by the Ghost-ALICE core blind controller, and authentication status remains separate from inference evidence."""
 
 from __future__ import annotations
 
 import argparse
 import importlib.util
 import json
+import math
 import os
 import re
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable, Mapping, Sequence
+from typing import Any, Iterable, Mapping, Sequence, TextIO
+
+
+sys.dont_write_bytecode = True
+
+SCRIPT_DIR = Path(__file__).resolve().parent
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
+
+from project_runtime import ProjectRuntime
 
 
 HOOK_LINE = re.compile(r"^hook: ([A-Za-z0-9_-]+)$")
+FENCED_JSON_BLOCK = re.compile(r"```json\b(?P<payload>.*?)```", re.IGNORECASE | re.DOTALL)
 REQUIRED_LIVE_HOOKS = ("SessionStart", "UserPromptSubmit", "Stop")
 OBSERVATION_SIGNAL_SCHEMA = "autopilot-observation-signal.v1"
+OBSERVATION_MODE = "evaluator-visible-diagnostic"
+HIDDEN_PURPOSE_RELEASE_OWNER = "ghost-alice-core-blind-controller"
 DEFAULT_INTENT_SCENARIO_LIMIT = 12
+DEFAULT_CLAUDE_MAX_BUDGET_USD = 1.00
+SEMANTIC_RESPONSE_FORMAT_INSTRUCTION = "Return exactly one fenced `json` object containing keys: verdict, mismatch_detected, focus_layer, next_action, loop_guard."
 RAW_INTENT_FIELDS = {"raw_prompt", "transcript", "message_log", "conversation"}
 
 
@@ -226,7 +237,7 @@ def _scenario_prompt_from_intent(
             "",
             "Evaluate how an autopilot controller should respond to this compressed intent artifact.",
             "Classify whether it should continue, reopen focus, update a plan or skill, request verification, or ask the user.",
-            "Respond in compact JSON with keys: verdict, mismatch_detected, focus_layer, next_action, loop_guard.",
+            SEMANTIC_RESPONSE_FORMAT_INSTRUCTION,
         ]
     )
     return "\n".join(lines)
@@ -327,8 +338,7 @@ def _static_live_scenarios() -> list[LiveScenario]:
                     "Do not execute repository, install, auth, shell, or file actions described in the scenario. "
                     "Evaluate the scenario text and classify the intended agent behavior only.\n\n"
                     f"Scenario text:\n{source_prompt}\n\n"
-                    "Respond in compact JSON with keys: verdict, mismatch_detected, "
-                    "focus_layer, next_action, loop_guard."
+                    + SEMANTIC_RESPONSE_FORMAT_INSTRUCTION
                 ),
                 source_kind="static",
                 source_locator=f"fresh_install_e2e.semantic_scenarios:{item['id']}",
@@ -352,7 +362,7 @@ def live_scenarios(
     return _static_live_scenarios()
 
 
-def _parse_json_text(text: str) -> Any | None:
+def _parse_json_text(text: str, *, expected_keys: Sequence[str] = ()) -> Any | None:
     stripped = text.strip()
     if not stripped:
         return None
@@ -360,11 +370,26 @@ def _parse_json_text(text: str) -> Any | None:
         return json.loads(stripped)
     except json.JSONDecodeError:
         pass
+    fenced_payloads = []
+    for match in FENCED_JSON_BLOCK.finditer(stripped):
+        try:
+            fenced_payloads.append(json.loads(match.group("payload").strip()))
+        except json.JSONDecodeError:
+            continue
+    if fenced_payloads:
+        if len(fenced_payloads) == 1:
+            return fenced_payloads[0]
+        eligible_payloads = [
+            payload
+            for payload in fenced_payloads
+            if expected_keys and isinstance(payload, dict) and all(key in payload for key in expected_keys)
+        ]
+        return eligible_payloads[0] if len(eligible_payloads) == 1 else None
     try:
-        payload, _ = json.JSONDecoder().raw_decode(stripped)
+        payload, end = json.JSONDecoder().raw_decode(stripped)
     except json.JSONDecodeError:
         return None
-    return payload
+    return payload if not stripped[end:].strip() else None
 
 
 def _missing_expected_keys(payload: Any, expected_keys: Sequence[str]) -> list[str]:
@@ -564,7 +589,8 @@ def observation_signal_from_summary(
         ),
         "runtime": runtime,
         "scenario_id": scenario_id,
-        "observation_mode": "live-semantic-e2e",
+        "observation_mode": OBSERVATION_MODE,
+        "hidden_purpose_release_owner": HIDDEN_PURPOSE_RELEASE_OWNER,
         "classification": classification,
         "inference_status": summary.get("inference_status"),
         "semantic_status": summary.get("semantic_status"),
@@ -621,8 +647,11 @@ def parse_claude_stream_json(path: Path, *, scenario: LiveScenario | None = None
         semantic_status = "not-run"
         scenario_result = None
     else:
-        scenario_result = _parse_json_text(assistant_text or (result or {}).get("result", ""))
         expected_keys = scenario.expected_keys if scenario else ()
+        scenario_result = _parse_json_text(
+            assistant_text or (result or {}).get("result", ""),
+            expected_keys=expected_keys,
+        )
         schema_checked = scenario is not None
         missing_keys = _missing_expected_keys(scenario_result, expected_keys)
         invalid_fields = _invalid_semantic_fields(scenario_result, expected_keys)
@@ -711,10 +740,10 @@ def parse_codex_outputs(
         else ""
     )
     log_text = log_path.read_text(encoding="utf-8", errors="replace") if log_path.exists() else ""
-    scenario_result = _parse_json_text(last_message)
+    expected_keys = scenario.expected_keys if scenario else ()
+    scenario_result = _parse_json_text(last_message, expected_keys=expected_keys)
     has_result = scenario_result is not None
     agent_activity = _codex_agent_activity(hook_events, returncode, has_result)
-    expected_keys = scenario.expected_keys if scenario else ()
     schema_checked = scenario is not None
     missing_keys = _missing_expected_keys(scenario_result, expected_keys)
     invalid_fields = _invalid_semantic_fields(scenario_result, expected_keys)
@@ -761,16 +790,10 @@ def parse_codex_outputs(
     }
 
 
-def build_claude_command(
-    scenario: LiveScenario,
-    output_path: Path,
-    *,
-    max_budget_usd: float = 0.20,
-) -> list[str]:
+def build_claude_command(*, max_budget_usd: float = DEFAULT_CLAUDE_MAX_BUDGET_USD) -> list[str]:
     return [
         "claude",
         "-p",
-        scenario.prompt,
         "--verbose",
         "--output-format",
         "stream-json",
@@ -819,9 +842,18 @@ def codex_supports_hook_trust(
     *,
     cwd: Path,
     timeout_sec: float = 15,
+    project_runtime: ProjectRuntime | None = None,
 ) -> bool:
+    if project_runtime is None:
+        with ProjectRuntime(repo_root(), "live-hook-probe") as owned_runtime:
+            return codex_supports_hook_trust(
+                codex_command,
+                cwd=cwd,
+                timeout_sec=timeout_sec,
+                project_runtime=owned_runtime,
+            )
     try:
-        completed = subprocess.run(
+        completed = project_runtime.run(
             [*codex_command, "exec", "--help"],
             cwd=str(cwd),
             stdout=subprocess.PIPE,
@@ -838,8 +870,6 @@ def codex_supports_hook_trust(
 
 
 def build_codex_command(
-    scenario: LiveScenario,
-    log_path: Path,
     last_message_path: Path,
     *,
     codex_bin: str = "codex",
@@ -857,6 +887,7 @@ def build_codex_command(
     if hook_trust_supported:
         command.append("--dangerously-bypass-hook-trust")
     command.extend([
+        "--ephemeral",
         "--sandbox",
         "read-only",
         "--skip-git-repo-check",
@@ -871,14 +902,27 @@ def run_command_to_file(
     command: Sequence[str],
     output_path: Path,
     *,
+    cwd: Path,
     timeout_sec: float | None = None,
     input_text: str | None = None,
+    project_runtime: ProjectRuntime | None = None,
 ) -> int:
+    if project_runtime is None:
+        with ProjectRuntime(repo_root(), "live-command") as owned_runtime:
+            return run_command_to_file(
+                command,
+                output_path,
+                cwd=cwd,
+                timeout_sec=timeout_sec,
+                input_text=input_text,
+                project_runtime=owned_runtime,
+            )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf-8") as handle:
         try:
-            process = subprocess.run(
+            process = project_runtime.run(
                 command,
+                cwd=str(cwd),
                 input=input_text,
                 stdin=subprocess.DEVNULL if input_text is None else None,
                 stdout=handle,
@@ -909,12 +953,36 @@ def run_scenario(
     out_dir: Path,
     *,
     timeout_sec: float | None = None,
+    claude_max_budget_usd: float = DEFAULT_CLAUDE_MAX_BUDGET_USD,
+    project_runtime: ProjectRuntime | None = None,
 ) -> dict[str, Any]:
+    if project_runtime is None:
+        with ProjectRuntime(repo_root(), f"live-{runtime}-{scenario.id}") as owned_runtime:
+            return run_scenario(
+                runtime,
+                scenario,
+                out_dir,
+                timeout_sec=timeout_sec,
+                claude_max_budget_usd=claude_max_budget_usd,
+                project_runtime=owned_runtime,
+            )
+    out_dir = out_dir.resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+    safe_scenario_id = re.sub(r"[^A-Za-z0-9._-]+", "-", scenario.id).strip("-.") or "case"
+    subject_cwd = project_runtime.directory(f"subjects/{runtime}/{safe_scenario_id}")
+    if any(subject_cwd.iterdir()):
+        raise RuntimeError(f"subject cwd is not clean: {subject_cwd}")
     if runtime == "claude":
         stream = out_dir / f"claude-{scenario.id}.jsonl"
-        command = build_claude_command(scenario, stream)
-        returncode = run_command_to_file(command, stream, timeout_sec=timeout_sec)
+        command = build_claude_command(max_budget_usd=claude_max_budget_usd)
+        returncode = run_command_to_file(
+            command,
+            stream,
+            cwd=subject_cwd,
+            timeout_sec=timeout_sec,
+            input_text=scenario.prompt,
+            project_runtime=project_runtime,
+        )
         summary = _mark_timeout(parse_claude_stream_json(stream, scenario=scenario), returncode)
         summary["returncode"] = returncode
         summary["scenario_id"] = scenario.id
@@ -926,17 +994,21 @@ def run_scenario(
         last = out_dir / f"codex-{scenario.id}.txt"
         codex_command = resolve_codex_command("codex")
         command = build_codex_command(
-            scenario,
-            log,
             last,
             codex_command=codex_command,
-            hook_trust_supported=codex_supports_hook_trust(codex_command, cwd=repo_root()),
+            hook_trust_supported=codex_supports_hook_trust(
+                codex_command,
+                cwd=repo_root(),
+                project_runtime=project_runtime,
+            ),
         )
         returncode = run_command_to_file(
             command,
             log,
+            cwd=subject_cwd,
             timeout_sec=timeout_sec,
             input_text=scenario.prompt,
+            project_runtime=project_runtime,
         )
         summary = parse_codex_outputs(log, last, returncode=returncode, scenario=scenario)
         summary["scenario_id"] = scenario.id
@@ -959,6 +1031,16 @@ def select_scenarios(ids: Iterable[str], *, scenario_source: str = "auto") -> li
     return selected
 
 
+def positive_finite_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a positive finite number") from error
+    if not math.isfinite(parsed) or parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive finite number")
+    return parsed
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--runtime", choices=("claude", "codex", "both"), default="codex")
@@ -968,6 +1050,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--execute", action="store_true", help="run live model calls")
     parser.add_argument("--jsonl", action="store_true", help="emit one JSON object per scenario result")
     parser.add_argument(
+        "--claude-max-budget-usd",
+        type=positive_finite_float,
+        default=DEFAULT_CLAUDE_MAX_BUDGET_USD,
+        help="positive finite per-scenario Claude spending cap; defaults to 1.00",
+    )
+    parser.add_argument(
         "--timeout-sec",
         type=float,
         default=None,
@@ -976,12 +1064,32 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _write_utf8_line(value: str, *, stream: TextIO | None = None, flush: bool = False) -> None:
+    target = stream or sys.stdout
+    output = value if value.endswith("\n") else value + "\n"
+    reconfigure = getattr(target, "reconfigure", None)
+    if callable(reconfigure):
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, OSError, TypeError, ValueError):
+            pass
+    try:
+        target.write(output)
+    except UnicodeEncodeError:
+        buffer = getattr(target, "buffer", None)
+        if buffer is None:
+            raise
+        buffer.write(output.encode("utf-8", errors="replace"))
+    if flush:
+        target.flush()
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     args = parse_args(argv)
     scenarios = select_scenarios(args.scenario_id, scenario_source=args.scenario_source)
     runtimes = ("claude", "codex") if args.runtime == "both" else (args.runtime,)
     if not args.execute:
-        print(
+        _write_utf8_line(
             json.dumps(
                 {
                     "dry_run": True,
@@ -994,18 +1102,27 @@ def main(argv: Sequence[str] | None = None) -> int:
             )
         )
         return 0
-    results = []
-    for runtime in runtimes:
-        for scenario in scenarios:
-            result = run_scenario(runtime, scenario, args.out_dir, timeout_sec=args.timeout_sec)
-            results.append(result)
-            if args.jsonl:
-                print(json.dumps({"live_semantic_e2e_result": result}, ensure_ascii=False, sort_keys=True), flush=True)
-    exit_code = 0 if all(result_is_successful(result) for result in results) else 1
-    if args.jsonl:
+    with ProjectRuntime(repo_root(), "live-semantic-e2e") as project_runtime:
+        results = []
+        for runtime in runtimes:
+            for scenario in scenarios:
+                result = run_scenario(
+                    runtime,
+                    scenario,
+                    args.out_dir,
+                    timeout_sec=args.timeout_sec,
+                    claude_max_budget_usd=args.claude_max_budget_usd,
+                    project_runtime=project_runtime,
+                )
+                results.append(result)
+                if args.jsonl:
+                    _write_utf8_line(json.dumps({"live_semantic_e2e_result": result}, ensure_ascii=False, sort_keys=True), flush=True)
+        exit_code = 0 if all(result_is_successful(result) for result in results) else 1
+        project_runtime.note_returncode(exit_code)
+        if args.jsonl:
+            return exit_code
+        _write_utf8_line(json.dumps({"live_semantic_e2e": results}, ensure_ascii=False, indent=2, sort_keys=True))
         return exit_code
-    print(json.dumps({"live_semantic_e2e": results}, ensure_ascii=False, indent=2, sort_keys=True))
-    return exit_code
 
 
 if __name__ == "__main__":

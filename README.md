@@ -14,7 +14,7 @@ Language: English | [Korean](./README_ko.md)
 
 - Installs the `autopilot-mode` skill.
 - Registers the core-owned `[adapter:autopilot-mode] continue` hook through the Ghost-ALICE installer.
-- Reads project-local run state from `.autopilot/`.
+- Reads project-local run state from `.autopilot/`, preferring Claude's stable `CLAUDE_PROJECT_DIR` over a drifted hook-time `cwd`.
 - Provides `skill/scripts/autopilot_session_bridge.py` plus the repository wrapper `scripts/autopilot_session_bridge.py` to bootstrap `.autopilot/` from session-intent ledger files after explicit approval.
 - Stop-hook bootstrap is session-lineage bounded: an explicit hook session id cannot fall back to an older `current-session.json` pointer from another session.
 - Lets the Stop adapter materialize current-session `.autopilot/` state without adding a separate receptor when session intent records admitted, unmet acceptance criteria, or when open conduct feedback provides an approved conduct plan; io-trace material alone never bootstraps a run and flows through the `autopilot-observation-signal.v1` receptor as observation only.
@@ -56,6 +56,8 @@ Default run directory:
   OFF
 ```
 
+`GHOST_ALICE_AUTOPILOT_RUN_DIR` is the strict authoritative run-directory override, and `GHOST_ALICE_AUTOPILOT_CWD` is the next project-root override. The project-root override must be absolute; a relative value surfaces as a blocking adapter reason instead of being resolved against the process directory. Without either override, Claude hooks select the first non-empty absolute path from `CLAUDE_PROJECT_DIR` and hook input `cwd`; Codex ignores an inherited `CLAUDE_PROJECT_DIR` and selects hook input `cwd`. Both platforms then fall back to the absolute adapter process directory. Relative derived candidates are skipped, while an access failure after selection does not retry a lower-priority source. Only `PermissionError` raised while creating a derived `<project>/.autopilot` directory or acquiring its lock becomes the empty no-op payload; later state-processing exceptions and explicit run-directory errors still surface.
+
 ## Governance Candidates And Promotion
 
 `addons/autopilot-mode/skill/scripts/autopilot_governance_signal.py` converts session intent, conduct feedback, routing-surface corrections, and completion validation failures into evidence-backed candidate files. A candidate file is diagnostic only:
@@ -66,33 +68,15 @@ Default run directory:
 
 Promotion is the boundary that creates adapter-consumable files. `promote-decision` writes a promoted `consistency-decision.json` with `schema_version: "autopilot-consistency-decision.v1"`, `promotion_state: "promoted"`, `promotion_evidence.decision`, `promotion_evidence.source`, `candidate_id`, `governance_signal_digest`, `state_hash`, `decision_key`, and `loop_key`. `promotion_evidence.decision` accepts `go`, `approve`, `approved`, `promote`, `promoted`, or `direct`; use `direct` only for a current-turn before-stop resolution without a candidate. In every promoted decision, `evidence` must be a JSON array of strings; do not nest `verdict`, `completion_check_digest`, or `text` inside it. `promote-conduct-plan` writes an approved `conduct-plan.json` with `promotion_state: "approved"`, approval evidence, source candidate id, and evidence digest.
 
-The promotion command can read `.autopilot/tasks.jsonl` and `.autopilot/events.jsonl` with `--run-dir` so retry caps and repeated decision/state loops escalate to `ask_user_meta` instead of looping.
+State-aware promotion resolves the target work-item status from `--run-dir` or the candidate file's parent run directory before writing an action. `continue_next` accepts `running`, `ready`, or `reopened`; all other decisions require `running`. A missing or incompatible target exits without creating `consistency-decision.json`, while the candidate remains diagnostic. The same run state supplies retry attempts and prior decision/state loop keys so retry caps and repeated loops escalate to `ask_user_meta` instead of looping.
 
 ## Session-Intent Bridge
 
-Installation alone does not create `.autopilot/`. To activate an approved run
-from the current Ghost-ALICE session ledger, use the package bridge
-`skill/scripts/autopilot_session_bridge.py` or the repository wrapper
-`scripts/autopilot_session_bridge.py`. The bridge reads
-`.tmp/session-intent/<platform>/current-session.json`, the pointed
-`intent-state.json`, and sibling `intent-events.jsonl`, then writes
-`.autopilot/approved-run.json` plus either a promoted `conduct-plan.json` or a
-ready `tasks.jsonl` item.
+Installation alone does not create `.autopilot/`. To activate an approved run from the current Ghost-ALICE session ledger, use the package bridge `skill/scripts/autopilot_session_bridge.py` or the repository wrapper `scripts/autopilot_session_bridge.py`. The bridge reads `.tmp/session-intent/<platform>/current-session.json`, the pointed `intent-state.json`, and sibling `intent-events.jsonl`, then writes `.autopilot/approved-run.json` plus either a promoted `conduct-plan.json` or a ready `tasks.jsonl` item.
 
-The bridge supports `--platform codex` and `--platform claude`. It refuses to
-write run state unless `--approval-evidence-json` contains an approval decision
-(`GO`, `approve`, or `approved`) and a non-empty `source`, and it preserves
-session event metadata in `approved-run.json` approval evidence.
+The bridge supports `--platform codex` and `--platform claude`. It refuses to write run state unless `--approval-evidence-json` contains an approval decision (`GO`, `approve`, or `approved`) and a non-empty `source`, and it preserves session event metadata in `approved-run.json` approval evidence.
 
-The Stop adapter has a separate automatic current-session path. When the
-project has no `.autopilot/` run state and the session ledger records
-admitted, not-yet-met acceptance criteria, the adapter bootstraps run state
-with `approval_evidence.decision: "AUTO"`
-(`source: "admitted-unmet-criterion"`). Io-trace presence alone never
-bootstraps a run; io-trace is routed through the existing
-`autopilot-observation-signal.v1` receptor in
-`autopilot_governance_signal.py`, and observation candidates stay diagnostic
-and are not promoted into adapter-consumable action files.
+The Stop adapter has a separate automatic current-session path. When the project has no `.autopilot/` run state and the session ledger records admitted, not-yet-met acceptance criteria, the adapter bootstraps run state with `approval_evidence.decision: "AUTO"` (`source: "admitted-unmet-criterion"`). Io-trace presence alone never bootstraps a run; io-trace is routed through the existing `autopilot-observation-signal.v1` receptor in `autopilot_governance_signal.py`, and observation candidates stay diagnostic and are not promoted into adapter-consumable action files.
 
 ```bash
 /opt/homebrew/bin/python3 scripts/autopilot_session_bridge.py \
@@ -106,11 +90,11 @@ and are not promoted into adapter-consumable action files.
 
 ## Requirements
 
-- Ghost-ALICE core 0.2.1 or newer with privileged adapter support.
+- Ghost-ALICE core 0.2.2 or newer with privileged adapter support and schema-preserving hook rendering.
 - Python 3.11+.
 - Claude Code and/or Codex hooks installed by the Ghost-ALICE core installer.
 
-Do not install this addon with Ghost-ALICE core older than 0.2.1. Older core installers may copy the skill without wiring the privileged adapter, runtime-core audit, or ledger met-flip path required by the current addon contract; that install is inert or incomplete and should be removed before upgrading.
+Do not install this addon with Ghost-ALICE core older than 0.2.2. Older core installers may copy the skill without wiring the privileged adapter, runtime-core audit, ledger met-flip path, or schema-preserving hook renderer required by the current addon contract; that install is inert or incomplete and should be removed before upgrading.
 
 ## Compatibility Matrix
 
@@ -119,20 +103,18 @@ The compatibility SSOT is `compatibility-matrix.json`. It must be checked before
 Current target status:
 
 - macOS: `verified-local` with local unit tests and adapter subprocess simulation.
-- Claude Code: `simulated-local` with temporary hook install and removal tests.
+- Claude Code: `verified-local` with local install status, credentialed Claude live semantic E2E, and five purpose-hidden core blind-controller cases.
 - Linux: `not-run`.
 - Windows Command Prompt: `not-run`.
 - Windows PowerShell 5: `not-run`.
 - Windows PowerShell 7: `not-run`.
-- Codex: `verified-local` with local install status, Codex live semantic E2E, and candidate-boundary checks.
+- Codex: `verified-local` with local install status, Codex live semantic E2E, candidate-boundary checks, and five purpose-hidden core blind-controller cases.
 
-Any `not-run` target blocks a full compatibility claim until runner evidence is attached to the matrix.
-Linux and Windows runner targets still block a full compatibility claim.
+Any `not-run` target blocks a full compatibility claim until runner evidence is attached to the matrix. Linux and Windows runner targets still block a full compatibility claim.
 
 ## Install
 
-Run these commands from a Ghost-ALICE core checkout. This addon repository does
-not provide a standalone root `install.sh`.
+Run these commands from a Ghost-ALICE core checkout. This addon repository does not provide a standalone root `install.sh`.
 
 Default install to detected Claude Code/Codex targets:
 

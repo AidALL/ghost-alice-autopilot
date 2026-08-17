@@ -14,7 +14,7 @@ Language: [English](./README.md) | Korean
 
 - `autopilot-mode` skill을 설치한다.
 - Ghost-ALICE installer를 통해 core-owned `[adapter:autopilot-mode] continue` hook을 등록한다.
-- 프로젝트 로컬 `.autopilot/` 실행 상태를 읽는다.
+- 프로젝트 로컬 `.autopilot/` 실행 상태를 읽으며, Claude에서는 hook 실행 시점의 `cwd`보다 안정적인 `CLAUDE_PROJECT_DIR`을 우선한다.
 - 명시적 승인 후 session-intent ledger file에서 `.autopilot/`을 부트스트랩하는 `skill/scripts/autopilot_session_bridge.py`와 repository wrapper `scripts/autopilot_session_bridge.py`를 제공한다.
 - Stop hook bootstrap은 session lineage에 묶인다. hook이 명시적 session id를 제공하면 다른 session의 오래된 `current-session.json` pointer로 fallback하지 않는다.
 - Stop adapter가 별도 receptor를 만들지 않고, session intent에 admitted 상태의 미충족 acceptance criteria가 기록되어 있거나 open conduct feedback이 승인된 conduct plan을 제공할 때 current-session `.autopilot/` state를 materialize한다. io-trace 자료만으로는 run을 부트스트랩하지 않으며 `autopilot-observation-signal.v1` receptor를 통한 observation으로만 처리된다.
@@ -56,6 +56,8 @@ Language: [English](./README.md) | Korean
   OFF
 ```
 
+`GHOST_ALICE_AUTOPILOT_RUN_DIR`은 오류를 숨기지 않는 최우선 run-directory override이고, `GHOST_ALICE_AUTOPILOT_CWD`는 그다음 project-root override다. Project-root override는 절대경로여야 하며, 상대값은 process directory 기준으로 해석하지 않고 blocking adapter reason으로 표면화한다. 두 override가 없으면 Claude hook은 `CLAUDE_PROJECT_DIR`과 hook input의 `cwd`에서 처음 발견한 비어 있지 않은 절대경로를 선택하고, Codex는 상속된 `CLAUDE_PROJECT_DIR`을 무시하고 hook input의 `cwd`를 선택한다. 두 platform 모두 그다음 절대 adapter process directory를 fallback으로 사용한다. 상대 파생 후보는 건너뛰되 경로 선택 뒤 접근 오류가 발생했다고 낮은 우선순위 후보를 다시 시도하지 않는다. 파생된 `<project>/.autopilot` directory 생성 또는 lock 획득 중 발생한 `PermissionError`만 빈 no-op payload로 바꾸며, 이후 state processing 예외와 명시적 run-directory 오류는 그대로 표면화한다.
+
 ## Governance Candidate와 Promotion
 
 `addons/autopilot-mode/skill/scripts/autopilot_governance_signal.py`는 session intent, conduct feedback, routing-surface correction, completion validation failure를 evidence-backed candidate file로 변환한다. candidate file은 진단 출력일 뿐이다.
@@ -66,31 +68,15 @@ Language: [English](./README.md) | Korean
 
 promotion은 adapter-consumable file을 만드는 경계다. `promote-decision`은 `schema_version: "autopilot-consistency-decision.v1"`, `promotion_state: "promoted"`, `promotion_evidence.decision`, `promotion_evidence.source`, `candidate_id`, `governance_signal_digest`, `state_hash`, `decision_key`, `loop_key`를 포함한 `consistency-decision.json`을 쓴다. `promotion_evidence.decision`은 `go`, `approve`, `approved`, `promote`, `promoted`, `direct`를 허용한다. `direct`는 candidate가 없는 current-turn before-stop resolution에만 사용한다. 모든 promoted decision에서 `evidence`는 JSON array of strings이어야 한다. `verdict`, `completion_check_digest`, `text`를 `evidence` 안에 중첩하지 않는다. `promote-conduct-plan`은 `promotion_state: "approved"`, approval evidence, source candidate id, evidence digest를 포함한 승인 `conduct-plan.json`을 쓴다.
 
-promotion command는 `--run-dir`로 `.autopilot/tasks.jsonl`과 `.autopilot/events.jsonl`을 읽을 수 있다. retry cap 또는 repeated decision/state loop가 확인되면 같은 결정을 반복하지 않고 `ask_user_meta`로 escalate한다.
+State-aware promotion은 action을 쓰기 전에 `--run-dir` 또는 candidate file의 parent run directory에서 target work-item status를 확인한다. `continue_next` accepts `running`, `ready`, or `reopened`; all other decisions require `running`. target이 없거나 호환되지 않으면 candidate는 진단 자료로 남기고 without creating `consistency-decision.json` 상태로 exit한다. 같은 run state에서 retry attempt와 이전 decision/state loop key도 읽으며, retry cap 또는 repeated loop가 확인되면 `ask_user_meta`로 escalate한다.
 
 ## Session-Intent Bridge
 
-설치만으로 `.autopilot/`은 생성되지 않는다. 현재 Ghost-ALICE session
-ledger에서 approved run을 활성화하려면 package bridge
-`skill/scripts/autopilot_session_bridge.py` 또는 repository wrapper
-`scripts/autopilot_session_bridge.py`를 사용한다. bridge는 `.tmp/session-intent/<platform>/current-session.json`,
-그 pointer가 가리키는 `intent-state.json`, 같은 디렉토리의
-`intent-events.jsonl`을 읽고 `.autopilot/approved-run.json`과 promoted
-`conduct-plan.json` 또는 ready `tasks.jsonl` item을 쓴다.
+설치만으로 `.autopilot/`은 생성되지 않는다. 현재 Ghost-ALICE session ledger에서 approved run을 활성화하려면 package bridge `skill/scripts/autopilot_session_bridge.py` 또는 repository wrapper `scripts/autopilot_session_bridge.py`를 사용한다. bridge는 `.tmp/session-intent/<platform>/current-session.json`, 그 pointer가 가리키는 `intent-state.json`, 같은 디렉토리의 `intent-events.jsonl`을 읽고 `.autopilot/approved-run.json`과 promoted `conduct-plan.json` 또는 ready `tasks.jsonl` item을 쓴다.
 
-bridge는 `--platform codex`와 `--platform claude`를 지원한다. bridge는
-`--approval-evidence-json`에 approval decision(`GO`, `approve`, `approved`)과
-비어 있지 않은 `source`가 없으면 run state를 쓰지 않으며, session event
-metadata를 `approved-run.json` approval evidence에 보존한다.
+bridge는 `--platform codex`와 `--platform claude`를 지원한다. bridge는 `--approval-evidence-json`에 approval decision(`GO`, `approve`, `approved`)과 비어 있지 않은 `source`가 없으면 run state를 쓰지 않으며, session event metadata를 `approved-run.json` approval evidence에 보존한다.
 
-Stop adapter에는 별도의 automatic current-session path가 있다. 프로젝트에
-`.autopilot/` run state가 없고 session ledger에 admitted 상태이면서 아직
-met되지 않은 acceptance criteria가 기록되어 있으면 adapter는
-`approval_evidence.decision: "AUTO"`(`source: "admitted-unmet-criterion"`)로
-run state를 bootstrap한다. io-trace 존재만으로는 run을 bootstrap하지 않으며,
-io-trace는 `autopilot_governance_signal.py`의 기존
-`autopilot-observation-signal.v1` receptor로 보낸다. Observation candidate는
-diagnostic 상태로 남고 adapter-consumable action file로 promote되지 않는다.
+Stop adapter에는 별도의 automatic current-session path가 있다. 프로젝트에 `.autopilot/` run state가 없고 session ledger에 admitted 상태이면서 아직 met되지 않은 acceptance criteria가 기록되어 있으면 adapter는 `approval_evidence.decision: "AUTO"`(`source: "admitted-unmet-criterion"`)로 run state를 bootstrap한다. io-trace 존재만으로는 run을 bootstrap하지 않으며, io-trace는 `autopilot_governance_signal.py`의 기존 `autopilot-observation-signal.v1` receptor로 보낸다. Observation candidate는 diagnostic 상태로 남고 adapter-consumable action file로 promote되지 않는다.
 
 ```bash
 /opt/homebrew/bin/python3 scripts/autopilot_session_bridge.py \
@@ -104,11 +90,11 @@ diagnostic 상태로 남고 adapter-consumable action file로 promote되지 않�
 
 ## 요구사항
 
-- privileged adapter를 지원하는 Ghost-ALICE core 0.2.1 이상.
+- privileged adapter와 schema-preserving hook rendering을 지원하는 Ghost-ALICE core 0.2.2 이상.
 - Python 3.11+.
 - Ghost-ALICE core installer로 설치된 Claude Code 또는 Codex hook.
 
-Ghost-ALICE core 0.2.1 미만에는 이 애드온을 설치하지 않는다. 오래된 core installer는 skill만 복사하고 privileged adapter, runtime-core audit, ledger met-flip path를 배선하지 못할 수 있다. 이 설치는 inert 또는 incomplete 상태이므로 업그레이드 전에 제거한다.
+Ghost-ALICE core 0.2.2 미만에는 이 애드온을 설치하지 않는다. 오래된 core installer는 skill만 복사하고 privileged adapter, runtime-core audit, ledger met-flip path, schema-preserving hook renderer를 배선하지 못할 수 있다. 이 설치는 inert 또는 incomplete 상태이므로 업그레이드 전에 제거한다.
 
 ## Compatibility Matrix
 
@@ -117,20 +103,18 @@ Ghost-ALICE core 0.2.1 미만에는 이 애드온을 설치하지 않는다. 오
 현재 target status:
 
 - macOS: local unit test와 adapter subprocess simulation으로 `verified-local`.
-- Claude Code: temporary hook install/remove test로 `simulated-local`.
+- Claude Code: `verified-local` with local install status, credentialed Claude live semantic E2E, and five purpose-hidden core blind-controller cases.
 - Linux: `not-run`.
 - Windows Command Prompt: `not-run`.
 - Windows PowerShell 5: `not-run`.
 - Windows PowerShell 7: `not-run`.
-- Codex: `verified-local` with local install status, Codex live semantic E2E, and candidate-boundary checks.
+- Codex: `verified-local` with local install status, Codex live semantic E2E, candidate-boundary checks, and five purpose-hidden core blind-controller cases.
 
-`not-run` target이 하나라도 있으면 runner evidence가 matrix에 붙기 전까지 full compatibility claim을 차단한다.
-Linux와 Windows runner target은 아직 full compatibility claim을 차단한다.
+`not-run` target이 하나라도 있으면 runner evidence가 matrix에 붙기 전까지 full compatibility claim을 차단한다. Linux와 Windows runner target은 아직 full compatibility claim을 차단한다.
 
 ## 설치
 
-이 명령은 Ghost-ALICE core checkout에서 실행한다. 이 addon repository는
-standalone root `install.sh`를 제공하지 않는다.
+이 명령은 Ghost-ALICE core checkout에서 실행한다. 이 addon repository는 standalone root `install.sh`를 제공하지 않는다.
 
 감지된 Claude Code/Codex 대상에 기본 설치:
 

@@ -5,6 +5,7 @@ Run: /opt/homebrew/bin/python3 -m pytest tests/test_autopilot_state.py -q
 
 from __future__ import annotations
 
+import io
 import json
 import os
 import shutil
@@ -62,9 +63,7 @@ def _locate_core_ledger_source() -> Path | None:
             source = candidate.read_text(encoding="utf-8")
         except OSError:
             continue
-        # Only a core that exposes the met-writer can drive the import-by-path
-        # flip; otherwise the integration test would assert against an older
-        # core that gracefully skips (e.g. a CI sibling on an unpublished API).
+        # Only a core that exposes the met-writer can drive the import-by-path flip; otherwise the integration test would assert against an older core that gracefully skips (e.g. a CI sibling on an unpublished API).
         if "def mark_acceptance_criterion_met" in source:
             return candidate
     return None
@@ -486,11 +485,7 @@ class AutopilotStateTest(unittest.TestCase):
         ):
             self.assertNotIn(f"def _{function_name}", adapter_source)
             self.assertIn(f"def {function_name}", messages_source)
-        # Facade stays thin: domain builders/validators live in the sibling
-        # modules asserted above. The ceiling was raised from 1050 to 1200 when
-        # the intent-driven resume-budget helpers were added next to the existing
-        # resume-count helpers (event-log state logic that belongs with the Stop
-        # adapter's own resume accounting, not in work_items/messages).
+        # Facade stays thin: domain builders/validators live in the sibling modules asserted above. The ceiling was raised from 1050 to 1200 when the intent-driven resume-budget helpers were added next to the existing resume-count helpers (event-log state logic that belongs with the Stop adapter's own resume accounting, not in work_items/messages).
         self.assertLess(len(adapter_source.splitlines()), 1200)
 
     def test_tasks_jsonl_preserves_completed_items_and_derives_ready_queue(self):
@@ -564,6 +559,7 @@ class AutopilotStateTest(unittest.TestCase):
 
     def test_consistency_decision_rejects_non_running_targets(self):
         cases = [
+            ("ready", "reopen_macro", {}),
             ("completed", "retry_same_unit", {}),
             ("not_applicable", "reopen_macro", {}),
         ]
@@ -653,6 +649,258 @@ class AutopilotStateTest(unittest.TestCase):
 
     def test_adapter_payload_without_run_dir_is_noop(self):
         self.assertEqual(aps.adapter_payload_from_env({}), {"continue": True, "systemMessage": ""})
+
+    def test_adapter_payload_derived_run_dir_permission_denied_is_noop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "protected-project"
+            cases = (
+                {"GHOST_ALICE_AUTOPILOT_CWD": str(project)},
+                {"PWD": str(project)},
+            )
+            for source in cases:
+                with self.subTest(source=source):
+                    with mock.patch.object(aps.Path, "mkdir", side_effect=PermissionError("denied")):
+                        payload = aps.adapter_payload_from_env(source)
+
+                    self.assertEqual(payload, {"continue": True, "systemMessage": ""})
+
+            with mock.patch.object(aps.Path, "cwd", return_value=project):
+                with mock.patch.object(aps.Path, "mkdir", side_effect=PermissionError("denied")):
+                    payload = aps.adapter_payload_from_env({"HOME": str(Path(tmp))})
+
+            self.assertEqual(payload, {"continue": True, "systemMessage": ""})
+
+    def test_adapter_payload_explicit_run_dir_permission_denied_remains_an_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "protected-run"
+            with mock.patch.object(aps.Path, "mkdir", side_effect=PermissionError("denied")):
+                with self.assertRaises(PermissionError):
+                    aps.adapter_payload_from_env({
+                        "GHOST_ALICE_AUTOPILOT_RUN_DIR": str(run_dir),
+                    })
+
+    def test_adapter_payload_explicit_run_dir_lock_permission_denied_remains_an_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp) / "explicit-run"
+            run_dir.mkdir()
+            original_mkdir = aps.Path.mkdir
+
+            def deny_lock_dir(path, *args, **kwargs):
+                if path.name == aps.LOCK_DIR:
+                    raise PermissionError("lock denied")
+                return original_mkdir(path, *args, **kwargs)
+
+            with mock.patch.object(aps.Path, "mkdir", autospec=True, side_effect=deny_lock_dir):
+                with self.assertRaisesRegex(PermissionError, "lock denied"):
+                    aps.adapter_payload_from_env({
+                        "GHOST_ALICE_AUTOPILOT_RUN_DIR": str(run_dir),
+                    })
+
+    def test_derived_run_dir_lock_permission_denied_is_noop(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / ".autopilot"
+            root.mkdir()
+            original_mkdir = aps.Path.mkdir
+
+            def deny_lock_dir(path, *args, **kwargs):
+                if path.name == aps.LOCK_DIR:
+                    raise PermissionError("lock denied")
+                return original_mkdir(path, *args, **kwargs)
+
+            with mock.patch.object(aps.Path, "mkdir", autospec=True, side_effect=deny_lock_dir):
+                payload = aps._bootstrap_then_advance(
+                    root,
+                    {},
+                    Path(tmp),
+                    derived_run_dir=True,
+                )
+
+        self.assertEqual(payload, {"continue": True, "systemMessage": ""})
+
+    def test_derived_run_dir_does_not_hide_state_processing_permission_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / ".autopilot"
+            _write_run(root, [_item("next")])
+            with mock.patch.object(
+                aps,
+                "_advance_approved_run_locked",
+                side_effect=PermissionError("state denied"),
+            ):
+                with self.assertRaisesRegex(PermissionError, "state denied"):
+                    aps._bootstrap_then_advance(
+                        root,
+                        {},
+                        Path(tmp),
+                        derived_run_dir=True,
+                    )
+
+    def test_claude_project_dir_selection_does_not_require_process_cwd(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "stable-project"
+            _write_run(project / ".autopilot", [_item("next")])
+            hook_input = {"hook_event_name": "Stop", "cwd": "/drifted/project"}
+            stdout = io.StringIO()
+            test_env = {
+                "CLAUDE_PROJECT_DIR": str(project),
+                "HOME": str(Path(tmp)),
+                "USERPROFILE": str(Path(tmp)),
+            }
+            with mock.patch.dict(os.environ, test_env, clear=True):
+                with mock.patch.object(apm.Path, "cwd", side_effect=PermissionError("cwd denied")):
+                    with mock.patch.object(apm, "_read_hook_input", return_value=hook_input):
+                        with mock.patch.object(apm.sys, "argv", ["autopilot_mode.py"]):
+                            with mock.patch.object(apm.sys, "stdout", stdout):
+                                return_code = apm.main()
+
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(return_code, 0)
+        self.assertIn("work-item: next", payload["reason"])
+
+    def test_relative_claude_project_dir_falls_back_to_absolute_hook_cwd(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            launcher = root / "launcher"
+            project = root / "intended-project"
+            launcher.mkdir()
+            _write_run(project / ".autopilot", [_item("next")])
+            hook_input = {"hook_event_name": "Stop", "cwd": str(project)}
+            stdout = io.StringIO()
+            previous_cwd = Path.cwd()
+            try:
+                os.chdir(launcher)
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        "CLAUDE_PROJECT_DIR": ".",
+                        "HOME": str(root),
+                        "USERPROFILE": str(root),
+                    },
+                    clear=True,
+                ):
+                    with mock.patch.object(apm, "_read_hook_input", return_value=hook_input):
+                        with mock.patch.object(apm.sys, "argv", ["autopilot_mode.py"]):
+                            with mock.patch.object(apm.sys, "stdout", stdout):
+                                return_code = apm.main()
+            finally:
+                os.chdir(previous_cwd)
+
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(return_code, 0)
+        self.assertIn("work-item: next", payload["reason"])
+        self.assertFalse((launcher / ".autopilot").exists())
+
+    def test_tilde_claude_project_dir_falls_back_to_absolute_hook_cwd(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            launcher = root / "launcher"
+            project = root / "intended-project"
+            home.mkdir()
+            launcher.mkdir()
+            _write_run(project / ".autopilot", [_item("next")])
+            hook_input = {"hook_event_name": "Stop", "cwd": str(project)}
+            stdout = io.StringIO()
+            previous_cwd = Path.cwd()
+            try:
+                os.chdir(launcher)
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        "CLAUDE_PROJECT_DIR": "~",
+                        "HOME": str(home),
+                        "USERPROFILE": str(home),
+                    },
+                    clear=True,
+                ):
+                    with mock.patch.object(apm, "_read_hook_input", return_value=hook_input):
+                        with mock.patch.object(apm.sys, "argv", ["autopilot_mode.py"]):
+                            with mock.patch.object(apm.sys, "stdout", stdout):
+                                return_code = apm.main()
+            finally:
+                os.chdir(previous_cwd)
+
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(return_code, 0)
+        self.assertIn("work-item: next", payload["reason"])
+        self.assertFalse((home / ".autopilot").exists())
+
+    def test_unknown_user_tilde_project_dir_falls_back_to_absolute_hook_cwd(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            launcher = root / "launcher"
+            project = root / "intended-project"
+            launcher.mkdir()
+            _write_run(project / ".autopilot", [_item("next")])
+            hook_input = {"hook_event_name": "Stop", "cwd": str(project)}
+            stdout = io.StringIO()
+            previous_cwd = Path.cwd()
+            try:
+                os.chdir(launcher)
+                with mock.patch.dict(
+                    os.environ,
+                    {
+                        "CLAUDE_PROJECT_DIR": "~definitely_missing_user",
+                        "HOME": str(root),
+                        "USERPROFILE": str(root),
+                    },
+                    clear=True,
+                ):
+                    with mock.patch.object(apm, "_read_hook_input", return_value=hook_input):
+                        with mock.patch.object(apm.sys, "argv", ["autopilot_mode.py"]):
+                            with mock.patch.object(apm.sys, "stdout", stdout):
+                                return_code = apm.main()
+            finally:
+                os.chdir(previous_cwd)
+
+        payload = json.loads(stdout.getvalue())
+        self.assertEqual(return_code, 0)
+        self.assertIn("work-item: next", payload["reason"])
+
+    def test_relative_explicit_project_cwd_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "absolute path"):
+            aps.adapter_payload_from_env({"GHOST_ALICE_AUTOPILOT_CWD": "."})
+
+    def test_tilde_explicit_project_cwd_is_rejected_before_expansion(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict(
+                os.environ,
+                {"HOME": tmp, "USERPROFILE": tmp},
+                clear=True,
+            ):
+                with self.assertRaisesRegex(ValueError, "absolute path"):
+                    aps.adapter_payload_from_env({"GHOST_ALICE_AUTOPILOT_CWD": "~"})
+
+    def test_adapter_payload_pwd_selection_does_not_require_process_cwd(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "protected-project"
+            with mock.patch.object(aps.Path, "cwd", side_effect=PermissionError("cwd denied")):
+                with mock.patch.object(aps.Path, "mkdir", side_effect=PermissionError("run denied")):
+                    payload = aps.adapter_payload_from_env({"PWD": str(project)})
+
+        self.assertEqual(payload, {"continue": True, "systemMessage": ""})
+
+    def test_tilde_pwd_candidate_is_ignored_before_expansion(self):
+        for pwd in (".", "~", "~definitely_missing_user"):
+            with self.subTest(pwd=pwd), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                home = root / "home"
+                project = root / "project"
+                home.mkdir()
+                _write_run(project / ".autopilot", [_item("next")])
+                previous_cwd = Path.cwd()
+                try:
+                    os.chdir(project)
+                    with mock.patch.dict(
+                        os.environ,
+                        {"HOME": str(home), "USERPROFILE": str(home)},
+                        clear=True,
+                    ):
+                        payload = aps.adapter_payload_from_env({"PWD": pwd})
+                finally:
+                    os.chdir(previous_cwd)
+
+                self.assertIn("work-item: next", payload["systemMessage"])
+                self.assertFalse((home / ".autopilot").exists())
 
     def test_bootstrap_then_advance_bootstraps_under_run_dir_lock(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -792,8 +1040,7 @@ class AutopilotStateTest(unittest.TestCase):
             project = root / "project"
             project.mkdir()
             intent_root = root / "session-intent"
-            # io-trace activity is present, but the only criterion is already met:
-            # io-trace alone must never bootstrap an autopilot run (the design-error guard).
+            # io-trace activity is present, but the only criterion is already met: io-trace alone must never bootstrap an autopilot run (the design-error guard).
             _write_session_intent_run_source(
                 intent_root,
                 criteria=[{"id": "AC1", "summary": "already done", "source": "user-explicit", "status": "met", "admitted": True}],
@@ -1007,14 +1254,16 @@ class AutopilotStateTest(unittest.TestCase):
         self.assertFalse((project / ".autopilot" / "approved-run.json").exists())
 
     def test_hook_input_session_id_is_passed_to_adapter_env(self):
-        with mock.patch.dict(os.environ, {}, clear=True):
-            env = apm._env_with_hook_cwd({
-                "session_id": "fresh-physical-ai",
-                "cwd": "/tmp/fresh-physical-ai",
-            })
+        with tempfile.TemporaryDirectory() as tmp:
+            project = str(Path(tmp) / "fresh-physical-ai")
+            with mock.patch.dict(os.environ, {}, clear=True):
+                env = apm._env_with_hook_cwd({
+                    "session_id": "fresh-physical-ai",
+                    "cwd": project,
+                })
 
         self.assertEqual(env["GHOST_ALICE_SESSION_ID"], "fresh-physical-ai")
-        self.assertEqual(env["GHOST_ALICE_AUTOPILOT_CWD"], "/tmp/fresh-physical-ai")
+        self.assertEqual(env["GHOST_ALICE_AUTOPILOT_CWD"], project)
 
     def test_adapter_payload_defaults_to_project_autopilot_directory(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1748,8 +1997,7 @@ class AutopilotStateTest(unittest.TestCase):
         self.assertIn("adapter-consumable", str(ctx.exception))
 
     def test_unconsumable_decision_is_quarantined_and_still_raises(self):
-        # Philosophy: an unconsumable decision is rejected (raises -- fail-closed),
-        # but the offending file is quarantined so it does not re-raise forever.
+        # Philosophy: an unconsumable decision is rejected (raises -- fail-closed), but the offending file is quarantined so it does not re-raise forever.
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp)
             _write_run(
@@ -1926,10 +2174,7 @@ class AutopilotStateTest(unittest.TestCase):
         self.assertNotIn("Get-Content", payload["systemMessage"])
 
     def test_iotrace_resume_limit_escalates_even_with_iotrace_present(self):
-        # Loop-guard ceiling: io-trace-backed resume is allowed up to the limit,
-        # but once IOTRACE_RESUME_LIMIT io-trace resumes have happened the run
-        # escalates to ask_user_meta even though io-trace material still exists.
-        # Without this, a session that keeps emitting io-trace re-fires forever.
+        # Loop-guard ceiling: io-trace-backed resume is allowed up to the limit, but once IOTRACE_RESUME_LIMIT io-trace resumes have happened the run escalates to ask_user_meta even though io-trace material still exists. Without this, a session that keeps emitting io-trace re-fires forever.
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             run_dir = root / "run"
@@ -1981,12 +2226,7 @@ class AutopilotStateTest(unittest.TestCase):
         self.assertEqual(events[-1]["event"], "missing_decision_escalated")
 
     def test_intent_advance_replenishes_resume_budget_then_still_terminates(self):
-        # User's model: the resume ceiling is not a dead static count -- it is
-        # replenished when session-intent advances (new input / newly-detected
-        # work routed through session-intent-analyzer -> new intent-events lines).
-        # With base limit 1: the base is already spent, so a fresh intent line
-        # grants another base-worth and the run continues; with no further intent
-        # advance the ceiling holds and it still terminates (ask_user_meta).
+        # User's model: the resume ceiling is not a dead static count -- it is replenished when session-intent advances (new input / newly-detected work routed through session-intent-analyzer -> new intent-events lines). With base limit 1: the base is already spent, so a fresh intent line grants another base-worth and the run continues; with no further intent advance the ceiling holds and it still terminates (ask_user_meta).
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             run_dir = root / "run"
@@ -2051,11 +2291,7 @@ class AutopilotStateTest(unittest.TestCase):
         self.assertEqual(items_after_second[0]["status"], "stopped")
 
     def test_reset_n_budget_counts_only_resumes_since_last_replenish(self):
-        # Reset-N discriminator: base=1, two prior replenishes but only ONE
-        # io-trace resume since the LAST replenish, and no new intent this turn.
-        # Reset-N counts resumes-since-last-replenish (=1 >= base) -> escalate.
-        # (The old additive model would see total<base*(1+refills)=1*3 and wrongly
-        # continue, so this test fails under additive and passes under reset-N.)
+        # Reset-N discriminator: base=1, two prior replenishes but only ONE io-trace resume since the LAST replenish, and no new intent this turn. Reset-N counts resumes-since-last-replenish (=1 >= base) -> escalate. (The old additive model would see total<base*(1+refills)=1*3 and wrongly continue, so this test fails under additive and passes under reset-N.)
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             run_dir = root / "run"
@@ -2442,8 +2678,7 @@ class AutopilotStateTest(unittest.TestCase):
             items = aps.read_work_items(run_dir / "tasks.jsonl")
             ledger_state = json.loads(state_path.read_text(encoding="utf-8"))
 
-        # The decision still applies (item completed) and the run keeps going; the
-        # criterion stays unmet because the met-flip is gracefully skipped.
+        # The decision still applies (item completed) and the run keeps going; the criterion stays unmet because the met-flip is gracefully skipped.
         self.assertEqual(items[0]["status"], "completed")
         self.assertEqual(payload["continue"], True)
         ac = next(c for c in ledger_state["acceptance_criteria"] if c["id"] == "AC-TEST")

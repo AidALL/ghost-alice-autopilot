@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -46,6 +47,21 @@ def _load_core_modules():
 
             return ai, install_hooks
     raise unittest.SkipTest("Ghost-ALICE core checkout not available for privileged-adapter integration test")
+
+
+def _real_adapter_gate_argv(platform: str) -> list[str]:
+    addon_installer, install_hooks = _load_core_modules()
+    targets = addon_installer.load_addon_targets([AUTOPILOT_SOURCE], platform=platform)
+    [spec] = addon_installer.iter_privileged_adapter_hook_specs(targets)
+    inner = install_hooks._hook_python_command(spec["script"], payload=True)
+    entry = install_hooks._hook_runner_command_entry(
+        spec["runner_id"],
+        inner,
+        spec["marker"],
+        platform_key=platform,
+    )
+    command = entry["hooks"][0]["command"]
+    return shlex.split(command, comments=True, posix=True)
 
 
 def _work_item(item_id: str) -> dict:
@@ -461,6 +477,100 @@ class OfficialAutopilotAddonTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(payload["continue"])
         self.assertIn("work-item: next", payload["systemMessage"])
+
+    def test_claude_project_dir_wins_over_drifted_hook_cwd(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "project"
+            drifted_cwd = project / "nested"
+            drifted_cwd.mkdir(parents=True)
+            _write_approved_run(project / ".autopilot", [_work_item("next")])
+            script = (
+                AUTOPILOT_SOURCE
+                / "addons"
+                / "autopilot-mode"
+                / "skill"
+                / "adapters"
+                / "autopilot_mode.py"
+            )
+            env = os.environ.copy()
+            env.pop("GHOST_ALICE_AUTOPILOT_RUN_DIR", None)
+            env.pop("GHOST_ALICE_AUTOPILOT_CWD", None)
+            env["CLAUDE_PROJECT_DIR"] = str(project)
+
+            result = subprocess.run(
+                [sys.executable, str(script)],
+                cwd=drifted_cwd,
+                env=env,
+                input=json.dumps({"hook_event_name": "Stop", "cwd": str(drifted_cwd)}),
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            payload = json.loads(result.stdout)
+            drifted_state_exists = (drifted_cwd / ".autopilot").exists()
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("work-item: next", payload["systemMessage"])
+        self.assertFalse(drifted_state_exists)
+
+    def test_real_adapter_repeated_stop_is_exact_noop_through_gate_from_system32_like_cwd(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            home = root / "home"
+            project = root / "project"
+            foreign_claude_project = root / "foreign-claude-project"
+            launcher = root / "Windows" / "System32"
+            home.mkdir()
+            (project / ".autopilot").mkdir(parents=True)
+            (project / ".autopilot" / "OFF").write_text("paused\n", encoding="utf-8")
+            _write_approved_run(
+                foreign_claude_project / ".autopilot",
+                [_work_item("must-not-run-from-codex")],
+            )
+            launcher.mkdir(parents=True)
+            cases = (
+                ("claude", str(launcher), str(project)),
+                ("codex", str(project), str(foreign_claude_project)),
+            )
+            for platform, hook_cwd, claude_project_dir in cases:
+                with self.subTest(platform=platform):
+                    env = os.environ.copy()
+                    for name in (
+                        "GHOST_ALICE_AUTOPILOT_RUN_DIR",
+                        "GHOST_ALICE_AUTOPILOT_CWD",
+                        "CLAUDE_PROJECT_DIR",
+                        "PWD",
+                        "GHOST_ALICE_DISABLED_HOOKS",
+                        "GHOST_ALICE_PLATFORM",
+                    ):
+                        env.pop(name, None)
+                    env["CLAUDE_PROJECT_DIR"] = claude_project_dir
+                    env["GHOST_ALICE_AGENT_VISIBILITY"] = "minimal"
+                    env["GHOST_ALICE_SESSION_ID"] = f"system32-cross-repo-{platform}"
+                    env["HOME"] = str(home)
+                    env["USERPROFILE"] = str(home)
+                    stdin = json.dumps({"hook_event_name": "Stop", "cwd": hook_cwd}).encode("utf-8")
+
+                    for attempt in range(2):
+                        with self.subTest(platform=platform, attempt=attempt):
+                            result = subprocess.run(
+                                _real_adapter_gate_argv(platform),
+                                cwd=launcher,
+                                env=env,
+                                input=stdin,
+                                capture_output=True,
+                                check=False,
+                            )
+
+                            self.assertEqual(result.returncode, 0, result.stderr)
+                            self.assertEqual(
+                                result.stdout,
+                                b'{"continue": true, "systemMessage": ""}' + os.linesep.encode("ascii"),
+                            )
+                            self.assertEqual(result.stderr, b"")
+                            self.assertFalse((launcher / ".autopilot").exists())
+                            self.assertFalse((project / ".autopilot" / ".advance.lock").exists())
 
     def test_adapter_script_rejects_arguments(self):
         script = (

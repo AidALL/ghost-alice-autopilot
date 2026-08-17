@@ -307,6 +307,16 @@ def _find_item(items: list[dict[str, Any]], item_id: str) -> dict[str, Any]:
     raise AutopilotStateError(f"unknown work item id {item_id!r}")
 
 
+def allowed_source_statuses_for_consistency_decision(decision: str) -> frozenset[str]:
+    """Return work-item statuses from which ``decision`` may be applied."""
+
+    if decision not in ALLOWED_DECISIONS:
+        return frozenset()
+    if decision == "continue_next":
+        return frozenset({"running", "ready", "reopened"})
+    return frozenset({"running"})
+
+
 def apply_consistency_decision(
     items: Iterable[dict[str, Any]],
     item_id: str,
@@ -320,9 +330,7 @@ def apply_consistency_decision(
         raise AutopilotStateError(f"unknown consistency decision {decision!r}")
     updated = validate_work_items(copy.deepcopy(list(items)))
     item = _find_item(updated, item_id)
-    allowed_source_statuses = {"running"}
-    if decision == "continue_next":
-        allowed_source_statuses = {"running", "ready", "reopened"}
+    allowed_source_statuses = allowed_source_statuses_for_consistency_decision(decision)
     if item["status"] not in allowed_source_statuses:
         raise AutopilotStateError(
             f"consistency decision state transition {decision!r} requires "
@@ -440,8 +448,7 @@ def materialize_met_criteria_from_continue_next(
     evidence = applied_decision.get("evidence")
     if not isinstance(evidence, list):
         return []
-    # A single claim may bind several criteria ("criterion: AC1, AC2"); split the
-    # same way the continue_next validator does so each real ledger id is flipped.
+    # A single claim may bind several criteria ("criterion: AC1, AC2"); split the same way the continue_next validator does so each real ledger id is flipped.
     raw_criteria = _extract_completion_claim_criteria("\n".join(str(line) for line in evidence))
     criterion_ids: list[str] = []
     for raw in raw_criteria:

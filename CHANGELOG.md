@@ -8,6 +8,32 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 Use this section for changes that have landed after the latest tagged public release.
 
+## [0.1.2] - 2026-08-17
+
+### Added
+
+- Added a repository-local child-process runtime and canonical pytest launcher so test, fresh-install, and live E2E scratch state stays under the addon `.tmp` tree.
+
+### Changed
+
+- Advanced the addon version to `0.1.2` and raised the supported Ghost-ALICE core floor to `0.2.2`, where hook protocol JSON is preserved across visibility profiles.
+- Claude and Codex live semantic sessions now receive prompts through stdin, use non-persistent session flags, and run from distinct clean repository-local working directories.
+- Claude live diagnostics now use a positive finite `--claude-max-budget-usd` per-scenario cap with a `1.00` default instead of the fixed `0.20` cap.
+- The addon live-semantic harness is evaluator-visible diagnostic tooling; hidden-purpose release acceptance remains owned by the Ghost-ALICE core blind controller.
+- Claude Code and Codex are `verified-local` through installed status, credentialed live semantic diagnostics, and five purpose-hidden fresh-session cases per platform; unrun OS and shell targets still block any full-compatibility claim.
+- GitHub Actions now uses `python scripts/run_project_tests.py tests`, covering both unittest and pytest-style tests through the same local-temp contract.
+- Source prose no longer uses display-width hard wrapping, and the release package includes the same structural Markdown wrapping gate as core.
+
+### Fixed
+
+- Prevented `promote-decision` from creating an action when its final decision is incompatible with the target work-item status or the target state is missing.
+- Kept Codex project-root selection independent of an inherited `CLAUDE_PROJECT_DIR` while retaining Claude's stable project-root preference.
+- Avoided blocking Stop loops when an implicitly derived `.autopilot` directory cannot be created or locked, without hiding explicit run-directory failures.
+- Treated successful `SystemExit` codes as project-runtime success so passing test and live-E2E launchers clean their addon-local scratch directories while nonzero or non-integer exits preserve diagnostics.
+- Preserved complete io-trace patterns without character-count truncation, resolved relative Codex output paths before clean-CWD execution, and made the canonical pytest runner disable root-level cache creation itself.
+- Parsed exactly one expected-key fenced JSON result amid required governance control blocks, rejected ambiguous candidates, and unified the live scenario response-format instruction.
+- Emitted live diagnostic JSON as UTF-8 under legacy Windows stdout encodings so Unicode model text cannot terminate a successful Claude/Codex run.
+
 ## [0.1.1] - 2026-07-01
 
 ### Added

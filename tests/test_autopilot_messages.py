@@ -53,6 +53,14 @@ class FormatIoTraceRowsTest(unittest.TestCase):
         lines = msgs.format_io_trace_rows([row], home_path="C:\\Users\\try2q")
         self.assertEqual(lines, [r"- Grep ~/proj C:\d+\w+"])
 
+    def test_non_bash_pattern_is_not_character_count_truncated(self):
+        pattern = "semantic-signal-" * 20
+        row = {"tool": "Grep", "path": "./intent-state.json", "pattern": pattern}
+
+        lines = msgs.format_io_trace_rows([row])
+
+        self.assertEqual(lines, [f"- Grep ./intent-state.json {pattern}"])
+
 
 class BuildContinuationMessageNeutralityTest(unittest.TestCase):
     def _item(self):
