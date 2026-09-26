@@ -14,6 +14,8 @@ Language: [English](./README.md) | Korean
 
 내부적으로는 에이전트의 stop 이벤트 이후 프로젝트의 `.autopilot/` 상태를 읽습니다. `ready` 또는 `reopened` 작업을 선택하고, 현재 io-trace 자료가 있으면 미완료 `running` 작업을 재개하도록 후속 실행 메시지(continuation message)를 출력합니다.
 
+현재 릴리스는 `0.3.0`이며 Ghost-ALICE core `0.3.0`과 함께 사용하시기를 권장합니다. [릴리스 노트](./docs/ko/release/2026-09-26-release-notes.md), [GitHub 릴리스](https://github.com/AidALL/ghost-alice-autopilot/releases/tag/v0.3.0), [Ghost-ALICE 홈페이지](https://aidall.github.io/ghost-alice/)에서 변경 내용을 확인하실 수 있습니다. 두 프로젝트는 Apache-2.0 라이선스의 오픈소스로 유지됩니다.
+
 ## 이 애드온이 하는 일
 
 - `autopilot-mode` skill을 설치합니다.
@@ -102,7 +104,11 @@ Stop adapter에는 별도의 automatic current-session path가 있습니다. 프
 
 Ghost-ALICE core 0.2.2 미만에는 이 애드온을 설치하지 마세요. 이전 설치기는 skill만 복사하고 privileged adapter, runtime-core audit, ledger met-flip path, schema-preserving hook renderer를 연결하지 못할 수 있습니다. 이 경우 설치되어 있어도 활성화되지 않는 inert 상태이거나 설치가 불완전할 수 있으므로, 기존 애드온 설치를 제거한 뒤 core를 업그레이드해 주세요.
 
+설치 호환성 하한은 core `0.2.2`로 유지됩니다. 현재 의도 snapshot과 세션에 연결된 hook 갱신을 함께 사용하시려면 core `0.3.0` / 애드온 `0.3.0` 조합을 권장합니다. 제품 버전을 맞추어도 schema 버전이 바뀌거나 독립적인 모델 실행 환경이 추가되지는 않습니다.
+
 ## Compatibility Matrix
+
+아래 매트릭스는 기존에 확인한 지원 상태를 나타냅니다. Claude·Codex의 live 검증 항목에는 이전 릴리스의 근거가 포함되어 있으며, 모든 항목을 `0.3.0`에서 다시 수행했다는 뜻은 아닙니다. [현재 릴리스 노트](./docs/ko/release/2026-09-26-release-notes.md#검증과-한계)에서 이번 설치본 재생·회귀 검사와 새 모델 추론 검증의 범위를 구분해 안내합니다.
 
 호환성 SSOT는 `compatibility-matrix.json`입니다. full compatibility claim을 하기 전 반드시 이 파일을 확인합니다. 이 matrix는 현재 지원 상태를 기록하는 표면이지 시간순 테스트 로그가 아닙니다. 날짜가 붙은 실행 산출물은 CI/test report 또는 release note에 둡니다.
 

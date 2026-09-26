@@ -44,6 +44,8 @@ RELEASE_PACKAGE_FILES = (
     "docs/release/2026-06-22-release-notes.md",
     "docs/release/2026-07-01-release-notes.md",
     "docs/release/2026-08-17-release-notes.md",
+    "docs/release/2026-09-26-release-notes.md",
+    "docs/ko/release/2026-09-26-release-notes.md",
     "addons/autopilot-mode/skill/adapters/autopilot_messages.py",
     "addons/autopilot-mode/skill/adapters/autopilot_state.py",
     "addons/autopilot-mode/skill/adapters/autopilot_work_items.py",
