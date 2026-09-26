@@ -208,6 +208,7 @@ class AutopilotSessionBridgeTest(unittest.TestCase):
             self.assertEqual(len(session_intent["recent_events"]), 2)
 
             env = os.environ.copy()
+            env.pop("CODEX_THREAD_ID", None)
             env["GHOST_ALICE_AUTOPILOT_RUN_DIR"] = str(run_dir)
             adapter = subprocess.run(
                 [sys.executable, str(ADAPTER_SCRIPT)],
@@ -263,6 +264,7 @@ class AutopilotSessionBridgeTest(unittest.TestCase):
             self.assertFalse((run_dir / "conduct-plan.json").exists())
 
             env = os.environ.copy()
+            env.pop("CODEX_THREAD_ID", None)
             env["GHOST_ALICE_AUTOPILOT_RUN_DIR"] = str(run_dir)
             adapter = subprocess.run(
                 [sys.executable, str(ADAPTER_SCRIPT)],
@@ -321,6 +323,7 @@ class AutopilotSessionBridgeTest(unittest.TestCase):
             )
 
             env = os.environ.copy()
+            env.pop("CODEX_THREAD_ID", None)
             env["GHOST_ALICE_AUTOPILOT_RUN_DIR"] = str(run_dir)
             adapter = subprocess.run(
                 [sys.executable, str(ADAPTER_SCRIPT)],

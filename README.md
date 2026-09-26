@@ -4,11 +4,17 @@
   <img src="./logo/logo_inward_fade.png" alt="Ghost-ALICE Autopilot logo" width="360">
 </p>
 
-Official Ghost-ALICE addon for approved autonomous continuation.
+Official Ghost-ALICE addon for continuing approved work and checking its completion criteria.
 
 Language: English | [Korean](./README_ko.md)
 
-`autopilot-mode` lets Ghost-ALICE continue an approved run one work item at a time. After an agent stop event, it reads the project's `.autopilot/` state, chooses the next ready or reopened item, resumes an unresolved running item when current io-trace material exists, and emits the next continuation message.
+`autopilot-mode` helps Ghost-ALICE continue approved work. After an agent response ends, it checks the current request, approved scope, and completion records before selecting the next item or resuming unfinished work. It respects user approval and stop state, and checks completion criteria before moving on.
+
+This repository provides the addon for Claude Code and Codex. You need Ghost-ALICE core and the corresponding host runtime first. Installation, a runnable example, and pause/stop controls are described below.
+
+Internally, the addon reads the project's `.autopilot/` state after an agent stop event, chooses a `ready` or `reopened` item, or resumes an unresolved `running` item when current io-trace material exists, then emits a continuation message.
+
+Current release: `0.3.0`, paired with Ghost-ALICE core `0.3.0`. See the [release notes](./docs/release/2026-09-26-release-notes.md), [GitHub release](https://github.com/AidALL/ghost-alice-autopilot/releases/tag/v0.3.0), and [Ghost-ALICE website](https://aidall.github.io/ghost-alice/). Both projects remain open source under Apache-2.0.
 
 ## What This Addon Does
 
@@ -72,6 +78,8 @@ State-aware promotion resolves the target work-item status from `--run-dir` or t
 
 ## Session-Intent Bridge
 
+The Stop adapter also accepts a host that declares `GHOST_ALICE_PLATFORM=agent-runtime`, an explicit `GHOST_ALICE_SESSION_ID`, and an absolute `GHOST_ALICE_SESSION_INTENT_ROOT`. It reads only `<root>/agent-runtime/<session-id>/intent-state.json`; it does not borrow a native platform's ledger or the shared current-session pointer. The ledger must use `session-intent-ledger.v1` and match the selected platform and session. Missing or conflicting context parks the run before pending receipts or plans are applied. Valid receipts are consumed once, and ordinary refinement within the approved objective keeps the existing approval. Unknown explicit platforms never fall back to Codex or Claude. Hosts still own their model, tool execution, and event dispatch; this adapter contract does not install those host capabilities.
+
 Installation alone does not create `.autopilot/`. To activate an approved run from the current Ghost-ALICE session ledger, use the package bridge `skill/scripts/autopilot_session_bridge.py` or the repository wrapper `scripts/autopilot_session_bridge.py`. The bridge reads `.tmp/session-intent/<platform>/current-session.json`, the pointed `intent-state.json`, and sibling `intent-events.jsonl`, then writes `.autopilot/approved-run.json` plus either a promoted `conduct-plan.json` or a ready `tasks.jsonl` item.
 
 The bridge supports `--platform codex` and `--platform claude`. It refuses to write run state unless `--approval-evidence-json` contains an approval decision (`GO`, `approve`, or `approved`) and a non-empty `source`, and it preserves session event metadata in `approved-run.json` approval evidence.
@@ -96,9 +104,13 @@ The Stop adapter has a separate automatic current-session path. When the project
 
 Do not install this addon with Ghost-ALICE core older than 0.2.2. Older core installers may copy the skill without wiring the privileged adapter, runtime-core audit, ledger met-flip path, or schema-preserving hook renderer required by the current addon contract; that install is inert or incomplete and should be removed before upgrading.
 
+The installer compatibility floor remains core `0.2.2`. For the current intent snapshots and session-bound hook updates, use the recommended core `0.3.0` / addon `0.3.0` pair; a shared product version does not change schema versions or add a standalone model runtime.
+
 ## Compatibility Matrix
 
 The compatibility SSOT is `compatibility-matrix.json`. It must be checked before making a full compatibility claim. The matrix records the current support posture, not a chronological test log; dated run artifacts belong in CI/test reports or release notes.
+
+The matrix below records the established support posture. Its live Claude/Codex entries include earlier release evidence; they are not a claim that every entry was rerun for `0.3.0`. The [current release notes](./docs/release/2026-09-26-release-notes.md#verification-and-limits) distinguish this release's installed replay and regression checks from fresh model-inference coverage.
 
 Current target status:
 

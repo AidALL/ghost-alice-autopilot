@@ -76,7 +76,7 @@ def _env_with_hook_cwd(hook_input: dict) -> dict[str, str]:
         hook_input.get("conversation_id"),
         hook_input.get("thread_id"),
     )
-    if hook_session_id and not env.get("GHOST_ALICE_SESSION_ID"):
+    if hook_session_id:
         env["GHOST_ALICE_SESSION_ID"] = hook_session_id
     if env.get("GHOST_ALICE_AUTOPILOT_RUN_DIR") or env.get("GHOST_ALICE_AUTOPILOT_CWD"):
         return env
@@ -98,7 +98,7 @@ def main() -> int:
     hook_input = _read_hook_input()
     try:
         autopilot_state = _load_autopilot_state()
-        payload = autopilot_state.adapter_payload_from_env(_env_with_hook_cwd(hook_input))
+        payload = autopilot_state.adapter_payload_from_env(_env_with_hook_cwd(hook_input), hook_input=hook_input)
     except Exception as exc:  # pragma: no cover - defensive hook fallback
         sys.stderr.write(f"autopilot-mode adapter fell back to no-op: {exc}\n")
         payload = {

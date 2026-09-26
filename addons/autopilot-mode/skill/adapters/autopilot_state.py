@@ -28,6 +28,11 @@ from autopilot_intent_recovery import (
     unmet_admitted_criteria_evidence,
 )
 from autopilot_lineage import (
+    agent_runtime_context_is_explicit,
+    continuation_context_error,
+    current_session_context,
+    intent_identity_matches,
+    session_binding_mismatch_event,
     stale_continuation_event,
     stale_continuation_missing_intent_event,
     stale_continuation_source_intent_event,
@@ -408,23 +413,30 @@ def _session_intent_root_candidates(source: Mapping[str, str], project_cwd: Path
 
 def _platform_candidates(source: Mapping[str, str]) -> list[str]:
     platform = str(source.get("GHOST_ALICE_PLATFORM") or "").strip().lower()
-    if platform in {"codex", "claude"}:
-        return [platform, "claude" if platform == "codex" else "codex"]
+    if platform:
+        return [platform] if platform in {"codex", "claude", "agent-runtime"} else []
     return ["codex", "claude"]
 
 
 def _iter_current_session_intents(
     source: Mapping[str, str],
     project_cwd: Path,
+    *, hook_input: Mapping[str, Any] | None = None,
 ):
-    explicit_session = str(source.get("GHOST_ALICE_SESSION_ID") or "").strip()
-    if explicit_session:
-        for root in _session_intent_root_candidates(source, project_cwd):
-            for platform in _platform_candidates(source):
+    if str(source.get("GHOST_ALICE_PLATFORM") or "").strip().lower() == "agent-runtime":
+        if not agent_runtime_context_is_explicit(source):
+            return
+    for root in _session_intent_root_candidates(source, project_cwd):
+        for platform in _platform_candidates(source):
+            context = current_session_context(source, run_platform=platform, hook_input=hook_input)
+            explicit_session = str(context.get("GHOST_ALICE_SESSION_ID") or "").strip()
+            if explicit_session:
                 state_path = root / platform / _safe_id(explicit_session) / "intent-state.json"
                 if not state_path.is_file():
                     continue
                 intent_state = _try_read_json_object(state_path)
+                if not intent_identity_matches(intent_state, platform, explicit_session):
+                    return
                 yield {
                     "platform": platform,
                     "session_id": explicit_session,
@@ -432,13 +444,15 @@ def _iter_current_session_intents(
                     "events_path": state_path.parent / "intent-events.jsonl",
                     "intent_state": intent_state,
                 }
-        return
-    for root in _session_intent_root_candidates(source, project_cwd):
-        for platform in _platform_candidates(source):
+                continue
             pointer_path = root / platform / "current-session.json"
+            if not pointer_path.is_file():
+                continue
             pointer = _try_read_json_object(pointer_path)
             if pointer.get("schema_version") != "session-intent-current.v1":
-                continue
+                return
+            if pointer.get("platform", platform) != platform:
+                return
             pointer_state = pointer.get("state_path")
             pointer_session = pointer.get("session_id")
             if isinstance(pointer_state, str) and pointer_state.strip():
@@ -448,11 +462,13 @@ def _iter_current_session_intents(
             elif isinstance(pointer_session, str) and pointer_session.strip():
                 state_path = root / platform / _safe_id(pointer_session) / "intent-state.json"
             else:
-                continue
+                return
             if not state_path.is_file():
-                continue
+                return
             intent_state = _try_read_json_object(state_path)
-            session_id = str(intent_state.get("session_id") or pointer_session or state_path.parent.name)
+            session_id = str(pointer_session or state_path.parent.name)
+            if not intent_identity_matches(intent_state, platform, session_id):
+                return
             yield {
                 "platform": platform,
                 "session_id": session_id,
@@ -484,6 +500,7 @@ def _bootstrap_from_session_intent_if_approved(
     run_dir: Path,
     source: Mapping[str, str],
     project_cwd: Path,
+    *, hook_input: Mapping[str, Any] | None = None,
 ) -> bool:
     if (run_dir / OFF_FILE).exists() or _run_state_available(run_dir):
         return False
@@ -491,7 +508,7 @@ def _bootstrap_from_session_intent_if_approved(
         return False
     resolved = None
     approval = None
-    for candidate in _iter_current_session_intents(source, project_cwd):
+    for candidate in _iter_current_session_intents(source, project_cwd, hook_input=hook_input):
         intent_state = candidate["intent_state"]
         if not isinstance(intent_state, Mapping):
             continue
@@ -745,7 +762,9 @@ def _apply_pending_decision(
     }
 
 
-def _apply_pending_conduct_plan(run_dir: Path, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _apply_pending_conduct_plan(
+    run_dir: Path, items: list[dict[str, Any]], run: dict[str, Any],
+) -> list[dict[str, Any]]:
     plan_path = run_dir / CONDUCT_PLAN_FILE
     if not plan_path.is_file():
         return items
@@ -753,7 +772,24 @@ def _apply_pending_conduct_plan(run_dir: Path, items: list[dict[str, Any]]) -> l
     before_ids = {item["id"] for item in current}
     plan = _read_json_object(plan_path)
     updated = apply_conduct_plan_proposals(current, plan)
-    imported_ids = [item["id"] for item in updated if item["id"] not in before_ids]
+    new_items = [item for item in updated if item["id"] not in before_ids]
+    rejected_ids = [item["id"] for item in new_items if not _work_item_within_run_surfaces(run, item)]
+    if rejected_ids:
+        # Plan approval cannot expand this run's authority. Keep the entire plan
+        # pending and its evidence intact, without blocking existing approved work.
+        _append_event(
+            run_dir,
+            {
+                "schema_version": "autopilot-event.v1",
+                "event": "conduct_plan_outside_allowed_surfaces",
+                "run_id": run.get("run_id"),
+                "source_candidate_id": plan.get("source_candidate_id"),
+                "rejected_work_item_ids": rejected_ids,
+                "source": plan.get("source"),
+            },
+        )
+        return current
+    imported_ids = [item["id"] for item in new_items]
     if imported_ids:
         write_work_items(run_dir / TASKS_FILE, updated)
     os.replace(plan_path, run_dir / APPLIED_CONDUCT_PLAN_FILE)
@@ -875,12 +911,15 @@ def _io_trace_rows_for_run(run: Mapping[str, Any], source: Mapping[str, str] | N
     return _read_io_trace_rows(source, session_id=_session_id_from_run(run, source), limit=8)
 
 
-def _current_intent_for_source(source: Mapping[str, str] | None, project_cwd: Path) -> dict[str, Any] | None:
-    if source is None:
+def _current_intent_for_source(
+    source: Mapping[str, str] | None, project_cwd: Path, run_platform: str | None = None,
+    *, hook_input: Mapping[str, Any] | None = None,
+) -> dict[str, Any] | None:
+    if source is None or not _has_explicit_session_intent_context(source, project_cwd):
         return None
-    if not _has_explicit_session_intent_context(source, project_cwd):
-        return None
-    for candidate in _iter_current_session_intents(source, project_cwd):
+    if not str(source.get("GHOST_ALICE_PLATFORM") or "").strip() and run_platform in ("codex", "claude"):
+        source = {**source, "GHOST_ALICE_PLATFORM": run_platform}
+    for candidate in _iter_current_session_intents(source, project_cwd, hook_input=hook_input):
         if isinstance(candidate.get("intent_state"), Mapping):
             return candidate
     return None
@@ -945,7 +984,9 @@ def _governance_candidate_event_fields(governance_candidate: Mapping[str, Any] |
     return {key: value for key, value in fields.items() if value not in (None, "", [])}
 
 
-def _advance_approved_run_locked(root: Path, source: Mapping[str, str] | None = None) -> dict[str, Any]:
+def _advance_approved_run_locked(
+    root: Path, source: Mapping[str, str] | None = None, *, hook_input: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     root = Path(root)
     approved_run_path = root / APPROVED_RUN_FILE
     tasks_path = root / TASKS_FILE
@@ -958,6 +999,19 @@ def _advance_approved_run_locked(root: Path, source: Mapping[str, str] | None = 
     run = _read_json_object(approved_run_path)
     if not _approved_run_allows_continue(run):
         return _noop_payload()
+    approval = run.get("approval_evidence")
+    binding = approval.get("session_intent") if isinstance(approval, Mapping) else None
+    run_platform = binding.get("platform") if isinstance(binding, Mapping) else None
+    source = current_session_context(source, run_platform=run_platform, hook_input=hook_input)
+    context_error = continuation_context_error(binding, source or {})
+    if context_error:
+        _append_event(root, {
+            "schema_version": "autopilot-event.v1",
+            "event": "stale_continuation_parked",
+            "run_id": run.get("run_id"),
+            "reason": context_error,
+        })
+        return _noop_payload()
     io_trace_rows = _io_trace_rows_for_run(run, source)
     # Platform-neutral rendering context for the continuation signal.
     signal_base = str(root.parent)
@@ -965,6 +1019,30 @@ def _advance_approved_run_locked(root: Path, source: Mapping[str, str] | None = 
     project_cwd = _project_cwd_from_env(source or {})
 
     items = read_work_items(tasks_path) if tasks_path.is_file() else []
+    current_intent = _current_intent_for_source(source, project_cwd, run_platform, hook_input=hook_input)
+    starvation_event = semantic_delta_starvation_event(current_intent)
+    if starvation_event is not None:
+        _append_event(root, starvation_event)
+        return {
+            "continue": True,
+            "systemMessage": build_semantic_delta_starvation_message(starvation_event),
+        }
+    binding_event = session_binding_mismatch_event(run, items, current_intent, source)
+    if binding_event is not None:
+        _append_event(root, binding_event)
+        return _noop_payload()
+    if current_intent is None:
+        parked_event = stale_continuation_missing_intent_event(
+            run, items, str((source or {}).get("GHOST_ALICE_SESSION_ID") or ""),
+            require_current_intent=_has_explicit_session_intent_context(source or {}, project_cwd),
+        )
+        if parked_event is not None:
+            _append_event(root, parked_event)
+            return _noop_payload()
+    parked_event = stale_continuation_event(run, items, current_intent)
+    if parked_event is not None:
+        _append_event(root, parked_event)
+        return _noop_payload()
     items, applied_decision = _apply_pending_decision(root, items)
     if applied_decision is not None and applied_decision.get("decision") == "continue_next":
         materialize_met_criteria_from_continue_next(run, applied_decision, source)
@@ -977,28 +1055,7 @@ def _advance_approved_run_locked(root: Path, source: Mapping[str, str] | None = 
                 evidence=applied_decision["evidence"],
             ),
         }
-    items = _apply_pending_conduct_plan(root, items)
-    current_intent = _current_intent_for_source(source, project_cwd)
-    if current_intent is None:
-        parked_event = stale_continuation_missing_intent_event(
-            run,
-            items,
-            str((source or {}).get("GHOST_ALICE_SESSION_ID") or ""),
-        )
-        if parked_event is not None:
-            _append_event(root, parked_event)
-            return _noop_payload()
-    starvation_event = semantic_delta_starvation_event(current_intent)
-    if starvation_event is not None:
-        _append_event(root, starvation_event)
-        return {
-            "continue": True,
-            "systemMessage": build_semantic_delta_starvation_message(starvation_event),
-        }
-    parked_event = stale_continuation_event(run, items, current_intent)
-    if parked_event is not None:
-        _append_event(root, parked_event)
-        return _noop_payload()
+    items = _apply_pending_conduct_plan(root, items, run)
 
     ready_queue = derive_ready_queue(items)
     if not ready_queue:
@@ -1133,7 +1190,9 @@ def _advance_approved_run_locked(root: Path, source: Mapping[str, str] | None = 
     }
 
 
-def advance_approved_run(run_dir: str | Path, env: Mapping[str, str] | None = None) -> dict[str, Any]:
+def advance_approved_run(
+    run_dir: str | Path, env: Mapping[str, str] | None = None, *, hook_input: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     root = Path(run_dir)
     approved_run_path = root / APPROVED_RUN_FILE
     tasks_path = root / TASKS_FILE
@@ -1143,11 +1202,12 @@ def advance_approved_run(run_dir: str | Path, env: Mapping[str, str] | None = No
     if not approved_run_path.is_file() or (not tasks_path.is_file() and not conduct_plan_path.is_file()):
         return _noop_payload()
     with _run_dir_lock(root):
-        return _advance_approved_run_locked(root, env)
+        return _advance_approved_run_locked(root, env, hook_input=hook_input)
 
 
 def _bootstrap_then_advance(
     root: Path, source: Mapping[str, str], project_cwd: Path, *, derived_run_dir: bool = False,
+    hook_input: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     try:
         root.mkdir(parents=True, exist_ok=True)
@@ -1159,29 +1219,31 @@ def _bootstrap_then_advance(
         if not acquired:
             return _noop_payload()
         if not _run_state_available(root):
-            _bootstrap_from_session_intent_if_approved(root, source, project_cwd)
-        return _advance_approved_run_locked(root, source)
+            _bootstrap_from_session_intent_if_approved(root, current_session_context(source, hook_input=hook_input), project_cwd, hook_input=hook_input)
+        return _advance_approved_run_locked(root, source, hook_input=hook_input)
 
 
-def adapter_payload_from_env(env: Mapping[str, str] | None = None) -> dict[str, Any]:
+def adapter_payload_from_env(
+    env: Mapping[str, str] | None = None, *, hook_input: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     source = os.environ if env is None else env
     if env is not None and not source:
         return _noop_payload()
     prefer_process_cwd = env is None
     project_cwd = _project_cwd_from_env(source)
     if run_dir := source.get("GHOST_ALICE_AUTOPILOT_RUN_DIR"):
-        return _bootstrap_then_advance(Path(run_dir).expanduser(), source, project_cwd)
+        return _bootstrap_then_advance(Path(run_dir).expanduser(), source, project_cwd, hook_input=hook_input)
     if explicit_cwd := source.get("GHOST_ALICE_AUTOPILOT_CWD"):
         if not (explicit_project := Path(explicit_cwd)).is_absolute():
             raise ValueError("GHOST_ALICE_AUTOPILOT_CWD must be an absolute path")
-        return _bootstrap_then_advance(explicit_project / ".autopilot", source, explicit_project, derived_run_dir=True)
+        return _bootstrap_then_advance(explicit_project / ".autopilot", source, explicit_project, derived_run_dir=True, hook_input=hook_input)
     cwd_run_dir = (Path.cwd() if prefer_process_cwd else project_cwd) / ".autopilot"
     pwd = source.get("PWD")
     if pwd:
         if prefer_process_cwd and _run_state_available(cwd_run_dir):
-            return advance_approved_run(cwd_run_dir, source)
+            return advance_approved_run(cwd_run_dir, source, hook_input=hook_input)
         if (pwd_project := Path(pwd)).is_absolute():
-            return _bootstrap_then_advance(pwd_project / ".autopilot", source, pwd_project, derived_run_dir=True)
+            return _bootstrap_then_advance(pwd_project / ".autopilot", source, pwd_project, derived_run_dir=True, hook_input=hook_input)
     if _run_state_available(cwd_run_dir):
-        return advance_approved_run(cwd_run_dir, source)
-    return _bootstrap_then_advance(cwd_run_dir, source, project_cwd, derived_run_dir=True)
+        return advance_approved_run(cwd_run_dir, source, hook_input=hook_input)
+    return _bootstrap_then_advance(cwd_run_dir, source, project_cwd, derived_run_dir=True, hook_input=hook_input)

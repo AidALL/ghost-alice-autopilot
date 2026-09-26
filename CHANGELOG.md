@@ -8,6 +8,23 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 Use this section for changes that have landed after the latest tagged public release.
 
+## [0.3.0] - 2026-09-26
+
+### Changed
+
+- Aligned the product release number with Ghost-ALICE core `0.3.0`; the existing minimum core version remains `0.2.2`, while `0.3.0` is the recommended paired release for the current intent and session-binding improvements.
+- Synchronized English and Korean public guidance, release notes, and links while preserving Apache-2.0 licensing.
+
+### Fixed
+
+- Validated the current session intent before applying pending completion receipts, importing plans, or mutating work queues.
+- Bound explicit `agent-runtime` execution to its declared platform, session ID, and absolute intent root; unknown platforms or invalid selected context cannot fall back to a native or sibling ledger.
+- Preserved approval for ordinary refinements within the approved objective and kept valid completion receipts single-use across reentry.
+- Added regression coverage for invalid context, changed objectives, missing roots, declared session mismatches, and previously rejected valid receipt cases.
+- Normalized firing-platform casing before session-binding comparisons without relaxing stored ledger or approval identity checks.
+- Selected the approved native platform when the firing environment omits it, while still validating the actual current session; malformed stored platform bindings stop continuation before receipt or queue changes.
+- Bound the selected Codex context to its native thread during bootstrap and continuation, preserving payload session precedence and Claude separation.
+
 ## [0.1.2] - 2026-08-17
 
 ### Added
