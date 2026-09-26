@@ -363,6 +363,7 @@ def _write_run_with_intent_source(
     state_path: Path,
     session_id: str,
     summary: str,
+    platform: str = "codex",
 ) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     events_path = state_path.parent / "intent-events.jsonl"
@@ -376,7 +377,7 @@ def _write_run_with_intent_source(
         "decision": "AUTO",
         "source": "admitted-unmet-criterion",
         "session_intent": {
-            "platform": "codex",
+            "platform": platform,
             "session_id": session_id,
             "state_path": str(state_path),
             "events_path": str(events_path),
@@ -485,8 +486,10 @@ class AutopilotStateTest(unittest.TestCase):
         ):
             self.assertNotIn(f"def _{function_name}", adapter_source)
             self.assertIn(f"def {function_name}", messages_source)
-        # Facade stays thin: domain builders/validators live in the sibling modules asserted above. The ceiling was raised from 1050 to 1200 when the intent-driven resume-budget helpers were added next to the existing resume-count helpers (event-log state logic that belongs with the Stop adapter's own resume accounting, not in work_items/messages).
-        self.assertLess(len(adapter_source.splitlines()), 1200)
+        # Domain builders/validators stay in sibling modules. The adapter owns
+        # event-log resume accounting and run-authority preflight before durable
+        # conduct-plan import; allow these orchestration checks in its ceiling.
+        self.assertLess(len(adapter_source.splitlines()), 1250)
 
     def test_tasks_jsonl_preserves_completed_items_and_derives_ready_queue(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1006,7 +1009,7 @@ class AutopilotStateTest(unittest.TestCase):
         self.assertIn("work-item: session-intent-session-1", payload["systemMessage"])
         self.assertEqual(items[0]["status"], "running")
 
-    def test_adapter_skips_unapproved_local_intent_pointer_for_approved_sibling_ghost_alice_root(self):
+    def test_ambiguous_local_pointer_parks_sibling_run_until_current_session_is_explicit(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             project = root / "ghost-alice-autopilot"
@@ -1026,6 +1029,15 @@ class AutopilotStateTest(unittest.TestCase):
             })
             run_dir = project / ".autopilot"
             approved_run = json.loads((run_dir / "approved-run.json").read_text(encoding="utf-8"))
+            self.assertEqual(payload, {"continue": True, "systemMessage": ""})
+            # A retained sibling approval does not make a different current
+            # pointer authoritative. A real hook's matching native ID does.
+            payload = aps.adapter_payload_from_env({
+                "PWD": str(project),
+                "GHOST_ALICE_PLATFORM": "codex",
+                "GHOST_ALICE_SESSION_ID": "session-1",
+                "GHOST_ALICE_AUTOPILOT_PLAN_PATH": ".tmp/implementation-plans/stop-bridge.md",
+            })
 
         self.assertTrue(payload["continue"])
         self.assertIn("work-item: session-intent-session-1", payload["systemMessage"])
@@ -1866,7 +1878,7 @@ class AutopilotStateTest(unittest.TestCase):
         self.assertIn("vendor email", events[-1]["current_summary"])
         self.assertIn("outside the approved autopilot objective lineage", events[-1]["reason"])
 
-    def test_same_objective_current_intent_allows_running_item_to_continue(self):
+    def test_same_objective_foreign_session_requires_current_approval_binding(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             run_dir = root / "run"
@@ -1897,10 +1909,368 @@ class AutopilotStateTest(unittest.TestCase):
             })
             items = aps.read_work_items(run_dir / "tasks.jsonl")
 
-        self.assertTrue(payload["continue"])
-        self.assertIn("work-item: physical-ai-followup", payload["systemMessage"])
-        self.assertIn("pending-decision: missing", payload["systemMessage"])
+        # Topic similarity is semantic context, not permission to transfer a
+        # run to another session. The current session needs its own binding.
+        self.assertEqual(payload, {"continue": True, "systemMessage": ""})
         self.assertEqual(items[0]["status"], "running")
+
+    def test_foreign_session_binding_precedes_pending_receipt_and_plan_writes(self):
+        goal = "Research physical AI regulation status and future outlook."
+        for pending in ("ready", "completion", "conduct-plan"):
+            with self.subTest(pending=pending), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                intent_root = root / "session-intent"
+                run_dir = root / "run"
+                old_state = _write_current_intent_state(intent_root, session_id="approved-session", current_goal=goal)
+                status = "running" if pending == "completion" else "ready"
+                _write_run_with_intent_source(run_dir, [_item("a", status=status)], state_path=old_state, session_id="approved-session", summary=goal)
+                if pending == "completion":
+                    decision = _decision_action("a", "continue_next", evidence=VALID_COMPLETION_EVIDENCE, completion_check_digest=VALID_COMPLETION_DIGEST, verdict="pass")
+                    (run_dir / "consistency-decision.json").write_text(json.dumps(decision), encoding="utf-8")
+                if pending == "conduct-plan":
+                    record = json.loads((run_dir / "approved-run.json").read_text())
+                    record["allowed_surfaces"].append("skill-evolution/...")
+                    (run_dir / "approved-run.json").write_text(json.dumps(record), encoding="utf-8")
+                    (run_dir / "conduct-plan.json").write_text(json.dumps(_conduct_plan()), encoding="utf-8")
+                _write_current_intent_state(intent_root, session_id="foreign-session", current_goal=goal)
+                before = {p.name: p.read_bytes() for p in run_dir.iterdir() if p.is_file()}
+
+                payload = aps.adapter_payload_from_env({
+                    "GHOST_ALICE_AUTOPILOT_RUN_DIR": str(run_dir),
+                    "GHOST_ALICE_PLATFORM": "codex",
+                    "GHOST_ALICE_SESSION_INTENT_ROOT": str(intent_root),
+                    "GHOST_ALICE_SESSION_ID": "foreign-session",
+                })
+
+                self.assertEqual(payload, {"continue": True, "systemMessage": ""})
+                for name, data in before.items():
+                    self.assertTrue((run_dir / name).is_file(), name)
+                    self.assertEqual((run_dir / name).read_bytes(), data)
+                self.assertFalse((run_dir / "consistency-decision.applied.json").exists())
+                self.assertFalse((run_dir / "conduct-plan.applied.json").exists())
+                event = json.loads((run_dir / "events.jsonl").read_text().splitlines()[-1])
+                self.assertEqual(event["event"], "stale_continuation_parked")
+                self.assertIn("binding", event["reason"])
+
+    def test_foreign_platform_cannot_reuse_same_session_id_via_fallback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            intent_root = root / "session-intent"
+            run_dir = root / "run"
+            goal = "Research physical AI regulation status and future outlook."
+            state_path = _write_current_intent_state(intent_root, session_id="same-id", current_goal=goal)
+            _write_run_with_intent_source(run_dir, [_item("a")], state_path=state_path, session_id="same-id", summary=goal)
+            before = (run_dir / "tasks.jsonl").read_bytes()
+
+            payload = aps.adapter_payload_from_env({
+                "GHOST_ALICE_AUTOPILOT_RUN_DIR": str(run_dir),
+                "GHOST_ALICE_PLATFORM": "claude",
+                "GHOST_ALICE_SESSION_INTENT_ROOT": str(intent_root),
+                "GHOST_ALICE_SESSION_ID": "same-id",
+            })
+
+            self.assertEqual(payload, {"continue": True, "systemMessage": ""})
+            self.assertEqual((run_dir / "tasks.jsonl").read_bytes(), before)
+
+    def test_missing_or_changed_current_intent_precedes_receipt_and_plan_writes(self):
+        goal = "Research physical AI regulation status and future outlook."
+        for context in ("missing", "changed"):
+            for pending in ("completion", "conduct-plan"):
+                with self.subTest(context=context, pending=pending), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    intent_root = root / "session-intent"
+                    run_dir = root / "run"
+                    state = _write_current_intent_state(intent_root, session_id="approved-session", current_goal=goal)
+                    _write_run_with_intent_source(run_dir, [_item("a", status="running")], state_path=state, session_id="approved-session", summary=goal)
+                    if pending == "completion":
+                        decision = _decision_action("a", "continue_next", evidence=VALID_COMPLETION_EVIDENCE, completion_check_digest=VALID_COMPLETION_DIGEST, verdict="pass")
+                        (run_dir / "consistency-decision.json").write_text(json.dumps(decision), encoding="utf-8")
+                    else:
+                        record = json.loads((run_dir / "approved-run.json").read_text())
+                        record["allowed_surfaces"].append("skill-evolution/...")
+                        (run_dir / "approved-run.json").write_text(json.dumps(record), encoding="utf-8")
+                        (run_dir / "conduct-plan.json").write_text(json.dumps(_conduct_plan()), encoding="utf-8")
+                    if context == "missing":
+                        state.unlink()
+                    else:
+                        _write_current_intent_state(intent_root, session_id="approved-session", current_goal="Draft a polite vendor email about a delayed delivery.")
+                    before = {p.name: p.read_bytes() for p in run_dir.iterdir() if p.is_file()}
+
+                    payload = aps.adapter_payload_from_env({
+                        "GHOST_ALICE_AUTOPILOT_RUN_DIR": str(run_dir),
+                        "GHOST_ALICE_PLATFORM": "codex",
+                        "GHOST_ALICE_SESSION_INTENT_ROOT": str(intent_root),
+                        "GHOST_ALICE_SESSION_ID": "approved-session",
+                    })
+
+                    self.assertEqual(payload, {"continue": True, "systemMessage": ""})
+                    for name, data in before.items():
+                        self.assertTrue((run_dir / name).is_file(), name)
+                        self.assertEqual((run_dir / name).read_bytes(), data)
+                    self.assertFalse((run_dir / "consistency-decision.applied.json").exists())
+                    self.assertFalse((run_dir / "conduct-plan.applied.json").exists())
+
+    def test_same_bound_session_goal_refinement_keeps_approved_ready_work(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            intent_root = root / "session-intent"
+            run_dir = root / "run"
+            goal = "Research physical AI regulation status and future outlook."
+            state_path = _write_current_intent_state(intent_root, session_id="same-session", current_goal=goal)
+            _write_run_with_intent_source(run_dir, [_item("a")], state_path=state_path, session_id="same-session", summary=goal)
+            _write_current_intent_state(intent_root, session_id="same-session", current_goal="Research physical AI regulation status and future outlook with deeper regulatory sources.")
+
+            payload = aps.adapter_payload_from_env({
+                "GHOST_ALICE_AUTOPILOT_RUN_DIR": str(run_dir),
+                "GHOST_ALICE_PLATFORM": "codex",
+                "GHOST_ALICE_SESSION_INTENT_ROOT": str(intent_root),
+                "GHOST_ALICE_SESSION_ID": "same-session",
+            })
+
+            self.assertIn("work-item: a", payload["systemMessage"])
+            self.assertEqual(aps.read_work_items(run_dir / "tasks.jsonl")[0]["status"], "running")
+
+    def test_explicit_platform_does_not_bootstrap_from_other_platform_ledger(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "project"
+            project.mkdir()
+            intent_root = root / "session-intent"
+            _write_current_intent_state(intent_root, session_id="same-id", current_goal="Research physical AI regulation status and future outlook.", platform="codex")
+
+            payload = aps.adapter_payload_from_env({
+                "PWD": str(project),
+                "GHOST_ALICE_PLATFORM": "claude",
+                "GHOST_ALICE_SESSION_INTENT_ROOT": str(intent_root),
+                "GHOST_ALICE_SESSION_ID": "same-id",
+            })
+
+            self.assertEqual(payload, {"continue": True, "systemMessage": ""})
+            self.assertFalse((project / ".autopilot/approved-run.json").exists())
+
+    def test_explicit_agent_runtime_receipt_completes_once_and_continues(self):
+        goal = "Research physical AI regulation status and future outlook."
+        for platform in ("codex", "claude", "agent-runtime"):
+            with self.subTest(platform=platform), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                intent_root = root / "session-intent"
+                run_dir = root / "run"
+                state = _write_current_intent_state(intent_root, session_id="approved-session", current_goal=goal, platform=platform)
+                _write_run_with_intent_source(run_dir, [_item("a", status="running"), _item("b", depends_on=["a"])], state_path=state, session_id="approved-session", summary=goal, platform=platform)
+                receipt = _decision_action("a", "continue_next", evidence=VALID_COMPLETION_EVIDENCE, completion_check_digest=VALID_COMPLETION_DIGEST, verdict="pass")
+                (run_dir / "consistency-decision.json").write_text(json.dumps(receipt))
+                env = {"GHOST_ALICE_AUTOPILOT_RUN_DIR": str(run_dir), "GHOST_ALICE_PLATFORM": platform, "GHOST_ALICE_SESSION_INTENT_ROOT": str(intent_root), "GHOST_ALICE_SESSION_ID": "approved-session"}
+
+                payload = aps.adapter_payload_from_env(env)
+
+                self.assertIn("work-item: b", payload["systemMessage"])
+                self.assertEqual([item["status"] for item in aps.read_work_items(run_dir / "tasks.jsonl")], ["completed", "running"])
+                self.assertFalse((run_dir / "consistency-decision.json").exists())
+                self.assertTrue((run_dir / "consistency-decision.applied.json").is_file())
+                aps.adapter_payload_from_env(env)
+                events = [json.loads(line) for line in (run_dir / "events.jsonl").read_text().splitlines()]
+                self.assertEqual(sum(event.get("event") == "consistency_decision_applied" for event in events), 1)
+
+    def test_agent_runtime_goal_refinement_keeps_approved_work(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            intent_root = root / "session-intent"
+            run_dir = root / "run"
+            goal = "Research physical AI regulation status and future outlook."
+            state = _write_current_intent_state(intent_root, session_id="approved-session", current_goal=goal, platform="agent-runtime")
+            _write_run_with_intent_source(run_dir, [_item("a")], state_path=state, session_id="approved-session", summary=goal, platform="agent-runtime")
+            _write_current_intent_state(intent_root, session_id="approved-session", current_goal=goal + " Include deeper regulatory sources.", platform="agent-runtime")
+
+            payload = aps.adapter_payload_from_env({"GHOST_ALICE_AUTOPILOT_RUN_DIR": str(run_dir), "GHOST_ALICE_PLATFORM": "agent-runtime", "GHOST_ALICE_SESSION_INTENT_ROOT": str(intent_root), "GHOST_ALICE_SESSION_ID": "approved-session"})
+
+            self.assertIn("work-item: a", payload["systemMessage"])
+            self.assertEqual(aps.read_work_items(run_dir / "tasks.jsonl")[0]["status"], "running")
+
+    def test_agent_runtime_bootstrap_uses_its_own_current_ledger(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            project = root / "project"
+            project.mkdir()
+            intent_root = root / "session-intent"
+            _write_current_intent_state(intent_root, session_id="same-id", current_goal="Research physical AI regulation status and future outlook.", platform="agent-runtime")
+            _write_current_intent_state(intent_root, session_id="same-id", current_goal="Draft an unrelated vendor email.", platform="codex")
+
+            payload = aps.adapter_payload_from_env({"PWD": str(project), "GHOST_ALICE_PLATFORM": "agent-runtime", "GHOST_ALICE_SESSION_INTENT_ROOT": str(intent_root), "GHOST_ALICE_SESSION_ID": "same-id"})
+
+            self.assertTrue(payload["systemMessage"])
+            run = json.loads((project / ".autopilot/approved-run.json").read_text())
+            self.assertEqual(run["approval_evidence"]["session_intent"]["platform"], "agent-runtime")
+            self.assertIn("physical AI", run["scope"]["summary"])
+
+    def test_unknown_explicit_platform_never_bootstraps_from_native_pointer(self):
+        for platform in ("custom-runtime", "../codex"):
+            with self.subTest(platform=platform), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                project = root / "project"
+                project.mkdir()
+                intent_root = root / "session-intent"
+                _write_current_intent_state(intent_root, session_id="same-id", current_goal="Research physical AI regulation status and future outlook.")
+
+                payload = aps.adapter_payload_from_env({"PWD": str(project), "GHOST_ALICE_PLATFORM": platform, "GHOST_ALICE_SESSION_INTENT_ROOT": str(intent_root), "GHOST_ALICE_SESSION_ID": "same-id"})
+
+                self.assertEqual(payload, {"continue": True, "systemMessage": ""})
+                self.assertFalse((project / ".autopilot/approved-run.json").exists())
+
+    def test_agent_runtime_invalid_context_preserves_pending_state(self):
+        goal = "Research physical AI regulation status and future outlook."
+        for context in ("missing", "changed", "foreign-session", "foreign-platform", "wrong-schema", "malformed", "ledger-session-mismatch", "ledger-platform-mismatch"):
+            for pending in ("completion", "conduct-plan"):
+                with self.subTest(context=context, pending=pending), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    intent_root = root / "session-intent"
+                    run_dir = root / "run"
+                    state = _write_current_intent_state(intent_root, session_id="approved-session", current_goal=goal, platform="agent-runtime")
+                    _write_run_with_intent_source(run_dir, [_item("a", status="running")], state_path=state, session_id="approved-session", summary=goal, platform="agent-runtime")
+                    env = {"GHOST_ALICE_AUTOPILOT_RUN_DIR": str(run_dir), "GHOST_ALICE_PLATFORM": "agent-runtime", "GHOST_ALICE_SESSION_INTENT_ROOT": str(intent_root), "GHOST_ALICE_SESSION_ID": "approved-session"}
+                    if pending == "completion":
+                        receipt = _decision_action("a", "continue_next", evidence=VALID_COMPLETION_EVIDENCE, completion_check_digest=VALID_COMPLETION_DIGEST, verdict="pass")
+                        (run_dir / "consistency-decision.json").write_text(json.dumps(receipt))
+                    else:
+                        record = json.loads((run_dir / "approved-run.json").read_text())
+                        record["allowed_surfaces"].append("skill-evolution/...")
+                        (run_dir / "approved-run.json").write_text(json.dumps(record))
+                        (run_dir / "conduct-plan.json").write_text(json.dumps(_conduct_plan()))
+                    if context == "missing":
+                        state.unlink()
+                    elif context == "changed":
+                        _write_current_intent_state(intent_root, session_id="approved-session", current_goal="Draft a polite vendor email about a delayed delivery.", platform="agent-runtime")
+                    elif context == "foreign-session":
+                        env["GHOST_ALICE_SESSION_ID"] = "foreign-session"
+                        _write_current_intent_state(intent_root, session_id="foreign-session", current_goal=goal, platform="agent-runtime")
+                    elif context == "foreign-platform":
+                        env["GHOST_ALICE_PLATFORM"] = "codex"
+                        _write_current_intent_state(intent_root, session_id="approved-session", current_goal=goal, platform="codex")
+                    elif context == "malformed":
+                        state.write_text("{")
+                    else:
+                        data = json.loads(state.read_text())
+                        field, value = {"wrong-schema": ("schema_version", "unknown.v1"), "ledger-session-mismatch": ("session_id", "foreign-session"), "ledger-platform-mismatch": ("platform", "codex")}[context]
+                        data[field] = value
+                        state.write_text(json.dumps(data))
+                    before = {p.name: p.read_bytes() for p in run_dir.iterdir() if p.is_file()}
+
+                    payload = aps.adapter_payload_from_env(env)
+
+                    self.assertEqual(payload, {"continue": True, "systemMessage": ""})
+                    for name, data in before.items():
+                        self.assertEqual((run_dir / name).read_bytes(), data, name)
+                    self.assertFalse((run_dir / "consistency-decision.applied.json").exists())
+                    self.assertFalse((run_dir / "conduct-plan.applied.json").exists())
+
+    def test_agent_runtime_requires_explicit_identity_and_absolute_root(self):
+        for absent in ("platform", "session", "root", "relative-root"):
+            with self.subTest(absent=absent), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                intent_root = root / "session-intent"
+                run_dir = root / "run"
+                goal = "Research physical AI regulation status and future outlook."
+                state = _write_current_intent_state(intent_root, session_id="approved-session", current_goal=goal, platform="agent-runtime")
+                _write_run_with_intent_source(run_dir, [_item("a", status="running")], state_path=state, session_id="approved-session", summary=goal, platform="agent-runtime")
+                receipt = _decision_action("a", "continue_next", evidence=VALID_COMPLETION_EVIDENCE, completion_check_digest=VALID_COMPLETION_DIGEST, verdict="pass")
+                (run_dir / "consistency-decision.json").write_text(json.dumps(receipt))
+                env = {"GHOST_ALICE_AUTOPILOT_RUN_DIR": str(run_dir), "GHOST_ALICE_PLATFORM": "agent-runtime", "GHOST_ALICE_SESSION_INTENT_ROOT": str(intent_root), "GHOST_ALICE_SESSION_ID": "approved-session"}
+                if absent == "relative-root":
+                    env["GHOST_ALICE_SESSION_INTENT_ROOT"] = "session-intent"
+                else:
+                    del env[{"platform": "GHOST_ALICE_PLATFORM", "session": "GHOST_ALICE_SESSION_ID", "root": "GHOST_ALICE_SESSION_INTENT_ROOT"}[absent]]
+                before = {p.name: p.read_bytes() for p in run_dir.iterdir() if p.is_file()}
+
+                payload = aps.adapter_payload_from_env(env)
+
+                self.assertEqual(payload, {"continue": True, "systemMessage": ""})
+                for name, data in before.items():
+                    self.assertTrue((run_dir / name).is_file(), name)
+                    self.assertEqual((run_dir / name).read_bytes(), data, name)
+                self.assertFalse((run_dir / "consistency-decision.applied.json").exists())
+
+    def test_invalid_ledger_identity_cannot_bootstrap_run(self):
+        for platform in ("codex", "claude", "agent-runtime"):
+            for field in ("schema_version", "session_id", "platform"):
+                for explicit_session in (True, False):
+                    with self.subTest(platform=platform, field=field, explicit_session=explicit_session), tempfile.TemporaryDirectory() as tmp:
+                        root = Path(tmp)
+                        project = root / "project"
+                        project.mkdir()
+                        intent_root = root / "session-intent"
+                        state = _write_current_intent_state(intent_root, session_id="same-id", current_goal="Research physical AI regulation status and future outlook.", platform=platform)
+                        data = json.loads(state.read_text())
+                        del data[field]
+                        state.write_text(json.dumps(data))
+                        env = {"PWD": str(project), "GHOST_ALICE_PLATFORM": platform, "GHOST_ALICE_SESSION_INTENT_ROOT": str(intent_root)}
+                        if explicit_session:
+                            env["GHOST_ALICE_SESSION_ID"] = "same-id"
+
+                        payload = aps.adapter_payload_from_env(env)
+
+                        self.assertEqual(payload, {"continue": True, "systemMessage": ""})
+                        self.assertFalse((project / ".autopilot/approved-run.json").exists())
+
+    def test_invalid_native_pointer_context_preserves_pending_receipt_without_explicit_sid(self):
+        for platform in ("codex", "claude"):
+            for conflict in ("platform", "session_id", "schema_version", "missing"):
+                with self.subTest(platform=platform, conflict=conflict), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    intent_root = root / "session-intent"
+                    run_dir = root / "run"
+                    goal = "Research physical AI regulation status and future outlook."
+                    state = _write_current_intent_state(intent_root, session_id="approved-session", current_goal=goal, platform=platform)
+                    _write_run_with_intent_source(run_dir, [_item("a", status="running")], state_path=state, session_id="approved-session", summary=goal, platform=platform)
+                    receipt = _decision_action("a", "continue_next", evidence=VALID_COMPLETION_EVIDENCE, completion_check_digest=VALID_COMPLETION_DIGEST, verdict="pass")
+                    (run_dir / "consistency-decision.json").write_text(json.dumps(receipt))
+                    if conflict == "missing":
+                        state.unlink()
+                    else:
+                        data = json.loads(state.read_text())
+                        data[conflict] = "foreign-value"
+                        state.write_text(json.dumps(data))
+                    before = {p.name: p.read_bytes() for p in run_dir.iterdir() if p.is_file()}
+
+                    payload = aps.adapter_payload_from_env({"GHOST_ALICE_AUTOPILOT_RUN_DIR": str(run_dir), "GHOST_ALICE_PLATFORM": platform, "GHOST_ALICE_SESSION_INTENT_ROOT": str(intent_root)})
+
+                    self.assertEqual(payload, {"continue": True, "systemMessage": ""})
+                    for name, data in before.items():
+                        self.assertTrue((run_dir / name).is_file(), name)
+                        self.assertEqual((run_dir / name).read_bytes(), data, name)
+                    self.assertFalse((run_dir / "consistency-decision.applied.json").exists())
+
+    def test_invalid_selected_context_never_falls_back_to_sibling_approval(self):
+        for explicit_session in (True, False):
+            for bootstrap in (True, False):
+                with self.subTest(explicit_session=explicit_session, bootstrap=bootstrap), tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    project = root / "project"
+                    project.mkdir()
+                    local_root = project / ".tmp/session-intent"
+                    run_dir = project / ".autopilot"
+                    goal = "Research physical AI regulation status and future outlook."
+                    state = _write_current_intent_state(local_root, session_id="same-id", current_goal=goal)
+                    _write_current_intent_state(root / "ghost-alice/.tmp/session-intent", session_id="same-id", current_goal=goal)
+                    if not bootstrap:
+                        _write_run_with_intent_source(run_dir, [_item("a", status="running")], state_path=state, session_id="same-id", summary=goal)
+                        receipt = _decision_action("a", "continue_next", evidence=VALID_COMPLETION_EVIDENCE, completion_check_digest=VALID_COMPLETION_DIGEST, verdict="pass")
+                        (run_dir / "consistency-decision.json").write_text(json.dumps(receipt))
+                    data = json.loads(state.read_text())
+                    data["platform"] = "claude"
+                    state.write_text(json.dumps(data))
+                    before = {p.name: p.read_bytes() for p in run_dir.iterdir() if p.is_file()} if run_dir.exists() else {}
+                    env = {"PWD": str(project), "GHOST_ALICE_PLATFORM": "codex"}
+                    if explicit_session:
+                        env["GHOST_ALICE_SESSION_ID"] = "same-id"
+
+                    payload = aps.adapter_payload_from_env(env)
+
+                    self.assertEqual(payload, {"continue": True, "systemMessage": ""})
+                    if bootstrap:
+                        self.assertFalse((run_dir / "approved-run.json").exists())
+                    for name, contents in before.items():
+                        self.assertTrue((run_dir / name).is_file(), name)
+                        self.assertEqual((run_dir / name).read_bytes(), contents, name)
+                    self.assertFalse((run_dir / "consistency-decision.applied.json").exists())
 
     def test_digest_only_current_session_escalates_before_stale_noop(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2399,6 +2769,107 @@ class AutopilotStateTest(unittest.TestCase):
         self.assertTrue(payload["continue"])
         self.assertIn("work-item: conduct-scope-drift", payload["systemMessage"])
         self.assertEqual(items[0]["status"], "running")
+
+    def test_conduct_plan_outside_run_surfaces_preserves_queue_and_plan_evidence(self):
+        for surfaces in (["skill-evolution/..."], [], ["_shared-other/report.md"]):
+            with self.subTest(surfaces=surfaces), tempfile.TemporaryDirectory() as tmp:
+                run_dir = Path(tmp)
+                _write_run(run_dir, [_item("done", status="completed")])
+                plan = _conduct_plan()
+                plan["proposed_queue_items"][0]["task_template"]["allowed_surface"] = surfaces
+                plan_bytes = json.dumps(plan, indent=2).encode()
+                (run_dir / "conduct-plan.json").write_bytes(plan_bytes)
+                prior_applied = b'{"previous": "approval receipt"}\n'
+                (run_dir / "conduct-plan.applied.json").write_bytes(prior_applied)
+                queue_bytes = (run_dir / "tasks.jsonl").read_bytes()
+                run_bytes = (run_dir / "approved-run.json").read_bytes()
+
+                for _ in range(2):
+                    payload = aps.advance_approved_run(run_dir)
+                    self.assertEqual(payload, {"continue": True, "systemMessage": ""})
+                    self.assertEqual((run_dir / "tasks.jsonl").read_bytes(), queue_bytes)
+                    self.assertEqual((run_dir / "conduct-plan.json").read_bytes(), plan_bytes)
+                    self.assertEqual((run_dir / "conduct-plan.applied.json").read_bytes(), prior_applied)
+                    self.assertEqual((run_dir / "approved-run.json").read_bytes(), run_bytes)
+                events = [json.loads(line) for line in (run_dir / "events.jsonl").read_text().splitlines()]
+                rejected = [e for e in events if e["event"] == "conduct_plan_outside_allowed_surfaces"]
+                self.assertEqual(len(rejected), 2)
+                self.assertEqual(rejected[0]["run_id"], "run-1")
+                self.assertEqual(rejected[0]["source_candidate_id"], plan["source_candidate_id"])
+                self.assertEqual(rejected[0]["rejected_work_item_ids"], ["conduct-scope-drift"])
+                self.assertNotIn("conduct_plan_imported", [e["event"] for e in events])
+
+    def test_mixed_conduct_plan_outside_run_surfaces_imports_no_partial_queue(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            _write_run(run_dir, [])
+            plan = _conduct_plan("inside")
+            plan["proposed_queue_items"][0]["task_template"]["allowed_surface"] = ["_shared/report.md"]
+            plan["proposed_queue_items"].extend(_conduct_plan("outside")["proposed_queue_items"])
+            (run_dir / "conduct-plan.json").write_text(json.dumps(plan), encoding="utf-8")
+            queue_bytes = (run_dir / "tasks.jsonl").read_bytes()
+
+            payload = aps.advance_approved_run(run_dir)
+
+            self.assertEqual(payload, {"continue": True, "systemMessage": ""})
+            self.assertEqual((run_dir / "tasks.jsonl").read_bytes(), queue_bytes)
+            self.assertTrue((run_dir / "conduct-plan.json").is_file())
+            self.assertFalse((run_dir / "conduct-plan.applied.json").exists())
+            events = [json.loads(line) for line in (run_dir / "events.jsonl").read_text().splitlines()]
+            self.assertEqual(events[0]["rejected_work_item_ids"], ["outside"])
+
+    def test_outside_conduct_plan_does_not_block_existing_approved_ready_work(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            _write_run(run_dir, [_item("existing")])
+            plan_bytes = json.dumps(_conduct_plan()).encode()
+            (run_dir / "conduct-plan.json").write_bytes(plan_bytes)
+
+            payload = aps.advance_approved_run(run_dir)
+            items = aps.read_work_items(run_dir / "tasks.jsonl")
+
+            self.assertIn("work-item: existing", payload["systemMessage"])
+            self.assertEqual([(item["id"], item["status"]) for item in items], [("existing", "running")])
+            self.assertEqual((run_dir / "conduct-plan.json").read_bytes(), plan_bytes)
+            self.assertFalse((run_dir / "conduct-plan.applied.json").exists())
+            events = [json.loads(line) for line in (run_dir / "events.jsonl").read_text().splitlines()]
+            self.assertEqual([e["event"] for e in events], ["conduct_plan_outside_allowed_surfaces", "continue_next_item"])
+
+    def test_conduct_plan_preflight_preserves_exact_and_subtree_surface_policy(self):
+        for allowed, candidate in (("docs/report.md", "docs/report.md"), ("docs/...", "docs/report.md")):
+            with self.subTest(allowed=allowed), tempfile.TemporaryDirectory() as tmp:
+                run_dir = Path(tmp)
+                _write_run(run_dir, [])
+                record = _approved_run_record()
+                record["allowed_surfaces"] = [allowed]
+                (run_dir / "approved-run.json").write_text(json.dumps(record), encoding="utf-8")
+                plan = _conduct_plan()
+                plan["proposed_queue_items"][0]["task_template"]["allowed_surface"] = [candidate]
+                plan_bytes = json.dumps(plan).encode()
+                (run_dir / "conduct-plan.json").write_bytes(plan_bytes)
+
+                payload = aps.advance_approved_run(run_dir)
+
+                self.assertIn("work-item: conduct-scope-drift", payload["systemMessage"])
+                self.assertEqual(len(aps.read_work_items(run_dir / "tasks.jsonl")), 1)
+                self.assertEqual((run_dir / "conduct-plan.applied.json").read_bytes(), plan_bytes)
+
+    def test_conduct_plan_preflight_does_not_reimport_or_replace_existing_item(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            run_dir = Path(tmp)
+            _write_run(run_dir, [_item("conduct-scope-drift", status="completed")])
+            queue_bytes = (run_dir / "tasks.jsonl").read_bytes()
+            plan_bytes = json.dumps(_conduct_plan()).encode()
+            (run_dir / "conduct-plan.json").write_bytes(plan_bytes)
+
+            for _ in range(2):
+                self.assertEqual(aps.advance_approved_run(run_dir), {"continue": True, "systemMessage": ""})
+                self.assertEqual((run_dir / "tasks.jsonl").read_bytes(), queue_bytes)
+            self.assertEqual((run_dir / "conduct-plan.applied.json").read_bytes(), plan_bytes)
+            events = [json.loads(line) for line in (run_dir / "events.jsonl").read_text().splitlines()]
+            imports = [e for e in events if e["event"] == "conduct_plan_imported"]
+            self.assertEqual(len(imports), 1)
+            self.assertEqual(imports[0]["imported_work_item_ids"], [])
 
     def test_approved_run_emits_next_ready_item_and_records_event(self):
         with tempfile.TemporaryDirectory() as tmp:

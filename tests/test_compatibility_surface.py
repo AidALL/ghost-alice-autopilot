@@ -243,7 +243,7 @@ class CompatibilitySurfaceTest(unittest.TestCase):
     def test_docs_explain_matrix_is_not_a_dated_test_log(self) -> None:
         expected = {
             "README.md": "not a chronological test log",
-            "README_ko.md": "시간순 테스트 로그가 아니다",
+            "README_ko.md": "시간순 테스트 로그가 아닙니다",
             "addons/autopilot-mode/skill/SKILL.md": "not historical dated run prose",
         }
         for rel, phrase in expected.items():
@@ -280,7 +280,7 @@ class CompatibilitySurfaceTest(unittest.TestCase):
     def test_install_docs_state_commands_run_from_core_checkout(self) -> None:
         expected = {
             "README.md": "from a Ghost-ALICE core checkout",
-            "README_ko.md": "Ghost-ALICE core checkout에서 실행한다",
+            "README_ko.md": "Ghost-ALICE core 저장소 디렉터리에서 실행해 주세요",
             "addons/autopilot-mode/skill/SKILL.md": "from a Ghost-ALICE core checkout",
         }
         for rel, phrase in expected.items():
@@ -378,9 +378,19 @@ class CompatibilitySurfaceTest(unittest.TestCase):
             "all other decisions require `running`",
             "without creating `consistency-decision.json`",
         )
-        for rel in ("README.md", "README_ko.md", "addons/autopilot-mode/skill/SKILL.md"):
+        expected = {
+            "README.md": required_phrases,
+            "addons/autopilot-mode/skill/SKILL.md": required_phrases,
+            "README_ko.md": (
+                "대상 작업의 상태를 확인합니다",
+                "`continue_next`는 `running`, `ready`, `reopened` 상태를 허용",
+                "나머지 결정은 `running` 상태를 요구합니다",
+                "`consistency-decision.json`을 생성하지 않은 채 종료합니다",
+            ),
+        }
+        for rel, phrases in expected.items():
             text = (REPO_ROOT / rel).read_text(encoding="utf-8")
-            for phrase in required_phrases:
+            for phrase in phrases:
                 with self.subTest(rel=rel, phrase=phrase):
                     self.assertIn(phrase, text)
 

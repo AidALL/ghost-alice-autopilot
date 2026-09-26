@@ -72,6 +72,8 @@ State-aware promotion resolves the target work-item status from `--run-dir` or t
 
 ## Session-Intent Bridge
 
+The Stop adapter also accepts a host that declares `GHOST_ALICE_PLATFORM=agent-runtime`, an explicit `GHOST_ALICE_SESSION_ID`, and an absolute `GHOST_ALICE_SESSION_INTENT_ROOT`. It reads only `<root>/agent-runtime/<session-id>/intent-state.json`; it does not borrow a native platform's ledger or the shared current-session pointer. The ledger must use `session-intent-ledger.v1` and match the selected platform and session. Missing or conflicting context parks the run before pending receipts or plans are applied. Valid receipts are consumed once, and ordinary refinement within the approved objective keeps the existing approval. Unknown explicit platforms never fall back to Codex or Claude. Hosts still own their model, tool execution, and event dispatch; this adapter contract does not install those host capabilities.
+
 Installation alone does not create `.autopilot/`. To activate an approved run from the current Ghost-ALICE session ledger, use the package bridge `skill/scripts/autopilot_session_bridge.py` or the repository wrapper `scripts/autopilot_session_bridge.py`. The bridge reads `.tmp/session-intent/<platform>/current-session.json`, the pointed `intent-state.json`, and sibling `intent-events.jsonl`, then writes `.autopilot/approved-run.json` plus either a promoted `conduct-plan.json` or a ready `tasks.jsonl` item.
 
 The bridge supports `--platform codex` and `--platform claude`. It refuses to write run state unless `--approval-evidence-json` contains an approval decision (`GO`, `approve`, or `approved`) and a non-empty `source`, and it preserves session event metadata in `approved-run.json` approval evidence.

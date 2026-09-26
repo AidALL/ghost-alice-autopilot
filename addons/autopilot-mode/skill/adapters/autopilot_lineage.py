@@ -10,6 +10,27 @@ from pathlib import Path
 from typing import Any, Mapping
 
 
+def agent_runtime_context_is_explicit(source: Mapping[str, str]) -> bool:
+    """Generic hosts must supply their current identity and authoritative root."""
+    root = str(source.get("GHOST_ALICE_SESSION_INTENT_ROOT") or "").strip()
+    return (
+        str(source.get("GHOST_ALICE_PLATFORM") or "").strip().lower() == "agent-runtime"
+        and bool(str(source.get("GHOST_ALICE_SESSION_ID") or "").strip())
+        and bool(root)
+        and Path(root).is_absolute()
+    )
+
+
+def intent_identity_matches(state: Mapping[str, Any], platform: str, session_id: str) -> bool:
+    """Validate candidate identity before either bootstrap or continuation."""
+    return (
+        state.get("schema_version") == "session-intent-ledger.v1"
+        and bool(session_id)
+        and state.get("session_id") == session_id
+        and state.get("platform") == platform
+    )
+
+
 STOPWORDS = frozenset({
     "about",
     "after",
@@ -148,17 +169,19 @@ def stale_continuation_missing_intent_event(
     run: Mapping[str, Any],
     items: list[dict[str, Any]],
     current_session_id: str | None,
+    *,
+    require_current_intent: bool = False,
 ) -> dict[str, Any] | None:
     current_session = str(current_session_id or "").strip()
     run_session = _run_session_id(run)
-    if not run_session or not current_session:
+    if not run_session or (not current_session and not require_current_intent):
         return None
     return _stale_continuation_event(
         run,
         items,
         current_session=current_session,
         current_summary="",
-        reason="explicit current session has no lineage-compatible intent state",
+        reason="selected current session context has no lineage-compatible intent state",
     )
 
 
@@ -177,6 +200,46 @@ def _run_source_state_paths(run: Mapping[str, Any]) -> set[str]:
             if isinstance(state_path, str) and state_path.strip():
                 paths.add(str(Path(state_path).expanduser()))
     return paths
+
+
+def session_binding_mismatch_event(
+    run: Mapping[str, Any],
+    items: list[dict[str, Any]],
+    current_intent: Mapping[str, Any] | None,
+    source: Mapping[str, str] | None,
+) -> dict[str, Any] | None:
+    """Topic similarity cannot transfer a run's authority across identities."""
+    source = source or {}
+    current = current_intent or {}
+    state = current.get("intent_state")
+    state = state if isinstance(state, Mapping) else {}
+    approval = run.get("approval_evidence")
+    approval = approval if isinstance(approval, Mapping) else {}
+    binding = approval.get("session_intent")
+    binding = binding if isinstance(binding, Mapping) else {}
+    run_session = _run_session_id(run)
+    run_platform = str(binding.get("platform") or "").strip()
+    current_session = str(source.get("GHOST_ALICE_SESSION_ID") or current.get("session_id") or state.get("session_id") or "").strip()
+    current_platform = str(source.get("GHOST_ALICE_PLATFORM") or current.get("platform") or state.get("platform") or "").strip()
+    reason = ""
+    if run_session and current_session and run_session != current_session:
+        reason = "current session binding differs from the approved run; current-session approval is required"
+    elif run_platform and current_platform and run_platform != current_platform:
+        reason = "current platform binding differs from the approved run; current-session approval is required"
+    elif current_intent and (
+        any(str(value).strip() != current_session for value in (current.get("session_id"), state.get("session_id")) if value)
+        or any(str(value).strip() != current_platform for value in (current.get("platform"), state.get("platform")) if value)
+    ):
+        reason = "current intent ledger identity disagrees with the firing session binding"
+    if not reason:
+        return None
+    event = _stale_continuation_event(
+        run, items, current_session=current_session,
+        current_summary=_current_summary(state),
+        current_state_path=current.get("state_path"), reason=reason,
+    )
+    event.update({"run_platform": run_platform, "current_platform": current_platform})
+    return event
 
 
 def stale_continuation_source_intent_event(
