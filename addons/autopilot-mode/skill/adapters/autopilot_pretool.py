@@ -26,7 +26,18 @@ def capture_before_tool(source, hook_input, *, preflight=False):
     if not current.get("GHOST_ALICE_SESSION_INTENT_ROOT"):
         helper = _helper()
         candidates = helper.adapter._session_intent_root_candidates(current, helper.adapter._project_cwd_from_env(current))
-        if not any((root / "ghost-state.sqlite3").is_file() for root in candidates):
+        for root in candidates:
+            if not (root / "ghost-state.sqlite3").is_file():
+                continue
+            try:
+                helper.adapter.read_session_material(root, current["GHOST_ALICE_PLATFORM"],
+                    current["GHOST_ALICE_SESSION_ID"], source=current,
+                    require_input=True, recover_audit=False)
+            except FileNotFoundError:
+                continue
+            current["GHOST_ALICE_SESSION_INTENT_ROOT"] = str(root.resolve())
+            break
+        else:
             return {"status": "skipped"}
     try:
         return capture_origin(current, preflight=preflight)

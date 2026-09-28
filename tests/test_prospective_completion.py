@@ -231,6 +231,20 @@ class ProspectiveCompletionTest(unittest.TestCase):
         self.assertFalse((self.root / ".tmp").exists())
         self.assertFalse(self.run_dir.exists())
 
+    def test_foreign_session_database_does_not_require_current_publication(self):
+        shutil.rmtree(self.root / "intent")
+        foreign = self.root / ".tmp/session-intent"
+        self.core.record_turn(root=foreign, platform="codex", session_id="foreign-session",
+            raw_user_input="Unrelated test session")
+        before = self.core.read_session_state(root=foreign, platform="codex",
+            session_id="foreign-session")
+        source = {key: value for key, value in self.source.items()
+                  if key != "GHOST_ALICE_SESSION_INTENT_ROOT"}
+        self.assertEqual(self.capture(source)["status"], "skipped")
+        self.assertEqual(before, self.core.read_session_state(root=foreign, platform="codex",
+            session_id="foreign-session"))
+        self.assertFalse(self.run_dir.exists())
+
     def test_runtime_surface_change_rejects_original_capture(self):
         self.capture(); self.proof()
         self.source["GHOST_ALICE_AUTOPILOT_PLAN_PATH"] = str(self.root / "new-plan.md")

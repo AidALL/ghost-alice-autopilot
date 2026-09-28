@@ -14,7 +14,7 @@ This repository provides the addon for Claude Code and Codex. You need Ghost-ALI
 
 Internally, the addon reads the project's `.autopilot/` state after an agent stop event, chooses a `ready` or `reopened` item, or resumes an unresolved `running` item when current io-trace material exists, then emits a continuation message.
 
-Current release: `0.3.0`, paired with Ghost-ALICE core `0.3.0`. See the [release notes](./docs/release/2026-09-26-release-notes.md), [GitHub release](https://github.com/AidALL/ghost-alice-autopilot/releases/tag/v0.3.0), and [Ghost-ALICE website](https://aidall.github.io/ghost-alice/). Both projects remain open source under Apache-2.0.
+Current source version: `0.4.0`, paired with Ghost-ALICE core `0.4.0`. See the [release notes](./docs/release/2026-09-28-release-notes.md), [GitHub release](https://github.com/AidALL/ghost-alice-autopilot/releases), and [Ghost-ALICE website](https://aidall.github.io/ghost-alice/). Both projects remain open source under Apache-2.0.
 
 ## What This Addon Does
 
@@ -123,13 +123,13 @@ The Stop adapter has a separate automatic current-session path. When the project
 
 Do not install this addon with Ghost-ALICE core older than 0.2.2. Older core installers may copy the skill without wiring the privileged adapter, runtime-core audit, ledger met-flip path, or schema-preserving hook renderer required by the current addon contract; that install is inert or incomplete and should be removed before upgrading.
 
-The installer compatibility floor remains core `0.2.2`. For the current intent snapshots and session-bound hook updates, use the recommended core `0.3.0` / addon `0.3.0` pair; a shared product version does not change schema versions or add a standalone model runtime.
+The current SQLite runtime requires core `0.4.0` or newer. For the current intent snapshots and session-bound hook updates, use the recommended core `0.4.0` / addon `0.4.0` pair; a shared product version does not change schema versions or add a standalone model runtime.
 
 ## Compatibility Matrix
 
 The compatibility SSOT is `compatibility-matrix.json`. It must be checked before making a full compatibility claim. The matrix records the current support posture, not a chronological test log; dated run artifacts belong in CI/test reports or release notes.
 
-The matrix below records the established support posture. Its live Claude/Codex entries include earlier release evidence; they are not a claim that every entry was rerun for `0.3.0`. The [current release notes](./docs/release/2026-09-26-release-notes.md#verification-and-limits) distinguish this release's installed replay and regression checks from fresh model-inference coverage.
+The matrix below records the established support posture. Its live Claude/Codex entries include earlier release evidence; they are not a claim that every entry was rerun for `0.4.0`. The [current release notes](./docs/release/2026-09-28-release-notes.md#verification-and-limits) distinguish this release's installed replay and regression checks from fresh model-inference coverage.
 
 Current target status:
 

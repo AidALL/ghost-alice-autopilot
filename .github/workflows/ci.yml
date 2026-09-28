@@ -36,4 +36,5 @@ jobs:
         working-directory: ghost-alice-autopilot
         env:
           GHOST_ALICE_CORE_REPO: ${{ github.workspace }}/ghost-alice
+          GHOST_ALICE_CORE_ROOT: ${{ github.workspace }}/ghost-alice
         run: python scripts/run_project_tests.py tests -q -p no:cacheprovider

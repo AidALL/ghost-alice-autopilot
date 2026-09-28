@@ -72,6 +72,17 @@ RELEASE_PACKAGE_FILES = (
     "tests/test_live_semantic_e2e_unittest.py",
     "tests/test_project_runtime.py",
     "tests/test_privileged_adapter.py",
+    "addons/autopilot-mode/skill/adapters/autopilot_pretool.py",
+    "addons/autopilot-mode/skill/adapters/autopilot_provenance.py",
+    "addons/autopilot-mode/skill/scripts/autopilot_completion.py",
+    "docs/ko/release/2026-09-28-release-notes.md",
+    "docs/release/2026-09-28-release-notes.md",
+    "tests/test_completion_behavior_repair.py",
+    "tests/test_completion_evidence_source.py",
+    "tests/test_completion_preflight.py",
+    "tests/test_completion_publication.py",
+    "tests/test_completion_timestamp.py",
+    "tests/test_prospective_completion.py",
 )
 BASH_FIRST_PUBLIC_DOC_PATTERNS = {
     "PowerShell code fence": re.compile(r"```powershell", re.IGNORECASE),
@@ -143,6 +154,7 @@ class CompatibilitySurfaceTest(unittest.TestCase):
 
         self.assertIn("python -m pip install --upgrade pip pytest", workflow)
         self.assertIn("python scripts/run_project_tests.py tests", workflow)
+        self.assertIn("GHOST_ALICE_CORE_ROOT: ${{ github.workspace }}/ghost-alice", workflow)
         self.assertNotIn("python -m unittest discover", workflow)
 
     def test_release_package_files_are_in_git_index(self) -> None:
@@ -166,10 +178,10 @@ class CompatibilitySurfaceTest(unittest.TestCase):
         )
 
     def test_addon_manifest_core_floor_matches_public_contract(self) -> None:
-        self.assertEqual(_addon_manifest()["min_core_version"], "0.2.2")
+        self.assertEqual(_addon_manifest()["min_core_version"], "0.4.0")
         entry = _top_level_addons_manifest()["addons"][0]
         self.assertEqual(entry["id"], "autopilot-mode")
-        self.assertEqual(entry["min_core_version"], "0.2.2")
+        self.assertEqual(entry["min_core_version"], "0.4.0")
 
     def test_compatibility_matrix_enumerates_required_targets(self) -> None:
         matrix = _compatibility_matrix()

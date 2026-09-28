@@ -52,7 +52,8 @@ def _load_core_modules():
 def _real_adapter_gate_argv(platform: str) -> list[str]:
     addon_installer, install_hooks = _load_core_modules()
     targets = addon_installer.load_addon_targets([AUTOPILOT_SOURCE], platform=platform)
-    [spec] = addon_installer.iter_privileged_adapter_hook_specs(targets)
+    [spec] = [item for item in addon_installer.iter_privileged_adapter_hook_specs(targets)
+              if item["event"] == "on_agent_stop"]
     inner = install_hooks._hook_python_command(spec["script"], payload=True)
     entry = install_hooks._hook_runner_command_entry(
         spec["runner_id"],
@@ -176,11 +177,14 @@ class OfficialAutopilotAddonTest(unittest.TestCase):
         self.assertEqual(target.privileged_adapters, ("autopilot-mode",))
 
         specs = ai.iter_privileged_adapter_hook_specs(targets)
-        self.assertEqual(len(specs), 1)
-        self.assertEqual(specs[0]["event"], "on_agent_stop")
-        self.assertEqual(specs[0]["marker"], "[adapter:autopilot-mode] continue")
-        self.assertEqual(specs[0]["runner_id"], "adapter-autopilot-mode-continue")
-        self.assertTrue(Path(specs[0]["script"]).is_file())
+        self.assertEqual(len(specs), 2)
+        by_event = {spec["event"]: spec for spec in specs}
+        self.assertEqual(set(by_event), {"pre_tool_use", "on_agent_stop"})
+        self.assertEqual(by_event["on_agent_stop"]["marker"], "[adapter:autopilot-mode] continue")
+        self.assertEqual(by_event["on_agent_stop"]["runner_id"], "adapter-autopilot-mode-continue")
+        self.assertEqual(by_event["pre_tool_use"]["marker"], "[adapter:autopilot-mode] prepare-origin")
+        for spec in specs:
+            self.assertTrue(Path(spec["script"]).is_file())
 
     def test_official_autopilot_adapter_hook_installs_and_full_uninstall_removes_it(self):
         _ai, install_hooks = _load_core_modules()
