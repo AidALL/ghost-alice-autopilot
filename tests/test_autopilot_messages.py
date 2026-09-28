@@ -88,6 +88,34 @@ class BuildContinuationMessageNeutralityTest(unittest.TestCase):
         self.assertNotIn("C:/Users", msg)
         self.assertNotIn("C:\\Users", msg)
 
+    def test_approval_generation_keeps_exact_scalar_and_adjacent_runtime_provenance(self):
+        generation = "sha256:" + "aB09" * 16
+        criterion = "protect: Preserve protected.txt [source: user-explicit]"
+        item = self._item()
+        item["acceptance_criteria"] = [criterion]
+
+        msg = msgs.build_continuation_message(
+            {"run_id": "r", "approval_generation": generation}, item
+        )
+
+        self.assertIn(
+            f"approval-generation: {generation}\n"
+            "approval-generation-source: previous-tool\n"
+            "approval-generation-origin: autopilot-runtime\n",
+            msg,
+        )
+        self.assertEqual(msg.count("approval-generation:"), 1)
+        self.assertIn(f"acceptance-criteria:\n- {criterion}\n", msg)
+        self.assertEqual(item["acceptance_criteria"], [criterion])
+
+    def test_absent_approval_generation_does_not_emit_provenance_metadata(self):
+        for run in ({"run_id": "r"}, {"run_id": "r", "approval_generation": ""}):
+            with self.subTest(run=run):
+                msg = msgs.build_continuation_message(run, self._item())
+                self.assertNotIn("approval-generation:", msg)
+                self.assertNotIn("approval-generation-source:", msg)
+                self.assertNotIn("approval-generation-origin:", msg)
+
 
 if __name__ == "__main__":
     unittest.main()

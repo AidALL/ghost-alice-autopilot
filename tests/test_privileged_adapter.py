@@ -86,6 +86,9 @@ def _work_item(item_id: str) -> dict:
 
 def _write_approved_run(run_dir: Path, items: list[dict]) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "authority.json").write_text(json.dumps({
+        "schema_version": "autopilot-authority.v1", "kind": "standalone", "authority_id": "privileged-adapter-test",
+    }), encoding="utf-8")
     (run_dir / "approved-run.json").write_text(
         json.dumps({
             "schema_version": "autopilot-run.v1",
@@ -105,6 +108,9 @@ def _write_approved_run(run_dir: Path, items: list[dict]) -> None:
 
 def _write_approved_run_config(run_dir: Path, *, allowed_surfaces: list[str]) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "authority.json").write_text(json.dumps({
+        "schema_version": "autopilot-authority.v1", "kind": "standalone", "authority_id": "privileged-adapter-test",
+    }), encoding="utf-8")
     (run_dir / "approved-run.json").write_text(
         json.dumps({
             "schema_version": "autopilot-run.v1",
@@ -432,10 +438,7 @@ class OfficialAutopilotAddonTest(unittest.TestCase):
             )
             payload = json.loads(result.stdout)
             items = aps.read_work_items(run_dir / "tasks.jsonl")
-            events = [
-                json.loads(line)
-                for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
-            ]
+            events = aps.storage.read(run_dir / "events.jsonl")
             applied_plan_exists = (run_dir / "conduct-plan.applied.json").is_file()
 
         self.assertEqual(result.returncode, 0, result.stderr)

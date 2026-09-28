@@ -7,6 +7,9 @@ Dependencies: Python 3.11+ standard library plus sibling adapter modules.
 from __future__ import annotations
 
 import copy
+import hashlib
+import autopilot_storage as storage
+from autopilot_provenance import bind_origin, reapproval_payload, default_intent_root
 from contextlib import contextmanager
 import importlib.util
 import json
@@ -27,11 +30,16 @@ from autopilot_intent_recovery import (
     semantic_delta_starvation_event,
     unmet_admitted_criteria_evidence,
 )
+from autopilot_runtime_context import (
+    project_cwd_from_env as _project_cwd_from_env,
+    read_session_material,
+    resolve_run_target,
+    run_state_available as _run_state_available,
+)
 from autopilot_lineage import (
     agent_runtime_context_is_explicit,
     continuation_context_error,
     current_session_context,
-    intent_identity_matches,
     session_binding_mismatch_event,
     stale_continuation_event,
     stale_continuation_missing_intent_event,
@@ -99,32 +107,6 @@ def _noop_payload() -> dict[str, Any]:
     return dict(NOOP_PAYLOAD)
 
 
-@contextmanager
-def _run_dir_lock(run_dir: Path, permission_denied_noop: bool = False):
-    lock_dir = run_dir / LOCK_DIR
-    deadline = time.monotonic() + LOCK_TIMEOUT_SECONDS
-    while True:
-        try:
-            lock_dir.mkdir()
-            break
-        except FileExistsError as exc:
-            if time.monotonic() >= deadline:
-                raise AutopilotStateError(f"timed out waiting for autopilot run lock {lock_dir}") from exc
-            time.sleep(LOCK_POLL_SECONDS)
-        except PermissionError:
-            if permission_denied_noop:
-                yield False
-                return
-            raise
-    try:
-        yield True
-    finally:
-        try:
-            lock_dir.rmdir()
-        except FileNotFoundError:
-            pass
-
-
 def _has_non_empty_scope(value: Any) -> bool:
     if isinstance(value, str):
         return bool(value.strip())
@@ -168,7 +150,7 @@ def _work_item_within_run_surfaces(run: dict[str, Any], item: dict[str, Any]) ->
 
 def _read_json_object(path: Path) -> dict[str, Any]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = storage.read(path) if path.name not in storage.INBOXES else json.loads(path.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise AutopilotStateError(f"{path}: invalid JSON: {exc}") from exc
     if not isinstance(value, dict):
@@ -184,6 +166,11 @@ def _try_read_json_object(path: Path) -> dict[str, Any]:
 
 
 def _read_jsonl_objects(path: Path) -> list[dict[str, Any]]:
+    if path.name == EVENTS_FILE and (storage.active(path.parent) or (path.parent / storage.AUTHORITY_FILE).exists()):
+        try:
+            return storage.read(path)
+        except FileNotFoundError:
+            return []
     if not path.is_file():
         return []
     values: list[dict[str, Any]] = []
@@ -201,6 +188,8 @@ def _read_jsonl_objects(path: Path) -> list[dict[str, Any]]:
 
 def _write_json_atomic(path: str | Path, value: Mapping[str, Any]) -> None:
     target = Path(path)
+    if storage.write(target, dict(value)):
+        return
     target.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
     tmp_path = Path(tmp_name)
@@ -378,12 +367,6 @@ def _approval_from_session_decisions(intent_state: Mapping[str, Any]) -> dict[st
         return evidence
     return None
 
-
-def _project_cwd_from_env(source: Mapping[str, str]) -> Path:
-    candidate = Path(str(source.get("GHOST_ALICE_AUTOPILOT_CWD") or source.get("PWD") or "").strip())
-    return candidate if candidate.is_absolute() else Path.cwd()
-
-
 def _session_intent_root_candidates(source: Mapping[str, str], project_cwd: Path) -> list[Path]:
     candidates: list[Path] = []
     configured = str(source.get("GHOST_ALICE_SESSION_INTENT_ROOT") or "").strip()
@@ -401,15 +384,16 @@ def _session_intent_root_candidates(source: Mapping[str, str], project_cwd: Path
                 home / "ghost-alice" / ".tmp" / "session-intent",
                 home / ".ghost-alice" / "session-intent",
             ])
+    if not configured and (core_default := default_intent_root(source, project_cwd)) is not None:
+        candidates.append(core_default)
     unique: list[Path] = []
     seen: set[str] = set()
     for candidate in candidates:
         key = str(candidate)
-        if key not in seen:
+        if key not in seen and candidate.is_dir():
             seen.add(key)
             unique.append(candidate)
     return unique
-
 
 def _platform_candidates(source: Mapping[str, str]) -> list[str]:
     platform = str(source.get("GHOST_ALICE_PLATFORM") or "").strip().lower()
@@ -430,62 +414,16 @@ def _iter_current_session_intents(
         for platform in _platform_candidates(source):
             context = current_session_context(source, run_platform=platform, hook_input=hook_input)
             explicit_session = str(context.get("GHOST_ALICE_SESSION_ID") or "").strip()
-            if explicit_session:
-                state_path = root / platform / _safe_id(explicit_session) / "intent-state.json"
-                if not state_path.is_file():
-                    continue
-                intent_state = _try_read_json_object(state_path)
-                if not intent_identity_matches(intent_state, platform, explicit_session):
-                    return
-                yield {
-                    "platform": platform,
-                    "session_id": explicit_session,
-                    "state_path": state_path,
-                    "events_path": state_path.parent / "intent-events.jsonl",
-                    "intent_state": intent_state,
-                }
+            try:
+                yield read_session_material(root, platform, explicit_session or None, source=source)
+            except FileNotFoundError:
                 continue
-            pointer_path = root / platform / "current-session.json"
-            if not pointer_path.is_file():
-                continue
-            pointer = _try_read_json_object(pointer_path)
-            if pointer.get("schema_version") != "session-intent-current.v1":
+            except (ValueError, OSError):
                 return
-            if pointer.get("platform", platform) != platform:
-                return
-            pointer_state = pointer.get("state_path")
-            pointer_session = pointer.get("session_id")
-            if isinstance(pointer_state, str) and pointer_state.strip():
-                state_path = Path(pointer_state)
-                if not state_path.is_absolute():
-                    state_path = pointer_path.parent / state_path
-            elif isinstance(pointer_session, str) and pointer_session.strip():
-                state_path = root / platform / _safe_id(pointer_session) / "intent-state.json"
-            else:
-                return
-            if not state_path.is_file():
-                return
-            intent_state = _try_read_json_object(state_path)
-            session_id = str(pointer_session or state_path.parent.name)
-            if not intent_identity_matches(intent_state, platform, session_id):
-                return
-            yield {
-                "platform": platform,
-                "session_id": session_id,
-                "state_path": state_path,
-                "events_path": state_path.parent / "intent-events.jsonl",
-                "intent_state": intent_state,
-            }
 
 
 def _load_governance_signal_module():
     return SESSION_MATERIAL.load_governance_signal_module(required=False)
-
-
-def _run_state_available(run_dir: Path) -> bool:
-    return (run_dir / APPROVED_RUN_FILE).is_file() and (
-        (run_dir / TASKS_FILE).is_file() or (run_dir / CONDUCT_PLAN_FILE).is_file()
-    )
 
 
 def _has_explicit_session_intent_context(source: Mapping[str, str], project_cwd: Path) -> bool:
@@ -500,7 +438,8 @@ def _bootstrap_from_session_intent_if_approved(
     run_dir: Path,
     source: Mapping[str, str],
     project_cwd: Path,
-    *, hook_input: Mapping[str, Any] | None = None,
+    *, hook_input: Mapping[str, Any] | None = None, permission_denied_noop: bool = False,
+    expected_input_event: Mapping[str, Any] | None = None,
 ) -> bool:
     if (run_dir / OFF_FILE).exists() or _run_state_available(run_dir):
         return False
@@ -525,6 +464,8 @@ def _bootstrap_from_session_intent_if_approved(
         break
     if resolved is None:
         return False
+    if expected_input_event is not None and resolved.get("latest_input_event") != expected_input_event:
+        raise AutopilotStateError("input changed before completion admission; original caller receipt is stale")
     intent_state = resolved["intent_state"]
     if not isinstance(intent_state, Mapping):
         return False
@@ -532,18 +473,8 @@ def _bootstrap_from_session_intent_if_approved(
         return False
 
     events_path = resolved["events_path"]
-    events = _read_jsonl_objects(events_path)
-    session_evidence = {
-        "platform": resolved["platform"],
-        "session_id": resolved["session_id"],
-        "state_path": str(resolved["state_path"]),
-        "events_path": str(events_path),
-        "event_count": len(events),
-        "latest_event": _compact_event(events[-1] if events else None),
-        "latest_input_event": _latest_event_of(events, "user-input-observed"),
-        "latest_intent_update_event": _latest_event_of(events, "intent-updated"),
-        "recent_events": _safe_recent_events(events),
-    }
+    events = resolved["events"]
+    session_evidence = SESSION_MATERIAL.session_evidence(resolved)
     io_trace_rows = _read_io_trace_rows(source, session_id=str(resolved["session_id"]), limit=8)
     if io_trace_rows:
         session_evidence["io_trace"] = io_trace_rows
@@ -558,66 +489,74 @@ def _bootstrap_from_session_intent_if_approved(
     intent_events_path = resolved.get("events_path")
     initial_watermark = _intent_events_count(Path(intent_events_path)) if intent_events_path else 0
     run_dir.mkdir(parents=True, exist_ok=True)
-    _write_json_atomic(
-        run_dir / APPROVED_RUN_FILE,
-        {
-            "schema_version": "autopilot-run.v1",
-            "run_id": f"session-intent-{resolved['platform']}-{_safe_id(str(resolved['session_id']))}",
-            "approved": True,
-            "status": "running",
-            "scope": {"summary": SESSION_MATERIAL.run_summary(intent_state)},
-            "budget": {"remaining_steps": 3, "intent_watermark": initial_watermark},
-            "intent_source": {
-                "events_path": str(intent_events_path) if intent_events_path else "",
+    approved_run = SESSION_MATERIAL.build_approved_run(
+        intent_state=intent_state, approval_evidence=merged_approval,
+        run_id=f"session-intent-{resolved['platform']}-{_safe_id(str(resolved['session_id']))}",
+        remaining_steps=3, allowed_surfaces=allowed_surfaces,
+        stop_conditions=list(DEFAULT_STOP_CONDITIONS),
+    )
+    approved_run["scope"]["completion_contract"] = {key: copy.deepcopy(intent_state.get(key, [])) for key in ("constraints", "non_goals", "decisions")}
+    approved_run["approval_generation"] = SESSION_MATERIAL.approval_generation(approved_run)
+    approved_run["budget"]["intent_watermark"] = initial_watermark
+    approved_run["intent_source"] = {
+        "events_path": str(intent_events_path) if intent_events_path else "",
+        "state_path": str(resolved["state_path"]),
+    }
+    with storage.accessible_transaction(run_dir, source, authority=storage.bound_authority(approved_run),
+                                       permission_denied_noop=permission_denied_noop) as store:
+        if store is None or store.run() is not None:
+            return False
+        current = read_session_material(resolved["state_path"].parent.parent.parent,
+            resolved["platform"], resolved["session_id"], source=source)
+        if expected_input_event is not None and current.get("latest_input_event") != expected_input_event:
+            raise AutopilotStateError("input changed during completion admission; original caller receipt is stale")
+        if current["intent_state"] != intent_state:
+            raise AutopilotStateError("intent state changed during bootstrap; retry against current approval")
+        storage.migrate_bound_session(store, source)
+        _write_json_atomic(run_dir / APPROVED_RUN_FILE, approved_run)
+        _append_event(
+            run_dir,
+            {
+                "schema_version": "autopilot-event.v1",
+                "event": "session_intent_bootstrapped",
+                "platform": resolved["platform"],
+                "session_id": resolved["session_id"],
                 "state_path": str(resolved["state_path"]),
+                "approval_source": merged_approval.get("source"),
             },
-            "allowed_surfaces": allowed_surfaces,
-            "stop_conditions": list(DEFAULT_STOP_CONDITIONS),
-            "approval_evidence": merged_approval,
-        },
-    )
-    _append_event(
-        run_dir,
-        {
-            "schema_version": "autopilot-event.v1",
-            "event": "session_intent_bootstrapped",
-            "platform": resolved["platform"],
-            "session_id": resolved["session_id"],
-            "state_path": str(resolved["state_path"]),
-            "approval_source": merged_approval.get("source"),
-        },
-    )
-
-    governance_signal = _load_governance_signal_module()
-    candidate = None
-    if governance_signal is not None:
-        candidate = governance_signal.conduct_plan_candidate_from_governance(
-            intent_state=intent_state,
-            current_work_item_id=str(source.get("GHOST_ALICE_AUTOPILOT_CURRENT_WORK_ITEM_ID") or "current"),
-            plan_path=plan_path,
         )
-    if candidate is not None and governance_signal is not None:
-        approved_plan = governance_signal.promote_conduct_plan_candidate(
-            candidate,
-            approval_evidence=merged_approval,
-        )
-        if approved_plan is not None:
-            _write_json_atomic(run_dir / "conduct-plan.candidate.json", candidate)
-            _write_json_atomic(run_dir / CONDUCT_PLAN_FILE, approved_plan)
-            return True
 
-    write_work_items(
-        run_dir / TASKS_FILE,
-        [
-            SESSION_MATERIAL.session_intent_task(
+        governance_signal = _load_governance_signal_module()
+        candidate = None
+        if governance_signal is not None:
+            candidate = governance_signal.conduct_plan_candidate_from_governance(
                 intent_state=intent_state,
-                session_id=str(resolved["session_id"]),
-                allowed_surfaces=allowed_surfaces,
-                source_locator=f"{resolved['state_path']}#intent-state",
+                current_work_item_id=str(source.get("GHOST_ALICE_AUTOPILOT_CURRENT_WORK_ITEM_ID") or "current"),
+                plan_path=plan_path,
+                approval_generation=approved_run["approval_generation"],
             )
-        ],
-    )
-    return True
+        if candidate is not None and governance_signal is not None:
+            approved_plan = governance_signal.promote_conduct_plan_candidate(
+                candidate,
+                approval_evidence=merged_approval,
+            )
+            if approved_plan is not None:
+                _write_json_atomic(run_dir / "conduct-plan.candidate.json", candidate)
+                _write_json_atomic(run_dir / CONDUCT_PLAN_FILE, approved_plan)
+                return True
+
+        write_work_items(
+            run_dir / TASKS_FILE,
+            [
+                SESSION_MATERIAL.session_intent_task(
+                    intent_state=intent_state,
+                    session_id=str(resolved["session_id"]),
+                    allowed_surfaces=allowed_surfaces,
+                    source_locator=f"{resolved['state_path']}#intent-state",
+                )
+            ],
+        )
+        return True
 
 
 def _approved_run_allows_continue(run: dict[str, Any]) -> bool:
@@ -645,10 +584,7 @@ def _approved_run_allows_continue(run: dict[str, Any]) -> bool:
 
 
 def _append_event(run_dir: Path, event: dict[str, Any]) -> None:
-    event_path = run_dir / EVENTS_FILE
-    event_path.parent.mkdir(parents=True, exist_ok=True)
-    with event_path.open("a", encoding="utf-8") as out:
-        out.write(json.dumps(event, sort_keys=True, separators=(",", ":")) + "\n")
+    storage.append_event(run_dir, event)
 
 
 def _validate_promoted_decision_file(decision: Mapping[str, Any]) -> None:
@@ -692,38 +628,51 @@ def _quarantine_rejected_decision(run_dir: Path, decision: Mapping[str, Any], re
                 break
         else:
             rejected_path = run_dir / f"{stem}.{os.getpid()}.json"
-    try:
-        os.replace(run_dir / DECISION_FILE, rejected_path)
-    except OSError:
-        return
-    try:
-        _append_event(
-            run_dir,
-            {
-                "schema_version": "autopilot-event.v1",
-                "event": "consistency_decision_rejected",
-                "schema_version_seen": decision.get("schema_version"),
-                "reason": reason,
-            },
-        )
-    except OSError:
-        pass
+    storage.consume(run_dir / DECISION_FILE, decision, rejected_path)
+    _append_event(run_dir, {"schema_version": "autopilot-event.v1",
+        "event": "consistency_decision_rejected", "schema_version_seen": decision.get("schema_version"),
+        "reason": reason})
 
 
 def _apply_pending_decision(
     run_dir: Path,
     items: list[dict[str, Any]],
+    run: Mapping[str, Any] | None = None,
+    source: Mapping[str, str] | None = None,
 ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
     decision_path = run_dir / DECISION_FILE
-    if not decision_path.is_file():
-        return items, None
-    decision: Mapping[str, Any] = {}
     try:
-        decision = _read_json_object(decision_path)
+        decision = storage.inbox(decision_path)
+    except ValueError as exc:
+        raise AutopilotStateError(str(exc)) from exc
+    if decision is None:
+        return items, None
+    try:
         _validate_promoted_decision_file(decision)
+        try:
+            SESSION_MATERIAL.validate_approval_generation(run or {}, decision)
+        except ValueError as exc:
+            raise AutopilotStateError(str(exc)) from exc
         item_id = _require_string(decision.get("work_item_id"), "consistency decision work_item_id")
         decision_value = _require_string(decision.get("decision"), "consistency decision decision")
         evidence = _validate_string_list(decision.get("evidence"), "consistency decision evidence")
+        if decision_value == "continue_next":
+            store = storage.active(run_dir)
+            try:
+                publication = store.read("completion-publication.json") if store else None
+            except FileNotFoundError:
+                publication = None
+            if publication is not None and (publication.get("receipt") or {}).get("work_item_id") == item_id:
+                path = Path(__file__).resolve().parents[1] / "scripts" / "autopilot_completion.py"
+                spec = importlib.util.spec_from_file_location("autopilot_completion_validation", path)
+                helper = importlib.util.module_from_spec(spec)
+                spec.loader.exec_module(helper)
+                try:
+                    helper.validate_publication_decision(publication, run or {}, decision, source or {})
+                except ValueError as exc:
+                    raise AutopilotStateError(str(exc)) from exc
+            elif decision.get("completion_origin") is not None:
+                raise AutopilotStateError("completion origin has no matching prepared publication")
         updated = apply_consistency_decision(
             items,
             item_id,
@@ -732,12 +681,18 @@ def _apply_pending_decision(
             verdict=decision.get("verdict"),
             evidence=evidence,
         )
+        approval = (run or {}).get("approval_evidence")
+        if (decision_value == "continue_next" and isinstance(approval, Mapping)
+                and isinstance(approval.get("session_intent"), Mapping)):
+            # Validate and record proof under core's identity/input/criterion
+            # lock before promoting the AP task. A rejection cannot leave the
+            # task completed; an AP write failure leaves replayable core proof.
+            materialize_met_criteria_from_continue_next(run, decision, source, require_success=True)
     except AutopilotStateError as exc:
         # Reject (raise) an unconsumable decision -- fail-closed; the agent is not root and must not apply unverified state. But quarantine the offending file first so it does not re-raise on every subsequent Stop (a permanent stall): the rename preserves it as evidence, the event records the rejection, and the entrypoint still degrades to a non-blocking no-op. Fallback is correction before the next forward step; the audit log is never reduced.
-        _quarantine_rejected_decision(run_dir, decision, str(exc))
         raise
     write_work_items(run_dir / TASKS_FILE, updated)
-    os.replace(decision_path, run_dir / APPLIED_DECISION_FILE)
+    storage.consume(decision_path, decision, run_dir / APPLIED_DECISION_FILE)
     _append_event(
         run_dir,
         {
@@ -766,11 +721,15 @@ def _apply_pending_conduct_plan(
     run_dir: Path, items: list[dict[str, Any]], run: dict[str, Any],
 ) -> list[dict[str, Any]]:
     plan_path = run_dir / CONDUCT_PLAN_FILE
-    if not plan_path.is_file():
+    plan = storage.inbox(plan_path)
+    if plan is None:
         return items
     current = validate_work_items(copy.deepcopy(items))
     before_ids = {item["id"] for item in current}
-    plan = _read_json_object(plan_path)
+    try:
+        SESSION_MATERIAL.validate_approval_generation(run, plan)
+    except ValueError as exc:
+        raise AutopilotStateError(str(exc)) from exc
     updated = apply_conduct_plan_proposals(current, plan)
     new_items = [item for item in updated if item["id"] not in before_ids]
     rejected_ids = [item["id"] for item in new_items if not _work_item_within_run_surfaces(run, item)]
@@ -792,7 +751,7 @@ def _apply_pending_conduct_plan(
     imported_ids = [item["id"] for item in new_items]
     if imported_ids:
         write_work_items(run_dir / TASKS_FILE, updated)
-    os.replace(plan_path, run_dir / APPLIED_CONDUCT_PLAN_FILE)
+    storage.consume(plan_path, plan, run_dir / APPLIED_CONDUCT_PLAN_FILE)
     _append_event(
         run_dir,
         {
@@ -870,11 +829,18 @@ def _last_intent_watermark(run_dir: Path, run: Mapping[str, Any], work_item_id: 
     return base if isinstance(base, int) and not isinstance(base, bool) else 0
 
 
-def _maybe_replenish_resume_budget(run_dir: Path, run: Mapping[str, Any], work_item_id: str) -> bool:
+def _maybe_replenish_resume_budget(run_dir: Path, run: Mapping[str, Any], work_item_id: str,
+                                   current_intent: Mapping[str, Any] | None = None) -> bool:
     events_path = _run_intent_events_path(run)
     if events_path is None:
         return False
-    current = _intent_events_count(events_path)
+    binding = (run.get("approval_evidence") or {}).get("session_intent")
+    if binding:
+        if current_intent is None or not isinstance(current_intent.get("events"), list):
+            return False
+        current = len(current_intent["events"])
+    else:
+        current = _intent_events_count(events_path)  # Legacy standalone runs have no session binding.
     if current <= _last_intent_watermark(run_dir, run, work_item_id):
         return False
     _append_event(
@@ -931,7 +897,11 @@ def _io_trace_candidate_for_item(
     source: Mapping[str, str] | None,
     io_trace_rows: list[dict[str, Any]],
 ) -> dict[str, Any] | None:
-    if not io_trace_rows:
+    publication = run.get("completion_publication")
+    if (isinstance(publication, Mapping) and publication.get("status") == "prepared"
+            and (publication.get("receipt") or {}).get("work_item_id") == item.get("id")):
+        return None
+    if run.get("completion_origin_gap") or not io_trace_rows:
         return None
     work_item_id = str(item.get("id") or "current")
     focus_layer = str(item.get("focus_layer") or "macro")
@@ -993,10 +963,11 @@ def _advance_approved_run_locked(
     if (root / OFF_FILE).exists():
         return _noop_payload()
     conduct_plan_path = root / CONDUCT_PLAN_FILE
-    if not approved_run_path.is_file() or (not tasks_path.is_file() and not conduct_plan_path.is_file()):
+    if not _run_state_available(root):
         return _noop_payload()
 
     run = _read_json_object(approved_run_path)
+    run["approval_generation"] = SESSION_MATERIAL.approval_generation(run)
     if not _approved_run_allows_continue(run):
         return _noop_payload()
     approval = run.get("approval_evidence")
@@ -1013,12 +984,11 @@ def _advance_approved_run_locked(
         })
         return _noop_payload()
     io_trace_rows = _io_trace_rows_for_run(run, source)
-    # Platform-neutral rendering context for the continuation signal.
     signal_base = str(root.parent)
     signal_home = str((source or {}).get("HOME") or Path.home())
     project_cwd = _project_cwd_from_env(source or {})
 
-    items = read_work_items(tasks_path) if tasks_path.is_file() else []
+    items = read_work_items(tasks_path) if storage.exists(tasks_path) else []
     current_intent = _current_intent_for_source(source, project_cwd, run_platform, hook_input=hook_input)
     starvation_event = semantic_delta_starvation_event(current_intent)
     if starvation_event is not None:
@@ -1039,13 +1009,20 @@ def _advance_approved_run_locked(
         if parked_event is not None:
             _append_event(root, parked_event)
             return _noop_payload()
+    if recovery := reapproval_payload(root, run, source or {}):
+        return recovery
     parked_event = stale_continuation_event(run, items, current_intent)
     if parked_event is not None:
         _append_event(root, parked_event)
         return _noop_payload()
-    items, applied_decision = _apply_pending_decision(root, items)
-    if applied_decision is not None and applied_decision.get("decision") == "continue_next":
-        materialize_met_criteria_from_continue_next(run, applied_decision, source)
+    run.update(bind_origin(root, run, items, source or {}))
+    items, applied_decision = _apply_pending_decision(root, items, run, source)
+    store = storage.active(root)
+    if store is not None:
+        try:
+            run["completion_publication"] = store.read("completion-publication.json")
+        except FileNotFoundError:
+            pass
     if applied_decision is not None and applied_decision["decision"] == "ask_user_meta":
         return {
             "continue": True,
@@ -1074,7 +1051,7 @@ def _advance_approved_run_locked(
             if _work_item_within_run_surfaces(run, running_item):
                 governance_candidate = _io_trace_candidate_for_item(run, running_item, source, io_trace_rows)
                 if _missing_decision_resume_count(root, running_item["id"]) >= 1:
-                    _maybe_replenish_resume_budget(root, run, running_item["id"])
+                    _maybe_replenish_resume_budget(root, run, running_item["id"], current_intent)
                     resume_limit = _iotrace_resume_limit(source)
                     if io_trace_rows and _iotrace_resumes_since_last_replenish(root, running_item["id"]) < resume_limit:
                         _append_iotrace_resume_event(root, run, running_item, governance_candidate)
@@ -1192,6 +1169,7 @@ def _advance_approved_run_locked(
 
 def advance_approved_run(
     run_dir: str | Path, env: Mapping[str, str] | None = None, *, hook_input: Mapping[str, Any] | None = None,
+    permission_denied_noop: bool = False,
 ) -> dict[str, Any]:
     root = Path(run_dir)
     approved_run_path = root / APPROVED_RUN_FILE
@@ -1199,10 +1177,45 @@ def advance_approved_run(
     conduct_plan_path = root / CONDUCT_PLAN_FILE
     if (root / OFF_FILE).exists():
         return _noop_payload()
-    if not approved_run_path.is_file() or (not tasks_path.is_file() and not conduct_plan_path.is_file()):
+    if not _run_state_available(root):
         return _noop_payload()
-    with _run_dir_lock(root):
-        return _advance_approved_run_locked(root, env, hook_input=hook_input)
+    source = os.environ if env is None else env
+    run = _read_json_object(approved_run_path)
+    if not _approved_run_allows_continue(run):
+        return _noop_payload()
+    if not (root / storage.AUTHORITY_FILE).exists():
+        try:
+            storage.bound_authority(run)
+        except ValueError as exc:
+            # Invalid legacy binding has no authority to migrate. Preserve an
+            # audit-only diagnostic without changing approval/tasks/Core state.
+            with (root / EVENTS_FILE).open("a", encoding="utf-8") as out:
+                out.write(json.dumps({"event": "stale_continuation_parked", "reason": str(exc),
+                    "authority": "unmigrated-legacy-diagnostic"}) + "\n")
+            return _noop_payload()
+    try:
+        with storage.accessible_transaction(root, source, permission_denied_noop=permission_denied_noop) as store:
+            return _noop_payload() if store is None else _advance_approved_run_locked(root, env, hook_input=hook_input)
+    except AutopilotStateError as exc:
+        # First roll back every Core/task mutation. Rejection is a separate
+        # durable audit transaction and cannot accidentally commit partial proof.
+        if (root / DECISION_FILE).is_file():
+            try:
+                raw = (root / DECISION_FILE).read_bytes()
+                try:
+                    decision = json.loads(raw)
+                    if not isinstance(decision, dict):
+                        raise ValueError("decision must be an object")
+                    raw_digest = None
+                except ValueError:
+                    raw_digest = "raw:" + hashlib.sha256(raw).hexdigest()
+                    decision = {"invalid_json": raw.decode("utf-8", errors="replace"), "raw_digest": raw_digest}
+                with storage.transaction(root, source) as store:
+                    store.inbox_bytes[DECISION_FILE] = raw
+                    _quarantine_rejected_decision(root, decision, str(exc))
+            except (OSError, ValueError):
+                pass
+        raise
 
 
 def _bootstrap_then_advance(
@@ -1215,12 +1228,10 @@ def _bootstrap_then_advance(
         if derived_run_dir:
             return _noop_payload()
         raise
-    with _run_dir_lock(root, permission_denied_noop=derived_run_dir) as acquired:
-        if not acquired:
-            return _noop_payload()
-        if not _run_state_available(root):
-            _bootstrap_from_session_intent_if_approved(root, current_session_context(source, hook_input=hook_input), project_cwd, hook_input=hook_input)
-        return _advance_approved_run_locked(root, source, hook_input=hook_input)
+    if not _run_state_available(root):
+        _bootstrap_from_session_intent_if_approved(root, current_session_context(source, hook_input=hook_input),
+            project_cwd, hook_input=hook_input, permission_denied_noop=derived_run_dir)
+    return advance_approved_run(root, source, hook_input=hook_input, permission_denied_noop=derived_run_dir)
 
 
 def adapter_payload_from_env(
@@ -1229,21 +1240,10 @@ def adapter_payload_from_env(
     source = os.environ if env is None else env
     if env is not None and not source:
         return _noop_payload()
-    prefer_process_cwd = env is None
-    project_cwd = _project_cwd_from_env(source)
-    if run_dir := source.get("GHOST_ALICE_AUTOPILOT_RUN_DIR"):
-        return _bootstrap_then_advance(Path(run_dir).expanduser(), source, project_cwd, hook_input=hook_input)
-    if explicit_cwd := source.get("GHOST_ALICE_AUTOPILOT_CWD"):
-        if not (explicit_project := Path(explicit_cwd)).is_absolute():
-            raise ValueError("GHOST_ALICE_AUTOPILOT_CWD must be an absolute path")
-        return _bootstrap_then_advance(explicit_project / ".autopilot", source, explicit_project, derived_run_dir=True, hook_input=hook_input)
-    cwd_run_dir = (Path.cwd() if prefer_process_cwd else project_cwd) / ".autopilot"
-    pwd = source.get("PWD")
-    if pwd:
-        if prefer_process_cwd and _run_state_available(cwd_run_dir):
-            return advance_approved_run(cwd_run_dir, source, hook_input=hook_input)
-        if (pwd_project := Path(pwd)).is_absolute():
-            return _bootstrap_then_advance(pwd_project / ".autopilot", source, pwd_project, derived_run_dir=True, hook_input=hook_input)
-    if _run_state_available(cwd_run_dir):
-        return advance_approved_run(cwd_run_dir, source, hook_input=hook_input)
-    return _bootstrap_then_advance(cwd_run_dir, source, project_cwd, derived_run_dir=True, hook_input=hook_input)
+    selected = resolve_run_target(env)
+    if not selected["bootstrap"]:
+        return advance_approved_run(selected["run_dir"], source, hook_input=hook_input)
+    return _bootstrap_then_advance(
+        selected["run_dir"], source, selected["project_cwd"],
+        derived_run_dir=selected["derived_run_dir"], hook_input=hook_input,
+    )

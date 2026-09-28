@@ -7,7 +7,6 @@ Dependencies: Python 3.11+ standard library only.
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from typing import Any, Mapping
 
 
@@ -29,22 +28,6 @@ HIGH_IMPACT_CONDUCT_MARKERS = (
     "verification failure",
 )
 SEMANTIC_DELTA_STARVATION_THRESHOLD = 3
-
-
-def _read_jsonl_objects(path: Path) -> list[dict[str, Any]]:
-    if not path.is_file():
-        return []
-    values: list[dict[str, Any]] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        try:
-            value = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(value, dict):
-            values.append(value)
-    return values
 
 
 def _criterion_is_admitted(criterion: Mapping[str, Any]) -> bool:
@@ -142,7 +125,9 @@ def semantic_delta_starvation_event(current_intent: Mapping[str, Any] | None) ->
     events_path_value = current_intent.get("events_path")
     if not events_path_value:
         return None
-    events = _read_jsonl_objects(Path(events_path_value))
+    events = current_intent.get("events")
+    if not isinstance(events, list):
+        return None
     recent = events[-SEMANTIC_DELTA_STARVATION_THRESHOLD:]
     if len(recent) < SEMANTIC_DELTA_STARVATION_THRESHOLD:
         return None

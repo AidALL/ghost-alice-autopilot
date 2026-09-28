@@ -28,6 +28,27 @@ ADAPTER_DIR = REPO_ROOT / "addons" / "autopilot-mode" / "skill" / "adapters"
 sys.path.insert(0, str(ADAPTER_DIR))
 
 import autopilot_state as aps  # noqa: E402
+import autopilot_storage as aps_storage
+
+
+def read_authority(path):
+    path = Path(path)
+    if path.name == "intent-state.json":
+        import autopilot_work_items
+        core = autopilot_work_items._load_core_ledger_module(path, os.environ)
+        return core.read_session_state(root=path.parent.parent.parent,
+            platform=path.parent.parent.name, session_id=path.parent.name)
+    return aps_storage.read(path)
+
+
+def update_criteria(path, criteria):
+    import autopilot_work_items
+    core = autopilot_work_items._load_core_ledger_module(path, os.environ)
+    state = read_authority(path)
+    core.record_turn(root=path.parent.parent.parent, platform=path.parent.parent.name,
+        session_id=path.parent.name, intent_delta={"acceptance_criteria": criteria},
+        expected_input_event_id=state["latest_input_event_id"])
+
 
 
 def _write_current_session_ledger(
@@ -175,6 +196,7 @@ class AutopilotSessionBridgeTest(unittest.TestCase):
                     "current",
                     "--plan-path",
                     plan_path,
+                    "--input-event-id", "event-1",
                     "--approval-evidence-json",
                     '{"decision":"GO","source":"unit-test"}',
                 ],
@@ -185,17 +207,17 @@ class AutopilotSessionBridgeTest(unittest.TestCase):
 
             self.assertEqual(result.returncode, 0, result.stderr)
             summary = json.loads(result.stdout)
-            self.assertEqual(summary["state_path"], str(state_path))
+            self.assertEqual(summary["state_path"], str(state_path.resolve()))
             self.assertEqual(summary["event_count"], 2)
             self.assertEqual(summary["latest_event"]["delta_keys"], ["conduct_feedback", "acceptance_criteria"])
             self.assertEqual(summary["latest_input_event"]["event"], "user-input-observed")
             self.assertEqual(summary["latest_intent_update_event"]["event"], "intent-updated")
-            self.assertTrue((run_dir / "approved-run.json").is_file())
-            self.assertTrue((run_dir / "conduct-plan.json").is_file())
+            self.assertTrue(aps_storage.exists(run_dir / "approved-run.json"))
+            self.assertTrue(aps_storage.exists(run_dir / "conduct-plan.json"))
 
-            approved_run = json.loads((run_dir / "approved-run.json").read_text(encoding="utf-8"))
+            approved_run = read_authority(run_dir / "approved-run.json")
             session_intent = approved_run["approval_evidence"]["session_intent"]
-            self.assertEqual(session_intent["state_path"], str(state_path))
+            self.assertEqual(session_intent["state_path"], str(state_path.resolve()))
             self.assertEqual(session_intent["latest_event"]["event"], "intent-updated")
             self.assertEqual(session_intent["latest_input_event"]["event_id"], "event-1")
             self.assertEqual(session_intent["latest_intent_update_event"]["event_id"], "event-2")
@@ -247,6 +269,7 @@ class AutopilotSessionBridgeTest(unittest.TestCase):
                     "current",
                     "--plan-path",
                     ".tmp/implementation-plans/bridge.md",
+                    "--input-event-id", "event-1",
                     "--approval-evidence-json",
                     '{"decision":"GO","source":"unit-test"}',
                 ],
@@ -258,10 +281,10 @@ class AutopilotSessionBridgeTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             summary = json.loads(result.stdout)
             self.assertEqual(summary["mode"], "session-intent-task")
-            self.assertEqual(summary["state_path"], str(state_path))
-            self.assertTrue((run_dir / "approved-run.json").is_file())
-            self.assertTrue((run_dir / "tasks.jsonl").is_file())
-            self.assertFalse((run_dir / "conduct-plan.json").exists())
+            self.assertEqual(summary["state_path"], str(state_path.resolve()))
+            self.assertTrue(aps_storage.exists(run_dir / "approved-run.json"))
+            self.assertTrue(aps_storage.exists(run_dir / "tasks.jsonl"))
+            self.assertFalse(aps_storage.exists(run_dir / "conduct-plan.json"))
 
             env = os.environ.copy()
             env.pop("CODEX_THREAD_ID", None)
@@ -284,7 +307,7 @@ class AutopilotSessionBridgeTest(unittest.TestCase):
             root = Path(tmp)
             intent_root = root / "session-intent"
             state_path = _write_current_session_ledger(intent_root, repeated_conduct_feedback=False)
-            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state = read_authority(state_path)
             state["decisions"] = [
                 {
                     "id": "run-in-place",
@@ -314,6 +337,7 @@ class AutopilotSessionBridgeTest(unittest.TestCase):
                     "current",
                     "--plan-path",
                     ".tmp/implementation-plans/bridge.md",
+                    "--input-event-id", "event-1",
                     "--approval-evidence-json",
                     '{"decision":"GO","source":"unit-test"}',
                 ],
@@ -337,7 +361,7 @@ class AutopilotSessionBridgeTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(adapter.returncode, 0, adapter.stderr)
-        self.assertEqual(items[0]["source_locator"], f"{state_path}#intent-state")
+        self.assertEqual(items[0]["source_locator"], f"{state_path.resolve()}#intent-state")
         self.assertEqual(
             items[0]["decision_context"],
             ["run-in-place: Apply the approved cleanup in place rather than handing back a plan."],
@@ -383,6 +407,7 @@ class AutopilotSessionBridgeTest(unittest.TestCase):
                     "current",
                     "--plan-path",
                     ".tmp/implementation-plans/bridge.md",
+                    "--input-event-id", "event-1",
                     "--approval-evidence-json",
                     '{"decision":"GO","source":"unit-test"}',
                 ],
@@ -394,8 +419,8 @@ class AutopilotSessionBridgeTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             summary = json.loads(result.stdout)
             self.assertEqual(summary["mode"], "session-intent-task")
-            self.assertEqual(summary["state_path"], str(state_path))
-            approved_run = json.loads((run_dir / "approved-run.json").read_text(encoding="utf-8"))
+            self.assertEqual(summary["state_path"], str(state_path.resolve()))
+            approved_run = read_authority(run_dir / "approved-run.json")
             self.assertEqual(approved_run["approval_evidence"]["session_intent"]["platform"], "claude")
             self.assertEqual(
                 approved_run["approval_evidence"]["session_intent"]["latest_event"]["delta_keys"],
@@ -436,6 +461,7 @@ class AutopilotSessionBridgeTest(unittest.TestCase):
                     "current",
                     "--plan-path",
                     ".tmp/implementation-plans/bridge.md",
+                    "--input-event-id", "event-1",
                     "--approval-evidence-json",
                     '{"decision":"GO","source":"unit-test"}',
                 ],
@@ -446,7 +472,7 @@ class AutopilotSessionBridgeTest(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("schema_version", result.stderr)
-        self.assertFalse((run_dir / "approved-run.json").exists())
+        self.assertFalse(aps_storage.exists(run_dir / "approved-run.json"))
 
     def test_bridge_refuses_to_write_run_state_without_explicit_approval_evidence(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -476,7 +502,7 @@ class AutopilotSessionBridgeTest(unittest.TestCase):
             )
 
             self.assertNotEqual(result.returncode, 0)
-            self.assertFalse((run_dir / "approved-run.json").exists())
+            self.assertFalse(aps_storage.exists(run_dir / "approved-run.json"))
 
     def test_bridge_refuses_negative_or_incomplete_approval_evidence(self):
         bad_evidence = [
@@ -507,7 +533,8 @@ class AutopilotSessionBridgeTest(unittest.TestCase):
                         "current",
                         "--plan-path",
                         ".tmp/implementation-plans/bridge.md",
-                        "--approval-evidence-json",
+                        "--input-event-id", "event-1",
+                    "--approval-evidence-json",
                         evidence,
                     ],
                     capture_output=True,
@@ -516,7 +543,7 @@ class AutopilotSessionBridgeTest(unittest.TestCase):
                 )
 
                 self.assertNotEqual(result.returncode, 0)
-                self.assertFalse((run_dir / "approved-run.json").exists())
+                self.assertFalse(aps_storage.exists(run_dir / "approved-run.json"))
 
 
 if __name__ == "__main__":

@@ -50,6 +50,9 @@ def current_session_context(
     native_session = str(context.get("CODEX_THREAD_ID") or "").strip() if platform == "codex" else ""
     if session_id := payload_session or native_session:
         context["GHOST_ALICE_SESSION_ID"] = session_id
+    if payload_session and platform == "codex":
+        # A trusted firing hook is authoritative through later normalization.
+        context["CODEX_THREAD_ID"] = payload_session
     return context
 
 
@@ -227,14 +230,14 @@ def _run_source_state_paths(run: Mapping[str, Any]) -> set[str]:
     if isinstance(intent_source, Mapping):
         state_path = intent_source.get("state_path")
         if isinstance(state_path, str) and state_path.strip():
-            paths.add(str(Path(state_path).expanduser()))
+            paths.add(str(Path(state_path).expanduser().resolve()))
     approval = run.get("approval_evidence")
     if isinstance(approval, Mapping):
         session_intent = approval.get("session_intent")
         if isinstance(session_intent, Mapping):
             state_path = session_intent.get("state_path")
             if isinstance(state_path, str) and state_path.strip():
-                paths.add(str(Path(state_path).expanduser()))
+                paths.add(str(Path(state_path).expanduser().resolve()))
     return paths
 
 
@@ -264,6 +267,10 @@ def session_binding_mismatch_event(
         reason = "current session binding differs from the approved run; current-session approval is required"
     elif run_platform and current_platform and run_platform != current_platform:
         reason = "current platform binding differs from the approved run; current-session approval is required"
+    elif binding.get("state_path") and current.get("state_path") and (
+        Path(binding["state_path"]).expanduser().resolve() != Path(current["state_path"]).expanduser().resolve()
+    ):
+        reason = "current intent authority root differs from the approved run"
     elif current_intent and (
         any(str(value).strip() != current_session for value in (current.get("session_id"), state.get("session_id")) if value)
         or any(str(value).strip() != current_platform for value in (current.get("platform"), state.get("platform")) if value)
@@ -298,7 +305,7 @@ def stale_continuation_source_intent_event(
     state_path = current_intent.get("state_path")
     if not state_path:
         return None
-    current_state_path = str(Path(state_path).expanduser())
+    current_state_path = str(Path(state_path).expanduser().resolve())
     if current_state_path not in _run_source_state_paths(run):
         return None
     return _stale_continuation_event(

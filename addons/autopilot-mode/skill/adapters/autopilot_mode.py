@@ -13,6 +13,8 @@ from pathlib import Path
 
 sys.dont_write_bytecode = True
 
+from autopilot_messages import completion_recovery_guidance
+
 
 def _load_autopilot_state():
     adapter_dir = Path(__file__).resolve().parent
@@ -68,8 +70,8 @@ def _format_payload_for_hook(payload: dict, hook_input: dict) -> dict:
     return formatted
 
 
-def _env_with_hook_cwd(hook_input: dict) -> dict[str, str]:
-    env = dict(os.environ)
+def _env_with_hook_cwd(hook_input: dict, source: dict[str, str] | None = None) -> dict[str, str]:
+    env = dict(os.environ if source is None else source)
     hook_session_id = _first_text(
         hook_input.get("session_id"),
         hook_input.get("sessionId"),
@@ -106,7 +108,8 @@ def main() -> int:
             "systemMessage": (
                 "[autopilot-mode adapter error]\n"
                 f"error: {exc}\n"
-                "recovery-action: inspect and repair the .autopilot run state before continuing autopilot."
+                "recovery-action: inspect and repair the .autopilot run state within the existing authorized scope. "
+                + completion_recovery_guidance()
             ),
         }
     sys.stdout.write(json.dumps(_format_payload_for_hook(payload, hook_input)) + "\n")

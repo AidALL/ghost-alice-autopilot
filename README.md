@@ -82,6 +82,23 @@ The Stop adapter also accepts a host that declares `GHOST_ALICE_PLATFORM=agent-r
 
 Installation alone does not create `.autopilot/`. To activate an approved run from the current Ghost-ALICE session ledger, use the package bridge `skill/scripts/autopilot_session_bridge.py` or the repository wrapper `scripts/autopilot_session_bridge.py`. The bridge reads `.tmp/session-intent/<platform>/current-session.json`, the pointed `intent-state.json`, and sibling `intent-events.jsonl`, then writes `.autopilot/approved-run.json` plus either a promoted `conduct-plan.json` or a ready `tasks.jsonl` item.
 
+Before admission, inspect the exact session and target without creating state:
+
+```bash
+python3 scripts/autopilot_session_bridge.py \
+  --intent-root <ghost-alice>/.tmp/session-intent \
+  --platform codex --session-id <current-session-id> \
+  --run-dir .autopilot --check
+```
+
+The result reports the latest input event and `automatic_target`, using the same run-directory selection code as the Stop adapter. A custom `--run-dir` does not change the host process's Stop target. `matches_requested_run: false` means the inspected environment selects a different directory; preserve the strict `GHOST_ALICE_AUTOPILOT_RUN_DIR` override rather than searching or redirecting other runs. This diagnostic describes the current process environment and working directory, not a guarantee about a future host hook with different overrides. Admission requires `--input-event-id <checked-event-id>` from the receipt used to approve the work. A changed input rejects that old approval instead of rebinding it.
+
+Admission verifies the ledger schema, platform, session identity and latest input identity before writing. It refuses to replace a run bound to another session or an unbound existing run. Admission shares the adapter's run lock and rechecks its observed input and intent state before writing; a concurrent change requires a fresh inspection. These checks validate recorded provenance and do not infer user approval from similar topics.
+
+Session-bound completion requires a compatible core writer accepting the captured input receipt and criterion definition. The adapter records core completion before setting the task to `completed`; a rejected or unavailable core receipt leaves the task unfinished and preserves the rejected decision. Older approvals without criterion snapshots need current-input reapproval. Legacy standalone runs without a session binding retain their separate task-only contract.
+
+Session-bound runs carry `approval_generation`, a digest of the approved input, session identity, criterion definitions and scope. Capture this value when producing evidence, then preserve it in every decision or conduct-plan candidate and action. Both `decision-candidate` and `conduct-plan-candidate` accept `--approval-generation <captured-value>`. Promotion preserves that value; it does not attach the current generation to old evidence. The adapter rejects missing or stale generations before changing tasks or core criteria. New input, changed criterion definitions or changed scope require reapproval and new evidence. The bridge preserves the superseded run and pending artifacts under `.approval-history/`; late artifacts from the old generation remain invalid. Repeating the bridge for the same input and contract leaves existing progress, pending proof, remaining budget and `OFF` unchanged. This digest is a provenance check, not proof that the model's evidence is true.
+
 The bridge supports `--platform codex` and `--platform claude`. It refuses to write run state unless `--approval-evidence-json` contains an approval decision (`GO`, `approve`, or `approved`) and a non-empty `source`, and it preserves session event metadata in `approved-run.json` approval evidence.
 
 The Stop adapter has a separate automatic current-session path. When the project has no `.autopilot/` run state and the session ledger records admitted, not-yet-met acceptance criteria, the adapter bootstraps run state with `approval_evidence.decision: "AUTO"` (`source: "admitted-unmet-criterion"`). Io-trace presence alone never bootstraps a run; io-trace is routed through the existing `autopilot-observation-signal.v1` receptor in `autopilot_governance_signal.py`, and observation candidates stay diagnostic and are not promoted into adapter-consumable action files.
@@ -90,6 +107,8 @@ The Stop adapter has a separate automatic current-session path. When the project
 /opt/homebrew/bin/python3 scripts/autopilot_session_bridge.py \
   --intent-root <ghost-alice>/.tmp/session-intent \
   --platform codex \
+  --session-id <current-session-id> \
+  --input-event-id <checked-event-id> \
   --run-dir .autopilot \
   --current-work-item-id current \
   --plan-path .tmp/implementation-plans/current.md \

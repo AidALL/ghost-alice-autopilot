@@ -715,6 +715,17 @@ class GovernanceSignalTest(unittest.TestCase):
             proposal["task_template"]["allowed_surface"],
         )
 
+    def test_conduct_plan_keeps_generation_captured_at_creation(self) -> None:
+        module = _load_module(self)
+        candidate = module.conduct_plan_candidate_from_governance(
+            intent_state=_intent_state_with_conduct_feedback(),
+            current_work_item_id="work-1", plan_path="plan.md",
+            approval_generation="sha256:" + "a" * 64,
+        )
+        approved = module.promote_conduct_plan_candidate(
+            candidate, approval_evidence={"decision": "GO", "source": "user"})
+        self.assertEqual(approved["approval_generation"], "sha256:" + "a" * 64)
+
     def test_conduct_plan_candidate_requires_explicit_promotion_before_adapter_import(self) -> None:
         module = _load_module(self)
         candidate = module.conduct_plan_candidate_from_governance(

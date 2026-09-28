@@ -57,16 +57,114 @@ def _locate_core_ledger_source() -> Path | None:
         REPO_ROOT.parent / "ghost-alice" / "session-intent-analyzer" / "scripts" / "session_intent_ledger.py"
     )
     for candidate in candidates:
-        if not candidate.is_file():
+        if not _fixture_is_file(candidate):
             continue
         try:
-            source = candidate.read_text(encoding="utf-8")
+            source = _fixture_read_text(candidate, encoding="utf-8")
         except OSError:
             continue
         # Only a core that exposes the met-writer can drive the import-by-path flip; otherwise the integration test would assert against an older core that gracefully skips (e.g. a CI sibling on an unpublished API).
-        if "def mark_acceptance_criterion_met" in source:
+        if "def mark_acceptance_criterion_met" in source and "expected_criterion" in source:
             return candidate
     return None
+
+
+_AP_AUTHORITY_NAMES = {"approved-run.json", "tasks.jsonl", "events.jsonl", "conduct-plan.candidate.json",
+                       "consistency-decision.applied.json", "conduct-plan.applied.json"}
+_CORE_FIXTURE_MODULE = None
+
+
+_CORE_ROOT_FOR_TESTS = os.environ.get("GHOST_ALICE_CORE_ROOT", "")
+
+
+def _core_env(values):
+    return {"GHOST_ALICE_CORE_ROOT": _CORE_ROOT_FOR_TESTS, **values}
+
+
+def _fixture_is_file(path):
+    path = Path(path)
+    return aps.storage.exists(path) if path.name in _AP_AUTHORITY_NAMES else path.is_file()
+
+
+def _fixture_core():
+    global _CORE_FIXTURE_MODULE
+    if _CORE_FIXTURE_MODULE is None:
+        import importlib.util
+        path = _locate_core_ledger_source()
+        if path is None:
+            raise unittest.SkipTest("candidate Core storage API is required")
+        spec = importlib.util.spec_from_file_location("ap_state_fixture_core", path)
+        _CORE_FIXTURE_MODULE = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(_CORE_FIXTURE_MODULE)
+    return _CORE_FIXTURE_MODULE
+
+
+def _fixture_read_text(path, *args, **kwargs):
+    path = Path(path)
+    if path.name in _AP_AUTHORITY_NAMES:
+        value = aps.storage.read(path)
+        return ("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in value)
+                if path.suffix == ".jsonl" else json.dumps(value, ensure_ascii=False))
+    if path.name == "intent-state.json":
+        core = _fixture_core()
+        if core.storage_database_path(path.parents[2]).exists():
+            with core._read_connection(path.parents[2]) as connection:
+                exists = connection.execute("SELECT 1 FROM sessions WHERE platform=? AND session_id=?",
+                                            (path.parent.parent.name, path.parent.name)).fetchone()
+            if exists:
+                return json.dumps(core.read_session_state(root=path.parents[2], platform=path.parent.parent.name,
+                                                          session_id=path.parent.name), ensure_ascii=False)
+    return path.read_text(*args, **kwargs)
+
+
+def _fixture_write_text(path, text, *args, **kwargs):
+    path = Path(path)
+    if path.name in _AP_AUTHORITY_NAMES:
+        value = ([json.loads(line) for line in text.splitlines() if line.strip()]
+                 if path.suffix == ".jsonl" else json.loads(text))
+        if aps.storage.write(path, value):
+            return len(text)
+    if path.name == "intent-state.json":
+        core = _fixture_core()
+        if core.storage_database_path(path.parents[2]).exists():
+            # Tests deliberately replace persisted payloads (including malformed
+            # ones). Preserve their negative fixtures at the new authority.
+            with core.storage_transaction(path.parents[2]) as connection:
+                changed = connection.execute("UPDATE sessions SET state_json=? WHERE platform=? AND session_id=?",
+                                             (text, path.parent.parent.name, path.parent.name)).rowcount
+            if changed:
+                return len(text)
+    return path.write_text(text, *args, **kwargs)
+
+
+
+def _assert_authority_matches_bytes(test, path, expected, *message):
+    """Preservation includes database state as well as untouched import bytes."""
+    path = Path(path)
+    if path.name not in _AP_AUTHORITY_NAMES:
+        return
+    value = ([json.loads(line) for line in expected.splitlines() if line.strip()]
+             if path.suffix == ".jsonl" else json.loads(expected))
+    actual = aps.storage.read(path)
+    if path.name == "approved-run.json" and "approval_generation" not in value and "approval_generation" in actual:
+        # Legacy import adds a derived identity. Every original field must still
+        # compare exactly, and the new identity must match the original approval.
+        value["approval_generation"] = aps.SESSION_MATERIAL.approval_generation(value)
+    test.assertEqual(actual, value, *message)
+
+
+def _fixture_exists(path):
+    path = Path(path)
+    if path.name in _AP_AUTHORITY_NAMES:
+        return aps.storage.exists(path)
+    return path.exists()
+
+
+def _standalone_authority(run_dir):
+    path = run_dir / "authority.json"
+    if not path.exists():
+        path.write_text(json.dumps({"schema_version": "autopilot-authority.v1", "kind": "standalone",
+                                    "authority_id": "unit-test-standalone"}))
 
 
 def _item(item_id: str, *, status: str = "ready", depends_on: list[str] | None = None) -> dict:
@@ -110,13 +208,11 @@ def _approved_run_record(
 
 def _write_run(run_dir: Path, items: list[dict], *, decision: dict | None = None) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
-    (run_dir / "approved-run.json").write_text(
-        json.dumps(_approved_run_record()),
-        encoding="utf-8",
-    )
+    _standalone_authority(run_dir)
+    _fixture_write_text(run_dir / "approved-run.json", json.dumps(_approved_run_record()), encoding="utf-8")
     aps.write_work_items(run_dir / "tasks.jsonl", items)
     if decision is not None:
-        (run_dir / "consistency-decision.json").write_text(json.dumps(decision), encoding="utf-8")
+        _fixture_write_text(run_dir / "consistency-decision.json", json.dumps(decision), encoding="utf-8")
 
 
 def _write_run_config(
@@ -126,14 +222,12 @@ def _write_run_config(
     status: str = "running",
     remaining_steps: int = 3,
 ) -> None:
-    (run_dir / "approved-run.json").write_text(
-        json.dumps(_approved_run_record(
+    _standalone_authority(run_dir)
+    _fixture_write_text(run_dir / "approved-run.json", json.dumps(_approved_run_record(
             approved=approved,
             status=status,
             remaining_steps=remaining_steps,
-        )),
-        encoding="utf-8",
-    )
+        )), encoding="utf-8")
 
 
 def _write_io_trace(
@@ -155,7 +249,7 @@ def _write_io_trace(
     }
     if op:
         row["op"] = op
-    path.write_text(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+    _fixture_write_text(path, json.dumps(row, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
     return path
 
 
@@ -205,7 +299,7 @@ def _write_session_intent_run_source(
             "corrective_rule": "Bootstrap approved project run-state from current session-intent before returning no-op.",
             "occurrence_count": 2,
         })
-    state_path.write_text(json.dumps(state), encoding="utf-8")
+    _fixture_write_text(state_path, json.dumps(state), encoding="utf-8")
     events = [
         {
             "event": "user-input-observed",
@@ -234,19 +328,13 @@ def _write_session_intent_run_source(
             "tool_stage": "PostToolUse",
             "metadata": {"receptor": "io-trace", "next_action": "continue"},
         })
-    (session_dir / "intent-events.jsonl").write_text(
-        "\n".join(json.dumps(event, sort_keys=True) for event in events) + "\n",
-        encoding="utf-8",
-    )
-    (root / "codex" / "current-session.json").write_text(
-        json.dumps({
+    _fixture_write_text(session_dir / "intent-events.jsonl", "\n".join(json.dumps(event, sort_keys=True) for event in events) + "\n", encoding="utf-8")
+    _fixture_write_text(root / "codex" / "current-session.json", json.dumps({
             "schema_version": "session-intent-current.v1",
             "platform": "codex",
             "session_id": session_id,
             "state_path": str(state_path),
-        }),
-        encoding="utf-8",
-    )
+        }), encoding="utf-8")
     return state_path
 
 
@@ -281,7 +369,7 @@ def _write_current_intent_state(
         "decisions": [],
         "conduct_feedback": [],
     }
-    state_path.write_text(json.dumps(state), encoding="utf-8")
+    _fixture_write_text(state_path, json.dumps(state), encoding="utf-8")
     events = [
         {
             "event": "intent-updated",
@@ -295,19 +383,13 @@ def _write_current_intent_state(
         }
         for index in range(1, event_count + 1)
     ]
-    (session_dir / "intent-events.jsonl").write_text(
-        "\n".join(json.dumps(event, sort_keys=True) for event in events) + "\n",
-        encoding="utf-8",
-    )
-    (root / platform / "current-session.json").write_text(
-        json.dumps({
+    _fixture_write_text(session_dir / "intent-events.jsonl", "\n".join(json.dumps(event, sort_keys=True) for event in events) + "\n", encoding="utf-8")
+    _fixture_write_text(root / platform / "current-session.json", json.dumps({
             "schema_version": "session-intent-current.v1",
             "platform": platform,
             "session_id": session_id,
             "state_path": str(state_path),
-        }),
-        encoding="utf-8",
-    )
+        }), encoding="utf-8")
     return state_path
 
 
@@ -321,8 +403,7 @@ def _write_digest_only_intent_state(
     session_dir = root / platform / session_id
     session_dir.mkdir(parents=True, exist_ok=True)
     state_path = session_dir / "intent-state.json"
-    state_path.write_text(
-        json.dumps({
+    _fixture_write_text(state_path, json.dumps({
             "schema_version": "session-intent-ledger.v1",
             "platform": platform,
             "session_id": session_id,
@@ -334,11 +415,8 @@ def _write_digest_only_intent_state(
             "conduct_feedback": [],
             "intake_status": "observed",
             "last_semantic_delta_status": "not-provided",
-        }),
-        encoding="utf-8",
-    )
-    (session_dir / "intent-events.jsonl").write_text(
-        "\n".join(
+        }), encoding="utf-8")
+    _fixture_write_text(session_dir / "intent-events.jsonl", "\n".join(
             json.dumps({
                 "event": "user-input-observed",
                 "event_id": f"evt-digest-only-{index}",
@@ -350,9 +428,7 @@ def _write_digest_only_intent_state(
                 "intent_delta_status": "not-provided",
             })
             for index in range(1, event_count + 1)
-        ) + "\n",
-        encoding="utf-8",
-    )
+        ) + "\n", encoding="utf-8")
     return state_path
 
 
@@ -364,6 +440,7 @@ def _write_run_with_intent_source(
     session_id: str,
     summary: str,
     platform: str = "codex",
+    completion_receipt: bool = False,
 ) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     events_path = state_path.parent / "intent-events.jsonl"
@@ -381,9 +458,17 @@ def _write_run_with_intent_source(
             "session_id": session_id,
             "state_path": str(state_path),
             "events_path": str(events_path),
+            "acceptance_criteria": json.loads(_fixture_read_text(state_path))["acceptance_criteria"],
         },
     }
-    (run_dir / "approved-run.json").write_text(json.dumps(run), encoding="utf-8")
+    if completion_receipt:
+        core = _locate_core_ledger_source()
+        if core is None:
+            raise unittest.SkipTest("candidate core with input/criterion met preconditions required")
+        scripts_dir = state_path.parent.parent.parent.parent / "session-intent-analyzer/scripts"
+        scripts_dir.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(core, scripts_dir / "session_intent_ledger.py")
+    _fixture_write_text(run_dir / "approved-run.json", json.dumps(run), encoding="utf-8")
     aps.write_work_items(run_dir / "tasks.jsonl", items)
 
 
@@ -394,6 +479,7 @@ def _decision_action(
     evidence: list[str] | None = None,
     completion_check_digest: str | None = None,
     verdict: str | None = None,
+    approval_generation: str | None = None,
 ) -> dict:
     payload = {
         "schema_version": "autopilot-consistency-decision.v1",
@@ -413,6 +499,8 @@ def _decision_action(
         payload["completion_check_digest"] = completion_check_digest
     if verdict is not None:
         payload["verdict"] = verdict
+    if approval_generation is not None:
+        payload["approval_generation"] = approval_generation
     return payload
 
 
@@ -459,14 +547,14 @@ def _conduct_plan(task_id: str = "conduct-scope-drift") -> dict:
 
 class AutopilotStateTest(unittest.TestCase):
     def test_work_item_domain_logic_is_split_from_stop_adapter_facade(self):
-        adapter_source = (ADAPTER_DIR / "autopilot_state.py").read_text(encoding="utf-8")
+        adapter_source = _fixture_read_text(ADAPTER_DIR / "autopilot_state.py", encoding="utf-8")
         work_items_path = ADAPTER_DIR / "autopilot_work_items.py"
         messages_path = ADAPTER_DIR / "autopilot_messages.py"
 
-        self.assertTrue(work_items_path.is_file())
-        self.assertTrue(messages_path.is_file())
-        work_items_source = work_items_path.read_text(encoding="utf-8")
-        messages_source = messages_path.read_text(encoding="utf-8")
+        self.assertTrue(_fixture_is_file(work_items_path))
+        self.assertTrue(_fixture_is_file(messages_path))
+        work_items_source = _fixture_read_text(work_items_path, encoding="utf-8")
+        messages_source = _fixture_read_text(messages_path, encoding="utf-8")
         for function_name in (
             "validate_work_items",
             "read_work_items",
@@ -685,40 +773,21 @@ class AutopilotStateTest(unittest.TestCase):
     def test_adapter_payload_explicit_run_dir_lock_permission_denied_remains_an_error(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp) / "explicit-run"
-            run_dir.mkdir()
-            original_mkdir = aps.Path.mkdir
-
-            def deny_lock_dir(path, *args, **kwargs):
-                if path.name == aps.LOCK_DIR:
-                    raise PermissionError("lock denied")
-                return original_mkdir(path, *args, **kwargs)
-
-            with mock.patch.object(aps.Path, "mkdir", autospec=True, side_effect=deny_lock_dir):
+            _write_run(run_dir, [_item("next")])
+            with mock.patch.object(aps.storage, "transaction") as transaction:
+                transaction.return_value.__enter__.side_effect = PermissionError("lock denied")
                 with self.assertRaisesRegex(PermissionError, "lock denied"):
-                    aps.adapter_payload_from_env({
-                        "GHOST_ALICE_AUTOPILOT_RUN_DIR": str(run_dir),
-                    })
+                    aps.adapter_payload_from_env({"GHOST_ALICE_AUTOPILOT_RUN_DIR": str(run_dir)})
 
     def test_derived_run_dir_lock_permission_denied_is_noop(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp) / ".autopilot"
-            root.mkdir()
-            original_mkdir = aps.Path.mkdir
-
-            def deny_lock_dir(path, *args, **kwargs):
-                if path.name == aps.LOCK_DIR:
-                    raise PermissionError("lock denied")
-                return original_mkdir(path, *args, **kwargs)
-
-            with mock.patch.object(aps.Path, "mkdir", autospec=True, side_effect=deny_lock_dir):
-                payload = aps._bootstrap_then_advance(
-                    root,
-                    {},
-                    Path(tmp),
-                    derived_run_dir=True,
-                )
-
+            _write_run(root, [_item("next")])
+            with mock.patch.object(aps.storage, "transaction") as transaction:
+                transaction.return_value.__enter__.side_effect = PermissionError("lock denied")
+                payload = aps._bootstrap_then_advance(root, {}, Path(tmp), derived_run_dir=True)
         self.assertEqual(payload, {"continue": True, "systemMessage": ""})
+
 
     def test_derived_run_dir_does_not_hide_state_processing_permission_error(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -744,11 +813,12 @@ class AutopilotStateTest(unittest.TestCase):
             hook_input = {"hook_event_name": "Stop", "cwd": "/drifted/project"}
             stdout = io.StringIO()
             test_env = {
+                "GHOST_ALICE_CORE_ROOT": os.environ.get("GHOST_ALICE_CORE_ROOT", ""),
                 "CLAUDE_PROJECT_DIR": str(project),
                 "HOME": str(Path(tmp)),
                 "USERPROFILE": str(Path(tmp)),
             }
-            with mock.patch.dict(os.environ, test_env, clear=True):
+            with mock.patch.dict(os.environ, _core_env(test_env), clear=True):
                 with mock.patch.object(apm.Path, "cwd", side_effect=PermissionError("cwd denied")):
                     with mock.patch.object(apm, "_read_hook_input", return_value=hook_input):
                         with mock.patch.object(apm.sys, "argv", ["autopilot_mode.py"]):
@@ -773,11 +843,11 @@ class AutopilotStateTest(unittest.TestCase):
                 os.chdir(launcher)
                 with mock.patch.dict(
                     os.environ,
-                    {
+                    _core_env({
                         "CLAUDE_PROJECT_DIR": ".",
                         "HOME": str(root),
                         "USERPROFILE": str(root),
-                    },
+                    }),
                     clear=True,
                 ):
                     with mock.patch.object(apm, "_read_hook_input", return_value=hook_input):
@@ -790,7 +860,7 @@ class AutopilotStateTest(unittest.TestCase):
         payload = json.loads(stdout.getvalue())
         self.assertEqual(return_code, 0)
         self.assertIn("work-item: next", payload["reason"])
-        self.assertFalse((launcher / ".autopilot").exists())
+        self.assertFalse(_fixture_exists(launcher / ".autopilot"))
 
     def test_tilde_claude_project_dir_falls_back_to_absolute_hook_cwd(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -808,11 +878,11 @@ class AutopilotStateTest(unittest.TestCase):
                 os.chdir(launcher)
                 with mock.patch.dict(
                     os.environ,
-                    {
+                    _core_env({
                         "CLAUDE_PROJECT_DIR": "~",
                         "HOME": str(home),
                         "USERPROFILE": str(home),
-                    },
+                    }),
                     clear=True,
                 ):
                     with mock.patch.object(apm, "_read_hook_input", return_value=hook_input):
@@ -825,7 +895,7 @@ class AutopilotStateTest(unittest.TestCase):
         payload = json.loads(stdout.getvalue())
         self.assertEqual(return_code, 0)
         self.assertIn("work-item: next", payload["reason"])
-        self.assertFalse((home / ".autopilot").exists())
+        self.assertFalse(_fixture_exists(home / ".autopilot"))
 
     def test_unknown_user_tilde_project_dir_falls_back_to_absolute_hook_cwd(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -841,11 +911,11 @@ class AutopilotStateTest(unittest.TestCase):
                 os.chdir(launcher)
                 with mock.patch.dict(
                     os.environ,
-                    {
+                    _core_env({
                         "CLAUDE_PROJECT_DIR": "~definitely_missing_user",
                         "HOME": str(root),
                         "USERPROFILE": str(root),
-                    },
+                    }),
                     clear=True,
                 ):
                     with mock.patch.object(apm, "_read_hook_input", return_value=hook_input):
@@ -867,7 +937,7 @@ class AutopilotStateTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch.dict(
                 os.environ,
-                {"HOME": tmp, "USERPROFILE": tmp},
+                _core_env({"HOME": tmp, "USERPROFILE": tmp}),
                 clear=True,
             ):
                 with self.assertRaisesRegex(ValueError, "absolute path"):
@@ -895,7 +965,7 @@ class AutopilotStateTest(unittest.TestCase):
                     os.chdir(project)
                     with mock.patch.dict(
                         os.environ,
-                        {"HOME": str(home), "USERPROFILE": str(home)},
+                        _core_env({"HOME": str(home), "USERPROFILE": str(home)}),
                         clear=True,
                     ):
                         payload = aps.adapter_payload_from_env({"PWD": pwd})
@@ -903,28 +973,61 @@ class AutopilotStateTest(unittest.TestCase):
                     os.chdir(previous_cwd)
 
                 self.assertIn("work-item: next", payload["systemMessage"])
-                self.assertFalse((home / ".autopilot").exists())
+                self.assertFalse(_fixture_exists(home / ".autopilot"))
 
-    def test_bootstrap_then_advance_bootstraps_under_run_dir_lock(self):
+    def test_standalone_run_requires_explicit_or_approved_named_authority(self):
+        for changes in ({"run_id": None}, {"run_id": ""}, {"run_id": "   "}, {"approved": False}):
+            with self.subTest(changes=changes), tempfile.TemporaryDirectory() as tmp:
+                run_dir = Path(tmp)
+                _write_run(run_dir, [_item("next")])
+                (run_dir / "authority.json").unlink()
+                run_path = run_dir / "approved-run.json"
+                run = json.loads(run_path.read_text())
+                run.update(changes)
+                run_path.write_text(json.dumps(run))
+                before = {path.name: path.read_bytes() for path in run_dir.iterdir() if path.is_file()}
+                with self.assertRaisesRegex(ValueError, "standalone run requires explicit authority"):
+                    with aps.storage.transaction(run_dir):
+                        self.fail("missing standalone authority must not open a transaction")
+                self.assertEqual(before, {path.name: path.read_bytes() for path in run_dir.iterdir() if path.is_file()})
+
+    def test_named_approved_legacy_run_acquires_its_own_standalone_authority(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "run"
-            root.mkdir()
-            original_bootstrap = aps._bootstrap_from_session_intent_if_approved
-            try:
-                observed = {}
+            run_dir = Path(tmp)
+            _write_run(run_dir, [_item("next")])
+            (run_dir / "authority.json").unlink()
+            sources = {path: path.read_bytes() for path in run_dir.iterdir() if path.is_file()}
+            payload = aps.advance_approved_run(run_dir)
+            authority = json.loads((run_dir / "authority.json").read_text())
+            self.assertEqual(authority["kind"], "standalone")
+            self.assertTrue(authority["authority_id"].startswith("legacy-run:"))
+            self.assertNotIn("ledger_root", authority)
+            self.assertIn("work-item: next", payload["systemMessage"])
+            self.assertEqual(sources, {path: path.read_bytes() for path in sources})
+            self.assertEqual(aps.read_work_items(run_dir / "tasks.jsonl")[0]["status"], "running")
 
-                def fake_bootstrap(run_dir, source, project_cwd, *, hook_input=None):
-                    observed["locked"] = (Path(run_dir) / aps.LOCK_DIR).is_dir()
-                    _write_run(Path(run_dir), [_item("next")])
+    def test_bootstrap_and_advance_writes_use_storage_transactions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project = Path(tmp) / "project"
+            project.mkdir()
+            intent_root = Path(tmp) / "intent"
+            _write_session_intent_run_source(intent_root, decision_approval=True)
+            run_dir = project / ".autopilot"
+            observed = []
+            real_write = aps.storage.RunStore.write
+            def inspected_write(store, name, value):
+                observed.append((name, store.connection.in_transaction, store.run_dir))
+                return real_write(store, name, value)
+            with mock.patch.object(aps.storage.RunStore, "write", inspected_write):
+                payload = aps._bootstrap_then_advance(run_dir,
+                    {"GHOST_ALICE_CORE_ROOT": _CORE_ROOT_FOR_TESTS,
+                     "GHOST_ALICE_SESSION_INTENT_ROOT": str(intent_root),
+                     "GHOST_ALICE_PLATFORM": "codex", "GHOST_ALICE_SESSION_ID": "session-1"}, project)
+            self.assertTrue(observed)
+            self.assertIn("approved-run.json", [name for name, _, _ in observed])
+            self.assertTrue(all(active and path == run_dir for _, active, path in observed))
+            self.assertTrue(payload["systemMessage"])
 
-                aps._bootstrap_from_session_intent_if_approved = fake_bootstrap
-
-                payload = aps._bootstrap_then_advance(root, {}, Path(tmp))
-            finally:
-                aps._bootstrap_from_session_intent_if_approved = original_bootstrap
-
-        self.assertTrue(observed["locked"])
-        self.assertIn("work-item: next", payload["systemMessage"])
 
     def test_adapter_bootstraps_project_run_from_session_intent_with_approval_env(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -946,11 +1049,11 @@ class AutopilotStateTest(unittest.TestCase):
                 "GHOST_ALICE_AUTOPILOT_CURRENT_WORK_ITEM_ID": "current",
             })
             run_dir = project / ".autopilot"
-            approved_run = json.loads((run_dir / "approved-run.json").read_text(encoding="utf-8"))
+            approved_run = json.loads(_fixture_read_text(run_dir / "approved-run.json", encoding="utf-8"))
             items = aps.read_work_items(run_dir / "tasks.jsonl")
             events = [
                 json.loads(line)
-                for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+                for line in _fixture_read_text(run_dir / "events.jsonl", encoding="utf-8").splitlines()
             ]
 
         self.assertTrue(payload["continue"])
@@ -979,7 +1082,7 @@ class AutopilotStateTest(unittest.TestCase):
                 "GHOST_ALICE_AUTOPILOT_PLAN_PATH": ".tmp/implementation-plans/stop-bridge.md",
             })
             run_dir = project / ".autopilot"
-            approved_run = json.loads((run_dir / "approved-run.json").read_text(encoding="utf-8"))
+            approved_run = json.loads(_fixture_read_text(run_dir / "approved-run.json", encoding="utf-8"))
             latest_update = approved_run["approval_evidence"]["session_intent"]["latest_intent_update_event"]
 
         self.assertEqual(latest_update["correlation_id"], "corr-session-1")
@@ -1001,7 +1104,7 @@ class AutopilotStateTest(unittest.TestCase):
                 "GHOST_ALICE_AUTOPILOT_PLAN_PATH": ".tmp/implementation-plans/stop-bridge.md",
             })
             run_dir = project / ".autopilot"
-            approved_run_exists = (run_dir / "approved-run.json").is_file()
+            approved_run_exists = _fixture_is_file(run_dir / "approved-run.json")
             items = aps.read_work_items(run_dir / "tasks.jsonl")
 
         self.assertTrue(payload["continue"])
@@ -1028,7 +1131,7 @@ class AutopilotStateTest(unittest.TestCase):
                 "GHOST_ALICE_AUTOPILOT_PLAN_PATH": ".tmp/implementation-plans/stop-bridge.md",
             })
             run_dir = project / ".autopilot"
-            approved_run = json.loads((run_dir / "approved-run.json").read_text(encoding="utf-8"))
+            approved_run = json.loads(_fixture_read_text(run_dir / "approved-run.json", encoding="utf-8"))
             self.assertEqual(payload, {"continue": True, "systemMessage": ""})
             # A retained sibling approval does not make a different current
             # pointer authoritative. A real hook's matching native ID does.
@@ -1069,7 +1172,7 @@ class AutopilotStateTest(unittest.TestCase):
             run_dir = project / ".autopilot"
 
         self.assertEqual(payload, {"continue": True, "systemMessage": ""})
-        self.assertFalse(run_dir.exists())
+        self.assertFalse(_fixture_exists(run_dir))
 
     def test_adapter_does_not_bootstrap_project_run_without_approval_or_runtime_material(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1090,7 +1193,7 @@ class AutopilotStateTest(unittest.TestCase):
             run_dir = project / ".autopilot"
 
         self.assertEqual(payload, {"continue": True, "systemMessage": ""})
-        self.assertFalse(run_dir.exists())
+        self.assertFalse(_fixture_exists(run_dir))
 
     def test_adapter_bootstraps_when_admitted_unmet_criterion_exists(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1116,8 +1219,8 @@ class AutopilotStateTest(unittest.TestCase):
                 "GHOST_ALICE_AUTOPILOT_PLAN_PATH": ".tmp/implementation-plans/stop-bridge.md",
             })
             approved_run_path = project / ".autopilot" / "approved-run.json"
-            bootstrapped = approved_run_path.exists()
-            approved_run = json.loads(approved_run_path.read_text(encoding="utf-8")) if bootstrapped else {}
+            bootstrapped = _fixture_exists(approved_run_path)
+            approved_run = json.loads(_fixture_read_text(approved_run_path, encoding="utf-8")) if bootstrapped else {}
 
         self.assertTrue(payload["continue"])
         self.assertTrue(bootstrapped)
@@ -1147,7 +1250,7 @@ class AutopilotStateTest(unittest.TestCase):
                 "GHOST_ALICE_AUTOPILOT_PLAN_PATH": ".tmp/implementation-plans/stop-bridge.md",
             })
             approved_run_path = project / ".autopilot" / "approved-run.json"
-            approved_run = json.loads(approved_run_path.read_text(encoding="utf-8")) if approved_run_path.exists() else {}
+            approved_run = json.loads(_fixture_read_text(approved_run_path, encoding="utf-8")) if _fixture_exists(approved_run_path) else {}
 
         self.assertTrue(payload["continue"])
         self.assertEqual(approved_run["approval_evidence"]["source"], "admitted-unmet-criterion")
@@ -1179,10 +1282,10 @@ class AutopilotStateTest(unittest.TestCase):
                 "GHOST_ALICE_AUTOPILOT_CURRENT_WORK_ITEM_ID": "current",
             })
             run_dir = project / ".autopilot"
-            approved_run = json.loads((run_dir / "approved-run.json").read_text(encoding="utf-8"))
+            approved_run = json.loads(_fixture_read_text(run_dir / "approved-run.json", encoding="utf-8"))
             events = [
                 json.loads(line)
-                for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+                for line in _fixture_read_text(run_dir / "events.jsonl", encoding="utf-8").splitlines()
             ]
 
         self.assertTrue(payload["continue"])
@@ -1212,14 +1315,14 @@ class AutopilotStateTest(unittest.TestCase):
                     "admitted": True,
                 }],
             )
-            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state = json.loads(_fixture_read_text(state_path, encoding="utf-8"))
             state["conduct_feedback"] = [{
                 "id": "report-instead-of-execute",
                 "status": "open",
                 "summary": "The agent reported a plan instead of executing the requested work.",
                 "occurrence_count": 1,
             }]
-            state_path.write_text(json.dumps(state), encoding="utf-8")
+            _fixture_write_text(state_path, json.dumps(state), encoding="utf-8")
 
             payload = aps.adapter_payload_from_env({
                 "PWD": str(project),
@@ -1228,7 +1331,7 @@ class AutopilotStateTest(unittest.TestCase):
                 "GHOST_ALICE_AUTOPILOT_PLAN_PATH": ".tmp/implementation-plans/stop-bridge.md",
                 "GHOST_ALICE_AUTOPILOT_CURRENT_WORK_ITEM_ID": "current",
             })
-            approved_run = json.loads((project / ".autopilot" / "approved-run.json").read_text(encoding="utf-8"))
+            approved_run = json.loads(_fixture_read_text(project / ".autopilot" / "approved-run.json", encoding="utf-8"))
 
         self.assertTrue(payload["continue"])
         self.assertIn("work-item: conduct-report-instead-of-execute", payload["systemMessage"])
@@ -1263,12 +1366,12 @@ class AutopilotStateTest(unittest.TestCase):
             })
 
         self.assertEqual(payload, {"continue": True, "systemMessage": ""})
-        self.assertFalse((project / ".autopilot" / "approved-run.json").exists())
+        self.assertFalse(_fixture_exists(project / ".autopilot" / "approved-run.json"))
 
     def test_hook_input_session_id_is_passed_to_adapter_env(self):
         with tempfile.TemporaryDirectory() as tmp:
             project = str(Path(tmp) / "fresh-physical-ai")
-            with mock.patch.dict(os.environ, {}, clear=True):
+            with mock.patch.dict(os.environ, _core_env({}), clear=True):
                 env = apm._env_with_hook_cwd({
                     "session_id": "fresh-physical-ai",
                     "cwd": project,
@@ -1323,11 +1426,11 @@ class AutopilotStateTest(unittest.TestCase):
             project = Path(tmp)
             run_dir = project / ".autopilot"
             _write_run(run_dir, [_item("next")])
-            (run_dir / "OFF").write_text("", encoding="utf-8")
-            before = (run_dir / "tasks.jsonl").read_text(encoding="utf-8")
+            _fixture_write_text(run_dir / "OFF", "", encoding="utf-8")
+            before = _fixture_read_text(run_dir / "tasks.jsonl", encoding="utf-8")
 
             payload = aps.adapter_payload_from_env({"PWD": str(project)})
-            after = (run_dir / "tasks.jsonl").read_text(encoding="utf-8")
+            after = _fixture_read_text(run_dir / "tasks.jsonl", encoding="utf-8")
 
         self.assertEqual(payload, {"continue": True, "systemMessage": ""})
         self.assertEqual(after, before)
@@ -1343,12 +1446,12 @@ class AutopilotStateTest(unittest.TestCase):
             with self.subTest(run_config=run_config), tempfile.TemporaryDirectory() as tmp:
                 run_dir = Path(tmp)
                 _write_run(run_dir, [_item("next")])
-                before = (run_dir / "tasks.jsonl").read_text(encoding="utf-8")
+                before = _fixture_read_text(run_dir / "tasks.jsonl", encoding="utf-8")
                 _write_run_config(run_dir, **run_config)
 
                 payload = aps.advance_approved_run(run_dir)
-                after = (run_dir / "tasks.jsonl").read_text(encoding="utf-8")
-                events_exists = (run_dir / "events.jsonl").exists()
+                after = _fixture_read_text(run_dir / "tasks.jsonl", encoding="utf-8")
+                events_exists = _fixture_exists(run_dir / "events.jsonl")
 
             self.assertEqual(payload, {"continue": True, "systemMessage": ""})
             self.assertEqual(after, before)
@@ -1377,14 +1480,14 @@ class AutopilotStateTest(unittest.TestCase):
             with self.subTest(field=field), tempfile.TemporaryDirectory() as tmp:
                 run_dir = Path(tmp)
                 _write_run(run_dir, [_item("next")])
-                before = (run_dir / "tasks.jsonl").read_text(encoding="utf-8")
+                before = _fixture_read_text(run_dir / "tasks.jsonl", encoding="utf-8")
                 record = _approved_run_record()
                 mutate(record)
-                (run_dir / "approved-run.json").write_text(json.dumps(record), encoding="utf-8")
+                _fixture_write_text(run_dir / "approved-run.json", json.dumps(record), encoding="utf-8")
 
                 payload = aps.advance_approved_run(run_dir)
-                after = (run_dir / "tasks.jsonl").read_text(encoding="utf-8")
-                events_exists = (run_dir / "events.jsonl").exists()
+                after = _fixture_read_text(run_dir / "tasks.jsonl", encoding="utf-8")
+                events_exists = _fixture_exists(run_dir / "events.jsonl")
 
             self.assertEqual(payload, {"continue": True, "systemMessage": ""})
             self.assertEqual(after, before)
@@ -1394,16 +1497,16 @@ class AutopilotStateTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp)
             _write_run(run_dir, [_item("next")])
-            before = (run_dir / "tasks.jsonl").read_text(encoding="utf-8")
+            before = _fixture_read_text(run_dir / "tasks.jsonl", encoding="utf-8")
             record = _approved_run_record()
             record["allowed_surfaces"] = ["docs/..."]
-            (run_dir / "approved-run.json").write_text(json.dumps(record), encoding="utf-8")
+            _fixture_write_text(run_dir / "approved-run.json", json.dumps(record), encoding="utf-8")
 
             payload = aps.advance_approved_run(run_dir)
-            after = (run_dir / "tasks.jsonl").read_text(encoding="utf-8")
+            after = _fixture_read_text(run_dir / "tasks.jsonl", encoding="utf-8")
             events = [
                 json.loads(line)
-                for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+                for line in _fixture_read_text(run_dir / "events.jsonl", encoding="utf-8").splitlines()
             ]
 
         self.assertEqual(payload, {"continue": True, "systemMessage": ""})
@@ -1420,7 +1523,7 @@ class AutopilotStateTest(unittest.TestCase):
             items = aps.read_work_items(run_dir / "tasks.jsonl")
             events = [
                 json.loads(line)
-                for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+                for line in _fixture_read_text(run_dir / "events.jsonl", encoding="utf-8").splitlines()
             ]
 
         self.assertTrue(payload["continue"])
@@ -1444,15 +1547,12 @@ class AutopilotStateTest(unittest.TestCase):
                 session_id="ambient-digest-only",
                 event_count=3,
             )
-            (ambient_root / "codex" / "current-session.json").write_text(
-                json.dumps({
+            _fixture_write_text(ambient_root / "codex" / "current-session.json", json.dumps({
                     "schema_version": "session-intent-current.v1",
                     "platform": "codex",
                     "session_id": "ambient-digest-only",
                     "state_path": str(state_path),
-                }),
-                encoding="utf-8",
-            )
+                }), encoding="utf-8")
 
             payload = aps.adapter_payload_from_env({
                 "GHOST_ALICE_AUTOPILOT_RUN_DIR": str(run_dir),
@@ -1463,7 +1563,7 @@ class AutopilotStateTest(unittest.TestCase):
             items = aps.read_work_items(run_dir / "tasks.jsonl")
             events = [
                 json.loads(line)
-                for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+                for line in _fixture_read_text(run_dir / "events.jsonl", encoding="utf-8").splitlines()
             ]
 
         self.assertTrue(payload["continue"])
@@ -1496,17 +1596,17 @@ class AutopilotStateTest(unittest.TestCase):
                 current_goal="Assess whether a spare company computer can host local GitLab.",
                 summary="Answer GitLab local hosting feasibility and operational requirements.",
             )
-            before = (run_dir / "tasks.jsonl").read_text(encoding="utf-8")
+            before = _fixture_read_text(run_dir / "tasks.jsonl", encoding="utf-8")
 
             payload = aps.adapter_payload_from_env({
                 "GHOST_ALICE_AUTOPILOT_RUN_DIR": str(run_dir),
                 "GHOST_ALICE_PLATFORM": "codex",
                 "GHOST_ALICE_SESSION_INTENT_ROOT": str(intent_root),
             })
-            after = (run_dir / "tasks.jsonl").read_text(encoding="utf-8")
+            after = _fixture_read_text(run_dir / "tasks.jsonl", encoding="utf-8")
             events = [
                 json.loads(line)
-                for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+                for line in _fixture_read_text(run_dir / "events.jsonl", encoding="utf-8").splitlines()
             ]
 
         self.assertEqual(payload, {"continue": True, "systemMessage": ""})
@@ -1532,7 +1632,7 @@ class AutopilotStateTest(unittest.TestCase):
                 session_id="old-git-repair",
                 summary="Repair git pull failure caused by a stale upstream branch.",
             )
-            before = (run_dir / "tasks.jsonl").read_text(encoding="utf-8")
+            before = _fixture_read_text(run_dir / "tasks.jsonl", encoding="utf-8")
 
             payload = aps.adapter_payload_from_env({
                 "GHOST_ALICE_AUTOPILOT_RUN_DIR": str(run_dir),
@@ -1540,10 +1640,10 @@ class AutopilotStateTest(unittest.TestCase):
                 "GHOST_ALICE_SESSION_INTENT_ROOT": str(intent_root),
                 "GHOST_ALICE_SESSION_ID": "fresh-natural-chat",
             })
-            after = (run_dir / "tasks.jsonl").read_text(encoding="utf-8")
+            after = _fixture_read_text(run_dir / "tasks.jsonl", encoding="utf-8")
             events = [
                 json.loads(line)
-                for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+                for line in _fixture_read_text(run_dir / "events.jsonl", encoding="utf-8").splitlines()
             ]
 
         self.assertEqual(payload, {"continue": True, "systemMessage": ""})
@@ -1576,7 +1676,7 @@ class AutopilotStateTest(unittest.TestCase):
                 session_id="fresh-natural-chat",
                 event_count=1,
             )
-            before = (run_dir / "tasks.jsonl").read_text(encoding="utf-8")
+            before = _fixture_read_text(run_dir / "tasks.jsonl", encoding="utf-8")
 
             payload = aps.adapter_payload_from_env({
                 "GHOST_ALICE_AUTOPILOT_RUN_DIR": str(run_dir),
@@ -1584,10 +1684,10 @@ class AutopilotStateTest(unittest.TestCase):
                 "GHOST_ALICE_SESSION_INTENT_ROOT": str(intent_root),
                 "GHOST_ALICE_SESSION_ID": "fresh-natural-chat",
             })
-            after = (run_dir / "tasks.jsonl").read_text(encoding="utf-8")
+            after = _fixture_read_text(run_dir / "tasks.jsonl", encoding="utf-8")
             events = [
                 json.loads(line)
-                for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+                for line in _fixture_read_text(run_dir / "events.jsonl", encoding="utf-8").splitlines()
             ]
 
         self.assertEqual(payload, {"continue": True, "systemMessage": ""})
@@ -1615,7 +1715,7 @@ class AutopilotStateTest(unittest.TestCase):
                 session_id="fresh-natural-chat",
                 summary="Repair git pull failure caused by a stale upstream branch.",
             )
-            before = (run_dir / "tasks.jsonl").read_text(encoding="utf-8")
+            before = _fixture_read_text(run_dir / "tasks.jsonl", encoding="utf-8")
 
             payload = aps.adapter_payload_from_env({
                 "GHOST_ALICE_AUTOPILOT_RUN_DIR": str(run_dir),
@@ -1623,10 +1723,10 @@ class AutopilotStateTest(unittest.TestCase):
                 "GHOST_ALICE_SESSION_INTENT_ROOT": str(intent_root),
                 "GHOST_ALICE_SESSION_ID": "fresh-natural-chat",
             })
-            after = (run_dir / "tasks.jsonl").read_text(encoding="utf-8")
+            after = _fixture_read_text(run_dir / "tasks.jsonl", encoding="utf-8")
             events = [
                 json.loads(line)
-                for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+                for line in _fixture_read_text(run_dir / "events.jsonl", encoding="utf-8").splitlines()
             ]
 
         self.assertEqual(payload, {"continue": True, "systemMessage": ""})
@@ -1648,7 +1748,7 @@ class AutopilotStateTest(unittest.TestCase):
                 session_id="fresh-natural-chat",
                 current_goal="Repair git pull failure caused by a stale upstream branch.",
             )
-            state = json.loads(state_path.read_text(encoding="utf-8"))
+            state = json.loads(_fixture_read_text(state_path, encoding="utf-8"))
             state["decisions"] = [
                 {
                     "id": "autopilot-run-approval",
@@ -1656,7 +1756,7 @@ class AutopilotStateTest(unittest.TestCase):
                     "source": "prior approved autopilot run",
                 }
             ]
-            state_path.write_text(json.dumps(state), encoding="utf-8")
+            _fixture_write_text(state_path, json.dumps(state), encoding="utf-8")
             _write_run_with_intent_source(
                 run_dir,
                 [_item("git-pull-repair", status="running")],
@@ -1664,7 +1764,7 @@ class AutopilotStateTest(unittest.TestCase):
                 session_id="fresh-natural-chat",
                 summary="Repair git pull failure caused by a stale upstream branch.",
             )
-            before = (run_dir / "tasks.jsonl").read_text(encoding="utf-8")
+            before = _fixture_read_text(run_dir / "tasks.jsonl", encoding="utf-8")
 
             payload = aps.adapter_payload_from_env({
                 "GHOST_ALICE_AUTOPILOT_RUN_DIR": str(run_dir),
@@ -1672,10 +1772,10 @@ class AutopilotStateTest(unittest.TestCase):
                 "GHOST_ALICE_SESSION_INTENT_ROOT": str(intent_root),
                 "GHOST_ALICE_SESSION_ID": "fresh-natural-chat",
             })
-            after = (run_dir / "tasks.jsonl").read_text(encoding="utf-8")
+            after = _fixture_read_text(run_dir / "tasks.jsonl", encoding="utf-8")
             events = [
                 json.loads(line)
-                for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+                for line in _fixture_read_text(run_dir / "events.jsonl", encoding="utf-8").splitlines()
             ]
 
         self.assertEqual(payload, {"continue": True, "systemMessage": ""})
@@ -1709,7 +1809,7 @@ class AutopilotStateTest(unittest.TestCase):
                 session_id="fresh-natural-chat",
                 event_count=1,
             )
-            before = (run_dir / "tasks.jsonl").read_text(encoding="utf-8")
+            before = _fixture_read_text(run_dir / "tasks.jsonl", encoding="utf-8")
 
             payload = aps.adapter_payload_from_env({
                 "GHOST_ALICE_AUTOPILOT_RUN_DIR": str(run_dir),
@@ -1717,10 +1817,10 @@ class AutopilotStateTest(unittest.TestCase):
                 "GHOST_ALICE_SESSION_INTENT_ROOT": str(intent_root),
                 "GHOST_ALICE_SESSION_ID": "fresh-natural-chat",
             })
-            after = (run_dir / "tasks.jsonl").read_text(encoding="utf-8")
+            after = _fixture_read_text(run_dir / "tasks.jsonl", encoding="utf-8")
             events = [
                 json.loads(line)
-                for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+                for line in _fixture_read_text(run_dir / "events.jsonl", encoding="utf-8").splitlines()
             ]
 
         self.assertEqual(payload, {"continue": True, "systemMessage": ""})
@@ -1755,7 +1855,7 @@ class AutopilotStateTest(unittest.TestCase):
                 current_goal="Answer whether autopilot caused unnecessary side effects after the git pull repair.",
                 summary="Assess whether the previous autopilot runtime handling over-executed beyond the git pull repair.",
             )
-            before = (run_dir / "tasks.jsonl").read_text(encoding="utf-8")
+            before = _fixture_read_text(run_dir / "tasks.jsonl", encoding="utf-8")
 
             payload = aps.adapter_payload_from_env({
                 "GHOST_ALICE_AUTOPILOT_RUN_DIR": str(run_dir),
@@ -1763,10 +1863,10 @@ class AutopilotStateTest(unittest.TestCase):
                 "GHOST_ALICE_SESSION_INTENT_ROOT": str(intent_root),
                 "GHOST_ALICE_SESSION_ID": "codex-session",
             })
-            after = (run_dir / "tasks.jsonl").read_text(encoding="utf-8")
+            after = _fixture_read_text(run_dir / "tasks.jsonl", encoding="utf-8")
             events = [
                 json.loads(line)
-                for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+                for line in _fixture_read_text(run_dir / "events.jsonl", encoding="utf-8").splitlines()
             ]
 
         self.assertEqual(payload, {"continue": True, "systemMessage": ""})
@@ -1800,7 +1900,7 @@ class AutopilotStateTest(unittest.TestCase):
                 current_goal="Draft a polite vendor email about a delayed delivery.",
                 summary="Write a non-technical vendor reply about delivery delay.",
             )
-            current_state = json.loads(current_state_path.read_text(encoding="utf-8"))
+            current_state = json.loads(_fixture_read_text(current_state_path, encoding="utf-8"))
             current_state["decisions"] = [
                 {
                     "id": "autopilot-run-approval",
@@ -1808,8 +1908,8 @@ class AutopilotStateTest(unittest.TestCase):
                     "source": "prior approved autopilot run",
                 }
             ]
-            current_state_path.write_text(json.dumps(current_state), encoding="utf-8")
-            before = (run_dir / "tasks.jsonl").read_text(encoding="utf-8")
+            _fixture_write_text(current_state_path, json.dumps(current_state), encoding="utf-8")
+            before = _fixture_read_text(run_dir / "tasks.jsonl", encoding="utf-8")
 
             payload = aps.adapter_payload_from_env({
                 "GHOST_ALICE_AUTOPILOT_RUN_DIR": str(run_dir),
@@ -1817,10 +1917,10 @@ class AutopilotStateTest(unittest.TestCase):
                 "GHOST_ALICE_SESSION_INTENT_ROOT": str(intent_root),
                 "GHOST_ALICE_SESSION_ID": "codex-session",
             })
-            after = (run_dir / "tasks.jsonl").read_text(encoding="utf-8")
+            after = _fixture_read_text(run_dir / "tasks.jsonl", encoding="utf-8")
             events = [
                 json.loads(line)
-                for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+                for line in _fixture_read_text(run_dir / "events.jsonl", encoding="utf-8").splitlines()
             ]
 
         self.assertEqual(payload, {"continue": True, "systemMessage": ""})
@@ -1855,7 +1955,7 @@ class AutopilotStateTest(unittest.TestCase):
                 current_goal="Draft a polite vendor email about a delayed delivery.",
                 summary="Write a non-technical vendor reply about delivery delay.",
             )
-            before = (run_dir / "tasks.jsonl").read_text(encoding="utf-8")
+            before = _fixture_read_text(run_dir / "tasks.jsonl", encoding="utf-8")
 
             payload = aps.adapter_payload_from_env({
                 "GHOST_ALICE_AUTOPILOT_RUN_DIR": str(run_dir),
@@ -1863,10 +1963,10 @@ class AutopilotStateTest(unittest.TestCase):
                 "GHOST_ALICE_SESSION_INTENT_ROOT": str(intent_root),
                 "GHOST_ALICE_SESSION_ID": "codex-session",
             })
-            after = (run_dir / "tasks.jsonl").read_text(encoding="utf-8")
+            after = _fixture_read_text(run_dir / "tasks.jsonl", encoding="utf-8")
             events = [
                 json.loads(line)
-                for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+                for line in _fixture_read_text(run_dir / "events.jsonl", encoding="utf-8").splitlines()
             ]
 
         self.assertEqual(payload, {"continue": True, "systemMessage": ""})
@@ -1926,14 +2026,14 @@ class AutopilotStateTest(unittest.TestCase):
                 _write_run_with_intent_source(run_dir, [_item("a", status=status)], state_path=old_state, session_id="approved-session", summary=goal)
                 if pending == "completion":
                     decision = _decision_action("a", "continue_next", evidence=VALID_COMPLETION_EVIDENCE, completion_check_digest=VALID_COMPLETION_DIGEST, verdict="pass")
-                    (run_dir / "consistency-decision.json").write_text(json.dumps(decision), encoding="utf-8")
+                    _fixture_write_text(run_dir / "consistency-decision.json", json.dumps(decision), encoding="utf-8")
                 if pending == "conduct-plan":
-                    record = json.loads((run_dir / "approved-run.json").read_text())
+                    record = json.loads(_fixture_read_text(run_dir / "approved-run.json"))
                     record["allowed_surfaces"].append("skill-evolution/...")
-                    (run_dir / "approved-run.json").write_text(json.dumps(record), encoding="utf-8")
-                    (run_dir / "conduct-plan.json").write_text(json.dumps(_conduct_plan()), encoding="utf-8")
+                    _fixture_write_text(run_dir / "approved-run.json", json.dumps(record), encoding="utf-8")
+                    _fixture_write_text(run_dir / "conduct-plan.json", json.dumps(_conduct_plan()), encoding="utf-8")
                 _write_current_intent_state(intent_root, session_id="foreign-session", current_goal=goal)
-                before = {p.name: p.read_bytes() for p in run_dir.iterdir() if p.is_file()}
+                before = {p.name: p.read_bytes() for p in run_dir.iterdir() if _fixture_is_file(p)}
 
                 payload = aps.adapter_payload_from_env({
                     "GHOST_ALICE_AUTOPILOT_RUN_DIR": str(run_dir),
@@ -1944,11 +2044,12 @@ class AutopilotStateTest(unittest.TestCase):
 
                 self.assertEqual(payload, {"continue": True, "systemMessage": ""})
                 for name, data in before.items():
-                    self.assertTrue((run_dir / name).is_file(), name)
+                    self.assertTrue(_fixture_is_file(run_dir / name), name)
                     self.assertEqual((run_dir / name).read_bytes(), data)
-                self.assertFalse((run_dir / "consistency-decision.applied.json").exists())
-                self.assertFalse((run_dir / "conduct-plan.applied.json").exists())
-                event = json.loads((run_dir / "events.jsonl").read_text().splitlines()[-1])
+                    _assert_authority_matches_bytes(self, run_dir / name, data)
+                self.assertFalse(_fixture_exists(run_dir / "consistency-decision.applied.json"))
+                self.assertFalse(_fixture_exists(run_dir / "conduct-plan.applied.json"))
+                event = json.loads(_fixture_read_text(run_dir / "events.jsonl").splitlines()[-1])
                 self.assertEqual(event["event"], "stale_continuation_parked")
                 self.assertIn("binding", event["reason"])
 
@@ -1971,6 +2072,7 @@ class AutopilotStateTest(unittest.TestCase):
 
             self.assertEqual(payload, {"continue": True, "systemMessage": ""})
             self.assertEqual((run_dir / "tasks.jsonl").read_bytes(), before)
+            _assert_authority_matches_bytes(self, run_dir / "tasks.jsonl", before)
 
     def test_missing_or_changed_current_intent_precedes_receipt_and_plan_writes(self):
         goal = "Research physical AI regulation status and future outlook."
@@ -1984,17 +2086,17 @@ class AutopilotStateTest(unittest.TestCase):
                     _write_run_with_intent_source(run_dir, [_item("a", status="running")], state_path=state, session_id="approved-session", summary=goal)
                     if pending == "completion":
                         decision = _decision_action("a", "continue_next", evidence=VALID_COMPLETION_EVIDENCE, completion_check_digest=VALID_COMPLETION_DIGEST, verdict="pass")
-                        (run_dir / "consistency-decision.json").write_text(json.dumps(decision), encoding="utf-8")
+                        _fixture_write_text(run_dir / "consistency-decision.json", json.dumps(decision), encoding="utf-8")
                     else:
-                        record = json.loads((run_dir / "approved-run.json").read_text())
+                        record = json.loads(_fixture_read_text(run_dir / "approved-run.json"))
                         record["allowed_surfaces"].append("skill-evolution/...")
-                        (run_dir / "approved-run.json").write_text(json.dumps(record), encoding="utf-8")
-                        (run_dir / "conduct-plan.json").write_text(json.dumps(_conduct_plan()), encoding="utf-8")
+                        _fixture_write_text(run_dir / "approved-run.json", json.dumps(record), encoding="utf-8")
+                        _fixture_write_text(run_dir / "conduct-plan.json", json.dumps(_conduct_plan()), encoding="utf-8")
                     if context == "missing":
                         state.unlink()
                     else:
                         _write_current_intent_state(intent_root, session_id="approved-session", current_goal="Draft a polite vendor email about a delayed delivery.")
-                    before = {p.name: p.read_bytes() for p in run_dir.iterdir() if p.is_file()}
+                    before = {p.name: p.read_bytes() for p in run_dir.iterdir() if _fixture_is_file(p)}
 
                     payload = aps.adapter_payload_from_env({
                         "GHOST_ALICE_AUTOPILOT_RUN_DIR": str(run_dir),
@@ -2005,10 +2107,11 @@ class AutopilotStateTest(unittest.TestCase):
 
                     self.assertEqual(payload, {"continue": True, "systemMessage": ""})
                     for name, data in before.items():
-                        self.assertTrue((run_dir / name).is_file(), name)
+                        self.assertTrue(_fixture_is_file(run_dir / name), name)
                         self.assertEqual((run_dir / name).read_bytes(), data)
-                    self.assertFalse((run_dir / "consistency-decision.applied.json").exists())
-                    self.assertFalse((run_dir / "conduct-plan.applied.json").exists())
+                        _assert_authority_matches_bytes(self, run_dir / name, data)
+                    self.assertFalse(_fixture_exists(run_dir / "consistency-decision.applied.json"))
+                    self.assertFalse(_fixture_exists(run_dir / "conduct-plan.applied.json"))
 
     def test_same_bound_session_goal_refinement_keeps_approved_ready_work(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2046,7 +2149,7 @@ class AutopilotStateTest(unittest.TestCase):
             })
 
             self.assertEqual(payload, {"continue": True, "systemMessage": ""})
-            self.assertFalse((project / ".autopilot/approved-run.json").exists())
+            self.assertFalse(_fixture_exists(project / ".autopilot/approved-run.json"))
 
     def test_implicit_native_platform_uses_approved_binding_with_both_pointers(self):
         goal = "Research physical AI regulation status and future outlook."
@@ -2064,9 +2167,9 @@ class AutopilotStateTest(unittest.TestCase):
                         run_dir = root / "run"
                         state = _write_current_intent_state(intent_root, session_id="approved-session", current_goal=goal, platform=platform)
                         _write_current_intent_state(intent_root, session_id="approved-session" if peer_same_session else "other-session", current_goal=goal, platform=peer)
-                        _write_run_with_intent_source(run_dir, [_item("a", status="running"), _item("b", depends_on=["a"])], state_path=state, session_id="approved-session", summary=goal, platform=platform)
-                        receipt = _decision_action("a", "continue_next", evidence=VALID_COMPLETION_EVIDENCE, completion_check_digest=VALID_COMPLETION_DIGEST, verdict="pass")
-                        (run_dir / "consistency-decision.json").write_text(json.dumps(receipt))
+                        _write_run_with_intent_source(run_dir, [_item("a", status="running"), _item("b", depends_on=["a"])], state_path=state, session_id="approved-session", summary=goal, platform=platform, completion_receipt=True)
+                        receipt = _decision_action("a", "continue_next", evidence=[text.replace("AC-TEST", "AC-CURRENT") for text in VALID_COMPLETION_EVIDENCE], completion_check_digest=VALID_COMPLETION_DIGEST, verdict="pass", approval_generation=aps.SESSION_MATERIAL.approval_generation(json.loads(_fixture_read_text(run_dir / "approved-run.json"))))
+                        _fixture_write_text(run_dir / "consistency-decision.json", json.dumps(receipt))
                         env = {"GHOST_ALICE_AUTOPILOT_RUN_DIR": str(run_dir), "GHOST_ALICE_SESSION_INTENT_ROOT": str(intent_root)}
                         if declared is not None:
                             env["GHOST_ALICE_PLATFORM"] = declared
@@ -2077,9 +2180,9 @@ class AutopilotStateTest(unittest.TestCase):
 
                         self.assertIn("work-item: b", payload["systemMessage"])
                         self.assertEqual([item["status"] for item in aps.read_work_items(run_dir / "tasks.jsonl")], ["completed", "running"])
-                        self.assertTrue((run_dir / "consistency-decision.applied.json").is_file())
+                        self.assertTrue(_fixture_is_file(run_dir / "consistency-decision.applied.json"))
                         aps.adapter_payload_from_env(env)
-                        events = [json.loads(line) for line in (run_dir / "events.jsonl").read_text().splitlines()]
+                        events = [json.loads(line) for line in _fixture_read_text(run_dir / "events.jsonl").splitlines()]
                         self.assertEqual(sum(event.get("event") == "consistency_decision_applied" for event in events), 1)
 
     def test_native_session_identity_precedes_pointer_and_stale_generic_binding(self):
@@ -2107,7 +2210,7 @@ class AutopilotStateTest(unittest.TestCase):
                                 hook_input["session_id"] = payload_sid
                             if wrapper:
                                 output = io.StringIO()
-                                with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(apm, "_read_hook_input", return_value=hook_input), mock.patch.object(apm.sys, "argv", ["autopilot_mode.py"]), mock.patch.object(apm.sys, "stdout", output):
+                                with mock.patch.dict(os.environ, _core_env(env), clear=True), mock.patch.object(apm, "_read_hook_input", return_value=hook_input), mock.patch.object(apm.sys, "argv", ["autopilot_mode.py"]), mock.patch.object(apm.sys, "stdout", output):
                                     self.assertEqual(apm.main(), 0)
                                 payload = json.loads(output.getvalue())
                             else:
@@ -2116,13 +2219,13 @@ class AutopilotStateTest(unittest.TestCase):
                             run_dir = project / ".autopilot"
                             if selected_sid == "approved":
                                 self.assertTrue(payload["systemMessage"])
-                                run = json.loads((run_dir / "approved-run.json").read_text())
+                                run = json.loads(_fixture_read_text(run_dir / "approved-run.json"))
                                 self.assertEqual(run["approval_evidence"]["session_intent"]["session_id"], "approved")
                                 self.assertEqual(run["approval_evidence"]["session_intent"]["platform"], platform)
                             else:
                                 self.assertEqual(payload, {"continue": True, "systemMessage": ""})
-                                self.assertFalse((run_dir / "approved-run.json").exists())
-                                self.assertFalse((run_dir / "tasks.jsonl").exists())
+                                self.assertFalse(_fixture_exists(run_dir / "approved-run.json"))
+                                self.assertFalse(_fixture_exists(run_dir / "tasks.jsonl"))
 
     def test_bootstrap_keeps_root_first_platform_discovery_with_both_pointers(self):
         cases = (
@@ -2148,10 +2251,10 @@ class AutopilotStateTest(unittest.TestCase):
                 run_path = project / ".autopilot/approved-run.json"
                 if selected_platform is None:
                     self.assertEqual(payload, {"continue": True, "systemMessage": ""})
-                    self.assertFalse(run_path.exists())
+                    self.assertFalse(_fixture_exists(run_path))
                 else:
                     self.assertTrue(payload["systemMessage"])
-                    binding = json.loads(run_path.read_text())["approval_evidence"]["session_intent"]
+                    binding = json.loads(_fixture_read_text(run_path))["approval_evidence"]["session_intent"]
                     self.assertEqual(binding["platform"], selected_platform)
                     self.assertEqual(binding["session_id"], "approved" if selected_platform == "codex" else "claude-current")
 
@@ -2177,22 +2280,22 @@ class AutopilotStateTest(unittest.TestCase):
                             states = {sid: _write_current_intent_state(intent_root, session_id=sid, current_goal=goal, platform=platform) for sid in ("approved", "foreign")}
                             _write_current_intent_state(intent_root, session_id=pointer, current_goal=goal, platform=platform)
                             items = [_item("a", status="running"), _item("b", depends_on=["a"])] if pending == "completion" else [_item("a")]
-                            _write_run_with_intent_source(run_dir, items, state_path=states["approved"], session_id="approved", summary=goal, platform=platform)
+                            _write_run_with_intent_source(run_dir, items, state_path=states["approved"], session_id="approved", summary=goal, platform=platform, completion_receipt=True)
                             if pending == "completion":
-                                receipt = _decision_action("a", "continue_next", evidence=VALID_COMPLETION_EVIDENCE, completion_check_digest=VALID_COMPLETION_DIGEST, verdict="pass")
-                                (run_dir / "consistency-decision.json").write_text(json.dumps(receipt))
+                                receipt = _decision_action("a", "continue_next", evidence=[text.replace("AC-TEST", "AC-CURRENT") for text in VALID_COMPLETION_EVIDENCE], completion_check_digest=VALID_COMPLETION_DIGEST, verdict="pass", approval_generation=aps.SESSION_MATERIAL.approval_generation(json.loads(_fixture_read_text(run_dir / "approved-run.json"))))
+                                _fixture_write_text(run_dir / "consistency-decision.json", json.dumps(receipt))
                             env = {"GHOST_ALICE_AUTOPILOT_RUN_DIR": str(run_dir), "GHOST_ALICE_SESSION_INTENT_ROOT": str(intent_root), "CODEX_THREAD_ID": native}
                             if generic is not None:
                                 env["GHOST_ALICE_SESSION_ID"] = generic
                             if declared:
                                 env["GHOST_ALICE_PLATFORM"] = declared
-                            before = {p.name: p.read_bytes() for p in run_dir.iterdir() if p.is_file()}
+                            before = {p.name: p.read_bytes() for p in run_dir.iterdir() if _fixture_is_file(p)}
                             hook_input = {"hook_event_name": "Stop"}
                             if payload_sid:
                                 hook_input["session_id"] = payload_sid
                             if wrapper:
                                 output = io.StringIO()
-                                with mock.patch.dict(os.environ, env, clear=True), mock.patch.object(apm, "_read_hook_input", return_value=hook_input), mock.patch.object(apm.sys, "argv", ["autopilot_mode.py"]), mock.patch.object(apm.sys, "stdout", output):
+                                with mock.patch.dict(os.environ, _core_env(env), clear=True), mock.patch.object(apm, "_read_hook_input", return_value=hook_input), mock.patch.object(apm.sys, "argv", ["autopilot_mode.py"]), mock.patch.object(apm.sys, "stdout", output):
                                     self.assertEqual(apm.main(), 0)
                                 payload = json.loads(output.getvalue())
                             else:
@@ -2204,9 +2307,10 @@ class AutopilotStateTest(unittest.TestCase):
                                 self.assertEqual(payload, {"continue": True, "systemMessage": ""})
                                 for name, data in before.items():
                                     self.assertEqual((run_dir / name).read_bytes(), data, name)
-                                self.assertFalse((run_dir / "consistency-decision.applied.json").exists())
+                                    _assert_authority_matches_bytes(self, run_dir / name, data, name)
+                                self.assertFalse(_fixture_exists(run_dir / "consistency-decision.applied.json"))
                             approval_before = json.loads(before["approved-run.json"])["approval_evidence"]
-                            self.assertEqual(json.loads((run_dir / "approved-run.json").read_text())["approval_evidence"], approval_before)
+                            self.assertEqual(json.loads(_fixture_read_text(run_dir / "approved-run.json"))["approval_evidence"], approval_before)
 
     def test_native_binding_discovery_preserves_selected_context_authority(self):
         goal = "Research physical AI regulation status and future outlook."
@@ -2223,25 +2327,26 @@ class AutopilotStateTest(unittest.TestCase):
                     _write_current_intent_state(root / "ghost-alice/.tmp/session-intent", session_id="approved-session", current_goal=goal, platform=platform)
                     _write_run_with_intent_source(run_dir, [_item("a", status="running")], state_path=state, session_id="approved-session", summary=goal, platform=platform)
                     receipt = _decision_action("a", "continue_next", evidence=VALID_COMPLETION_EVIDENCE, completion_check_digest=VALID_COMPLETION_DIGEST, verdict="pass")
-                    (run_dir / "consistency-decision.json").write_text(json.dumps(receipt))
+                    _fixture_write_text(run_dir / "consistency-decision.json", json.dumps(receipt))
                     env = {"PWD": str(project)}
                     if conflict == "foreign-session":
                         _write_current_intent_state(intent_root, session_id="foreign-session", current_goal=goal, platform=platform)
                     elif conflict == "malformed":
-                        state.write_text("{")
+                        _fixture_write_text(state, "{")
                     elif conflict == "missing":
                         state.unlink()
                     else:
                         env["GHOST_ALICE_PLATFORM"] = peer if conflict == "explicit-peer" else "unknown-runtime"
-                    before = {p.name: p.read_bytes() for p in run_dir.iterdir() if p.is_file()}
+                    before = {p.name: p.read_bytes() for p in run_dir.iterdir() if _fixture_is_file(p)}
 
                     payload = aps.adapter_payload_from_env(env)
 
                     self.assertEqual(payload, {"continue": True, "systemMessage": ""})
                     for name, data in before.items():
-                        self.assertTrue((run_dir / name).is_file(), name)
+                        self.assertTrue(_fixture_is_file(run_dir / name), name)
                         self.assertEqual((run_dir / name).read_bytes(), data)
-                    self.assertFalse((run_dir / "consistency-decision.applied.json").exists())
+                        _assert_authority_matches_bytes(self, run_dir / name, data)
+                    self.assertFalse(_fixture_exists(run_dir / "consistency-decision.applied.json"))
 
     def test_malformed_stored_platform_never_authorizes_queued_or_pending_work(self):
         goal = "Research physical AI regulation status and future outlook."
@@ -2258,20 +2363,21 @@ class AutopilotStateTest(unittest.TestCase):
                         _write_run_with_intent_source(run_dir, [_item("a", status="running" if pending == "completion" else "ready")], state_path=state, session_id="approved-session", summary=goal, platform=stored_platform)
                         if pending == "completion":
                             receipt = _decision_action("a", "continue_next", evidence=VALID_COMPLETION_EVIDENCE, completion_check_digest=VALID_COMPLETION_DIGEST, verdict="pass")
-                            (run_dir / "consistency-decision.json").write_text(json.dumps(receipt))
+                            _fixture_write_text(run_dir / "consistency-decision.json", json.dumps(receipt))
                         env = {"PWD": str(root), "GHOST_ALICE_AUTOPILOT_RUN_DIR": str(run_dir)}
                         if explicit_context:
                             env.update({"GHOST_ALICE_PLATFORM": canonical, "GHOST_ALICE_SESSION_ID": "approved-session", "GHOST_ALICE_SESSION_INTENT_ROOT": str(intent_root)})
-                        before = {p.name: p.read_bytes() for p in run_dir.iterdir() if p.is_file()}
+                        before = {p.name: p.read_bytes() for p in run_dir.iterdir() if _fixture_is_file(p)}
 
                         payload = aps.adapter_payload_from_env(env)
 
                         self.assertEqual(payload, {"continue": True, "systemMessage": ""})
                         for name, data in before.items():
-                            self.assertTrue((run_dir / name).is_file(), name)
+                            self.assertTrue(_fixture_is_file(run_dir / name), name)
                             self.assertEqual((run_dir / name).read_bytes(), data)
-                        self.assertFalse((run_dir / "consistency-decision.applied.json").exists())
-                        event = json.loads((run_dir / "events.jsonl").read_text().splitlines()[-1])
+                            _assert_authority_matches_bytes(self, run_dir / name, data)
+                        self.assertFalse(_fixture_exists(run_dir / "consistency-decision.applied.json"))
+                        event = json.loads(_fixture_read_text(run_dir / "events.jsonl").splitlines()[-1])
                         self.assertEqual(event["event"], "stale_continuation_parked")
 
     def test_explicit_agent_runtime_receipt_completes_once_and_continues(self):
@@ -2287,19 +2393,19 @@ class AutopilotStateTest(unittest.TestCase):
                 intent_root = root / "session-intent"
                 run_dir = root / "run"
                 state = _write_current_intent_state(intent_root, session_id="approved-session", current_goal=goal, platform=platform)
-                _write_run_with_intent_source(run_dir, [_item("a", status="running"), _item("b", depends_on=["a"])], state_path=state, session_id="approved-session", summary=goal, platform=platform)
-                receipt = _decision_action("a", "continue_next", evidence=VALID_COMPLETION_EVIDENCE, completion_check_digest=VALID_COMPLETION_DIGEST, verdict="pass")
-                (run_dir / "consistency-decision.json").write_text(json.dumps(receipt))
+                _write_run_with_intent_source(run_dir, [_item("a", status="running"), _item("b", depends_on=["a"])], state_path=state, session_id="approved-session", summary=goal, platform=platform, completion_receipt=True)
+                receipt = _decision_action("a", "continue_next", evidence=[text.replace("AC-TEST", "AC-CURRENT") for text in VALID_COMPLETION_EVIDENCE], completion_check_digest=VALID_COMPLETION_DIGEST, verdict="pass", approval_generation=aps.SESSION_MATERIAL.approval_generation(json.loads(_fixture_read_text(run_dir / "approved-run.json"))))
+                _fixture_write_text(run_dir / "consistency-decision.json", json.dumps(receipt))
                 env = {"GHOST_ALICE_AUTOPILOT_RUN_DIR": str(run_dir), "GHOST_ALICE_PLATFORM": declared, "GHOST_ALICE_SESSION_INTENT_ROOT": str(intent_root), "GHOST_ALICE_SESSION_ID": "approved-session"}
 
                 payload = aps.adapter_payload_from_env(env)
 
                 self.assertIn("work-item: b", payload["systemMessage"])
                 self.assertEqual([item["status"] for item in aps.read_work_items(run_dir / "tasks.jsonl")], ["completed", "running"])
-                self.assertFalse((run_dir / "consistency-decision.json").exists())
-                self.assertTrue((run_dir / "consistency-decision.applied.json").is_file())
+                self.assertFalse(aps.storage.pending(run_dir / "consistency-decision.json"))
+                self.assertTrue(_fixture_is_file(run_dir / "consistency-decision.applied.json"))
                 aps.adapter_payload_from_env(env)
-                events = [json.loads(line) for line in (run_dir / "events.jsonl").read_text().splitlines()]
+                events = [json.loads(line) for line in _fixture_read_text(run_dir / "events.jsonl").splitlines()]
                 self.assertEqual(sum(event.get("event") == "consistency_decision_applied" for event in events), 1)
 
     def test_platform_case_normalization_keeps_foreign_and_invalid_receipts_pending(self):
@@ -2314,7 +2420,7 @@ class AutopilotStateTest(unittest.TestCase):
                     state = _write_current_intent_state(intent_root, session_id="approved-session", current_goal=goal, platform=platform)
                     _write_run_with_intent_source(run_dir, [_item("a", status="running"), _item("b", depends_on=["a"])], state_path=state, session_id="approved-session", summary=goal, platform=platform)
                     receipt = _decision_action("a", "continue_next", evidence=VALID_COMPLETION_EVIDENCE, completion_check_digest=VALID_COMPLETION_DIGEST, verdict="pass")
-                    (run_dir / "consistency-decision.json").write_text(json.dumps(receipt))
+                    _fixture_write_text(run_dir / "consistency-decision.json", json.dumps(receipt))
                     declared = f" {platform.title()} "
                     session_id = "approved-session"
                     if conflict == "session":
@@ -2326,19 +2432,20 @@ class AutopilotStateTest(unittest.TestCase):
                     elif conflict == "unknown-platform":
                         declared = " Custom-Runtime "
                     else:
-                        data = json.loads(state.read_text())
+                        data = json.loads(_fixture_read_text(state))
                         data["platform"] = platform.upper()
-                        state.write_text(json.dumps(data))
-                    before = {p.name: p.read_bytes() for p in run_dir.iterdir() if p.is_file()}
+                        _fixture_write_text(state, json.dumps(data))
+                    before = {p.name: p.read_bytes() for p in run_dir.iterdir() if _fixture_is_file(p)}
 
                     payload = aps.adapter_payload_from_env({"GHOST_ALICE_AUTOPILOT_RUN_DIR": str(run_dir), "GHOST_ALICE_PLATFORM": declared, "GHOST_ALICE_SESSION_INTENT_ROOT": str(intent_root), "GHOST_ALICE_SESSION_ID": session_id})
 
                     self.assertEqual(payload, {"continue": True, "systemMessage": ""})
                     for name, data in before.items():
-                        self.assertTrue((run_dir / name).is_file(), name)
+                        self.assertTrue(_fixture_is_file(run_dir / name), name)
                         self.assertEqual((run_dir / name).read_bytes(), data)
-                    self.assertFalse((run_dir / "consistency-decision.applied.json").exists())
-                    event = json.loads((run_dir / "events.jsonl").read_text().splitlines()[-1])
+                        _assert_authority_matches_bytes(self, run_dir / name, data)
+                    self.assertFalse(_fixture_exists(run_dir / "consistency-decision.applied.json"))
+                    event = json.loads(_fixture_read_text(run_dir / "events.jsonl").splitlines()[-1])
                     self.assertEqual(event["event"], "stale_continuation_parked")
 
     def test_agent_runtime_goal_refinement_keeps_approved_work(self):
@@ -2368,7 +2475,7 @@ class AutopilotStateTest(unittest.TestCase):
             payload = aps.adapter_payload_from_env({"PWD": str(project), "GHOST_ALICE_PLATFORM": "agent-runtime", "GHOST_ALICE_SESSION_INTENT_ROOT": str(intent_root), "GHOST_ALICE_SESSION_ID": "same-id"})
 
             self.assertTrue(payload["systemMessage"])
-            run = json.loads((project / ".autopilot/approved-run.json").read_text())
+            run = json.loads(_fixture_read_text(project / ".autopilot/approved-run.json"))
             self.assertEqual(run["approval_evidence"]["session_intent"]["platform"], "agent-runtime")
             self.assertIn("physical AI", run["scope"]["summary"])
 
@@ -2384,7 +2491,7 @@ class AutopilotStateTest(unittest.TestCase):
                 payload = aps.adapter_payload_from_env({"PWD": str(project), "GHOST_ALICE_PLATFORM": platform, "GHOST_ALICE_SESSION_INTENT_ROOT": str(intent_root), "GHOST_ALICE_SESSION_ID": "same-id"})
 
                 self.assertEqual(payload, {"continue": True, "systemMessage": ""})
-                self.assertFalse((project / ".autopilot/approved-run.json").exists())
+                self.assertFalse(_fixture_exists(project / ".autopilot/approved-run.json"))
 
     def test_agent_runtime_invalid_context_preserves_pending_state(self):
         goal = "Research physical AI regulation status and future outlook."
@@ -2399,12 +2506,12 @@ class AutopilotStateTest(unittest.TestCase):
                     env = {"GHOST_ALICE_AUTOPILOT_RUN_DIR": str(run_dir), "GHOST_ALICE_PLATFORM": "agent-runtime", "GHOST_ALICE_SESSION_INTENT_ROOT": str(intent_root), "GHOST_ALICE_SESSION_ID": "approved-session"}
                     if pending == "completion":
                         receipt = _decision_action("a", "continue_next", evidence=VALID_COMPLETION_EVIDENCE, completion_check_digest=VALID_COMPLETION_DIGEST, verdict="pass")
-                        (run_dir / "consistency-decision.json").write_text(json.dumps(receipt))
+                        _fixture_write_text(run_dir / "consistency-decision.json", json.dumps(receipt))
                     else:
-                        record = json.loads((run_dir / "approved-run.json").read_text())
+                        record = json.loads(_fixture_read_text(run_dir / "approved-run.json"))
                         record["allowed_surfaces"].append("skill-evolution/...")
-                        (run_dir / "approved-run.json").write_text(json.dumps(record))
-                        (run_dir / "conduct-plan.json").write_text(json.dumps(_conduct_plan()))
+                        _fixture_write_text(run_dir / "approved-run.json", json.dumps(record))
+                        _fixture_write_text(run_dir / "conduct-plan.json", json.dumps(_conduct_plan()))
                     if context == "missing":
                         state.unlink()
                     elif context == "changed":
@@ -2416,21 +2523,22 @@ class AutopilotStateTest(unittest.TestCase):
                         env["GHOST_ALICE_PLATFORM"] = "codex"
                         _write_current_intent_state(intent_root, session_id="approved-session", current_goal=goal, platform="codex")
                     elif context == "malformed":
-                        state.write_text("{")
+                        _fixture_write_text(state, "{")
                     else:
-                        data = json.loads(state.read_text())
+                        data = json.loads(_fixture_read_text(state))
                         field, value = {"wrong-schema": ("schema_version", "unknown.v1"), "ledger-session-mismatch": ("session_id", "foreign-session"), "ledger-platform-mismatch": ("platform", "codex")}[context]
                         data[field] = value
-                        state.write_text(json.dumps(data))
-                    before = {p.name: p.read_bytes() for p in run_dir.iterdir() if p.is_file()}
+                        _fixture_write_text(state, json.dumps(data))
+                    before = {p.name: p.read_bytes() for p in run_dir.iterdir() if _fixture_is_file(p)}
 
                     payload = aps.adapter_payload_from_env(env)
 
                     self.assertEqual(payload, {"continue": True, "systemMessage": ""})
                     for name, data in before.items():
                         self.assertEqual((run_dir / name).read_bytes(), data, name)
-                    self.assertFalse((run_dir / "consistency-decision.applied.json").exists())
-                    self.assertFalse((run_dir / "conduct-plan.applied.json").exists())
+                        _assert_authority_matches_bytes(self, run_dir / name, data, name)
+                    self.assertFalse(_fixture_exists(run_dir / "consistency-decision.applied.json"))
+                    self.assertFalse(_fixture_exists(run_dir / "conduct-plan.applied.json"))
 
     def test_agent_runtime_requires_explicit_identity_and_absolute_root(self):
         for absent in ("platform", "session", "root", "relative-root"):
@@ -2442,21 +2550,22 @@ class AutopilotStateTest(unittest.TestCase):
                 state = _write_current_intent_state(intent_root, session_id="approved-session", current_goal=goal, platform="agent-runtime")
                 _write_run_with_intent_source(run_dir, [_item("a", status="running")], state_path=state, session_id="approved-session", summary=goal, platform="agent-runtime")
                 receipt = _decision_action("a", "continue_next", evidence=VALID_COMPLETION_EVIDENCE, completion_check_digest=VALID_COMPLETION_DIGEST, verdict="pass")
-                (run_dir / "consistency-decision.json").write_text(json.dumps(receipt))
+                _fixture_write_text(run_dir / "consistency-decision.json", json.dumps(receipt))
                 env = {"GHOST_ALICE_AUTOPILOT_RUN_DIR": str(run_dir), "GHOST_ALICE_PLATFORM": "agent-runtime", "GHOST_ALICE_SESSION_INTENT_ROOT": str(intent_root), "GHOST_ALICE_SESSION_ID": "approved-session"}
                 if absent == "relative-root":
                     env["GHOST_ALICE_SESSION_INTENT_ROOT"] = "session-intent"
                 else:
                     del env[{"platform": "GHOST_ALICE_PLATFORM", "session": "GHOST_ALICE_SESSION_ID", "root": "GHOST_ALICE_SESSION_INTENT_ROOT"}[absent]]
-                before = {p.name: p.read_bytes() for p in run_dir.iterdir() if p.is_file()}
+                before = {p.name: p.read_bytes() for p in run_dir.iterdir() if _fixture_is_file(p)}
 
                 payload = aps.adapter_payload_from_env(env)
 
                 self.assertEqual(payload, {"continue": True, "systemMessage": ""})
                 for name, data in before.items():
-                    self.assertTrue((run_dir / name).is_file(), name)
+                    self.assertTrue(_fixture_is_file(run_dir / name), name)
                     self.assertEqual((run_dir / name).read_bytes(), data, name)
-                self.assertFalse((run_dir / "consistency-decision.applied.json").exists())
+                    _assert_authority_matches_bytes(self, run_dir / name, data, name)
+                self.assertFalse(_fixture_exists(run_dir / "consistency-decision.applied.json"))
 
     def test_invalid_ledger_identity_cannot_bootstrap_run(self):
         for platform in ("codex", "claude", "agent-runtime"):
@@ -2468,9 +2577,9 @@ class AutopilotStateTest(unittest.TestCase):
                         project.mkdir()
                         intent_root = root / "session-intent"
                         state = _write_current_intent_state(intent_root, session_id="same-id", current_goal="Research physical AI regulation status and future outlook.", platform=platform)
-                        data = json.loads(state.read_text())
+                        data = json.loads(_fixture_read_text(state))
                         del data[field]
-                        state.write_text(json.dumps(data))
+                        _fixture_write_text(state, json.dumps(data))
                         env = {"PWD": str(project), "GHOST_ALICE_PLATFORM": platform, "GHOST_ALICE_SESSION_INTENT_ROOT": str(intent_root)}
                         if explicit_session:
                             env["GHOST_ALICE_SESSION_ID"] = "same-id"
@@ -2478,7 +2587,7 @@ class AutopilotStateTest(unittest.TestCase):
                         payload = aps.adapter_payload_from_env(env)
 
                         self.assertEqual(payload, {"continue": True, "systemMessage": ""})
-                        self.assertFalse((project / ".autopilot/approved-run.json").exists())
+                        self.assertFalse(_fixture_exists(project / ".autopilot/approved-run.json"))
 
     def test_invalid_native_pointer_context_preserves_pending_receipt_without_explicit_sid(self):
         for platform in ("codex", "claude"):
@@ -2491,22 +2600,23 @@ class AutopilotStateTest(unittest.TestCase):
                     state = _write_current_intent_state(intent_root, session_id="approved-session", current_goal=goal, platform=platform)
                     _write_run_with_intent_source(run_dir, [_item("a", status="running")], state_path=state, session_id="approved-session", summary=goal, platform=platform)
                     receipt = _decision_action("a", "continue_next", evidence=VALID_COMPLETION_EVIDENCE, completion_check_digest=VALID_COMPLETION_DIGEST, verdict="pass")
-                    (run_dir / "consistency-decision.json").write_text(json.dumps(receipt))
+                    _fixture_write_text(run_dir / "consistency-decision.json", json.dumps(receipt))
                     if conflict == "missing":
                         state.unlink()
                     else:
-                        data = json.loads(state.read_text())
+                        data = json.loads(_fixture_read_text(state))
                         data[conflict] = "foreign-value"
-                        state.write_text(json.dumps(data))
-                    before = {p.name: p.read_bytes() for p in run_dir.iterdir() if p.is_file()}
+                        _fixture_write_text(state, json.dumps(data))
+                    before = {p.name: p.read_bytes() for p in run_dir.iterdir() if _fixture_is_file(p)}
 
                     payload = aps.adapter_payload_from_env({"GHOST_ALICE_AUTOPILOT_RUN_DIR": str(run_dir), "GHOST_ALICE_PLATFORM": platform, "GHOST_ALICE_SESSION_INTENT_ROOT": str(intent_root)})
 
                     self.assertEqual(payload, {"continue": True, "systemMessage": ""})
                     for name, data in before.items():
-                        self.assertTrue((run_dir / name).is_file(), name)
+                        self.assertTrue(_fixture_is_file(run_dir / name), name)
                         self.assertEqual((run_dir / name).read_bytes(), data, name)
-                    self.assertFalse((run_dir / "consistency-decision.applied.json").exists())
+                        _assert_authority_matches_bytes(self, run_dir / name, data, name)
+                    self.assertFalse(_fixture_exists(run_dir / "consistency-decision.applied.json"))
 
     def test_invalid_selected_context_never_falls_back_to_sibling_approval(self):
         for explicit_session in (True, False):
@@ -2523,11 +2633,11 @@ class AutopilotStateTest(unittest.TestCase):
                     if not bootstrap:
                         _write_run_with_intent_source(run_dir, [_item("a", status="running")], state_path=state, session_id="same-id", summary=goal)
                         receipt = _decision_action("a", "continue_next", evidence=VALID_COMPLETION_EVIDENCE, completion_check_digest=VALID_COMPLETION_DIGEST, verdict="pass")
-                        (run_dir / "consistency-decision.json").write_text(json.dumps(receipt))
-                    data = json.loads(state.read_text())
+                        _fixture_write_text(run_dir / "consistency-decision.json", json.dumps(receipt))
+                    data = json.loads(_fixture_read_text(state))
                     data["platform"] = "claude"
-                    state.write_text(json.dumps(data))
-                    before = {p.name: p.read_bytes() for p in run_dir.iterdir() if p.is_file()} if run_dir.exists() else {}
+                    _fixture_write_text(state, json.dumps(data))
+                    before = {p.name: p.read_bytes() for p in run_dir.iterdir() if _fixture_is_file(p)} if _fixture_exists(run_dir) else {}
                     env = {"PWD": str(project), "GHOST_ALICE_PLATFORM": "codex"}
                     if explicit_session:
                         env["GHOST_ALICE_SESSION_ID"] = "same-id"
@@ -2536,11 +2646,12 @@ class AutopilotStateTest(unittest.TestCase):
 
                     self.assertEqual(payload, {"continue": True, "systemMessage": ""})
                     if bootstrap:
-                        self.assertFalse((run_dir / "approved-run.json").exists())
+                        self.assertFalse(_fixture_exists(run_dir / "approved-run.json"))
                     for name, contents in before.items():
-                        self.assertTrue((run_dir / name).is_file(), name)
+                        self.assertTrue(_fixture_is_file(run_dir / name), name)
                         self.assertEqual((run_dir / name).read_bytes(), contents, name)
-                    self.assertFalse((run_dir / "consistency-decision.applied.json").exists())
+                        _assert_authority_matches_bytes(self, run_dir / name, contents, name)
+                    self.assertFalse(_fixture_exists(run_dir / "consistency-decision.applied.json"))
 
     def test_digest_only_current_session_escalates_before_stale_noop(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -2577,7 +2688,7 @@ class AutopilotStateTest(unittest.TestCase):
             })
             events = [
                 json.loads(line)
-                for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+                for line in _fixture_read_text(run_dir / "events.jsonl", encoding="utf-8").splitlines()
             ]
 
         self.assertTrue(payload["continue"])
@@ -2590,23 +2701,20 @@ class AutopilotStateTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp)
             _write_run(run_dir, [_item("current", status="running")])
-            (run_dir / "consistency-decision.candidate.json").write_text(
-                json.dumps({
+            _fixture_write_text(run_dir / "consistency-decision.candidate.json", json.dumps({
                     "schema_version": "autopilot-consistency-decision-candidate.v1",
                     "promotion_state": "candidate",
                     "action_file_allowed": False,
                     "work_item_id": "current",
                     "decision": "reopen_macro",
                     "evidence": ["conduct_feedback:scope-drift"],
-                }),
-                encoding="utf-8",
-            )
+                }), encoding="utf-8")
 
             payload = aps.advance_approved_run(run_dir)
             items = aps.read_work_items(run_dir / "tasks.jsonl")
-            candidate_still_exists = (run_dir / "consistency-decision.candidate.json").is_file()
-            action_exists = (run_dir / "consistency-decision.json").exists()
-            applied_action_exists = (run_dir / "consistency-decision.applied.json").exists()
+            candidate_still_exists = _fixture_is_file(run_dir / "consistency-decision.candidate.json")
+            action_exists = aps.storage.pending(run_dir / "consistency-decision.json")
+            applied_action_exists = _fixture_exists(run_dir / "consistency-decision.applied.json")
 
         self.assertTrue(payload["continue"])
         self.assertIn("pending-decision: missing", payload["systemMessage"])
@@ -2656,12 +2764,12 @@ class AutopilotStateTest(unittest.TestCase):
             with self.assertRaises(aps.AutopilotStateError):
                 aps.advance_approved_run(run_dir)
 
-            action_exists = (run_dir / "consistency-decision.json").exists()
-            rejected_exists = (run_dir / "consistency-decision.rejected.json").exists()
+            action_exists = aps.storage.pending(run_dir / "consistency-decision.json")
+            rejected_exists = _fixture_exists(run_dir / "consistency-decision.rejected.json")
             events_path = run_dir / "events.jsonl"
-            events = events_path.read_text(encoding="utf-8") if events_path.exists() else ""
+            events = _fixture_read_text(events_path, encoding="utf-8") if _fixture_exists(events_path) else ""
 
-        self.assertFalse(action_exists)   # quarantined: moved out of the action slot
+        self.assertFalse(action_exists)   # quarantined: receipt is no longer actionable
         self.assertTrue(rejected_exists)  # preserved as evidence
         self.assertIn("consistency_decision_rejected", events)
 
@@ -2669,14 +2777,14 @@ class AutopilotStateTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp)
             _write_run(run_dir, [_item("current", status="running")])
-            (run_dir / "consistency-decision.json").write_text("{not json", encoding="utf-8")
+            _fixture_write_text(run_dir / "consistency-decision.json", "{not json", encoding="utf-8")
 
             with self.assertRaises(aps.AutopilotStateError):
                 aps.advance_approved_run(run_dir)
 
-            action_exists = (run_dir / "consistency-decision.json").exists()
-            rejected_exists = (run_dir / "consistency-decision.rejected.json").exists()
-            events = (run_dir / "events.jsonl").read_text(encoding="utf-8")
+            action_exists = aps.storage.pending(run_dir / "consistency-decision.json")
+            rejected_exists = _fixture_exists(run_dir / "consistency-decision.rejected.json")
+            events = _fixture_read_text(run_dir / "events.jsonl", encoding="utf-8")
 
         self.assertFalse(action_exists)
         self.assertTrue(rejected_exists)
@@ -2687,44 +2795,42 @@ class AutopilotStateTest(unittest.TestCase):
             run_dir = Path(tmp)
             _write_run(run_dir, [_item("current", status="running")])
             first_rejected = run_dir / "consistency-decision.rejected.json"
-            first_rejected.write_text("prior rejected evidence", encoding="utf-8")
-            (run_dir / "consistency-decision.json").write_text("{not json", encoding="utf-8")
+            _fixture_write_text(first_rejected, "prior rejected evidence", encoding="utf-8")
+            _fixture_write_text(run_dir / "consistency-decision.json", "{not json", encoding="utf-8")
 
             with self.assertRaises(aps.AutopilotStateError):
                 aps.advance_approved_run(run_dir)
 
             rejected_files = sorted(run_dir.glob("consistency-decision.rejected*.json"))
-            prior_content = first_rejected.read_text(encoding="utf-8")
+            prior_content = _fixture_read_text(first_rejected, encoding="utf-8")
             new_rejections = [
                 path
                 for path in rejected_files
                 if path.name != "consistency-decision.rejected.json"
             ]
+            action_pending = aps.storage.pending(run_dir / "consistency-decision.json")
 
         self.assertEqual(prior_content, "prior rejected evidence")
         self.assertTrue(new_rejections)
-        self.assertFalse((run_dir / "consistency-decision.json").exists())
+        self.assertFalse(action_pending)
 
     def test_repeated_missing_decision_escalates_to_user_meta(self):
         with tempfile.TemporaryDirectory() as tmp:
             run_dir = Path(tmp)
             _write_run(run_dir, [_item("current", status="running")])
-            (run_dir / "events.jsonl").write_text(
-                json.dumps({
+            _fixture_write_text(run_dir / "events.jsonl", json.dumps({
                     "schema_version": "autopilot-event.v1",
                     "event": "resume_running_item_without_decision",
                     "run_id": "run-1",
                     "work_item_id": "current",
                 })
-                + "\n",
-                encoding="utf-8",
-            )
+                + "\n", encoding="utf-8")
 
             payload = aps.advance_approved_run(run_dir)
             items = aps.read_work_items(run_dir / "tasks.jsonl")
             events = [
                 json.loads(line)
-                for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+                for line in _fixture_read_text(run_dir / "events.jsonl", encoding="utf-8").splitlines()
             ]
 
         self.assertTrue(payload["continue"])
@@ -2740,16 +2846,13 @@ class AutopilotStateTest(unittest.TestCase):
             run_dir = root / "run"
             _write_run(run_dir, [_item("current", status="running")])
             _write_io_trace(root, "s-run", command="apply_patch current work")
-            (run_dir / "events.jsonl").write_text(
-                json.dumps({
+            _fixture_write_text(run_dir / "events.jsonl", json.dumps({
                     "schema_version": "autopilot-event.v1",
                     "event": "resume_running_item_without_decision",
                     "run_id": "run-1",
                     "work_item_id": "current",
                 })
-                + "\n",
-                encoding="utf-8",
-            )
+                + "\n", encoding="utf-8")
 
             payload = aps.adapter_payload_from_env({
                 "HOME": str(root),
@@ -2759,7 +2862,7 @@ class AutopilotStateTest(unittest.TestCase):
             items = aps.read_work_items(run_dir / "tasks.jsonl")
             events = [
                 json.loads(line)
-                for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+                for line in _fixture_read_text(run_dir / "events.jsonl", encoding="utf-8").splitlines()
             ]
 
         self.assertTrue(payload["continue"])
@@ -2793,16 +2896,13 @@ class AutopilotStateTest(unittest.TestCase):
                 path_value=str(target),
                 op="read",
             )
-            (run_dir / "events.jsonl").write_text(
-                json.dumps({
+            _fixture_write_text(run_dir / "events.jsonl", json.dumps({
                     "schema_version": "autopilot-event.v1",
                     "event": "resume_running_item_without_decision",
                     "run_id": "run-1",
                     "work_item_id": "current",
                 })
-                + "\n",
-                encoding="utf-8",
-            )
+                + "\n", encoding="utf-8")
 
             payload = aps.adapter_payload_from_env({
                 "HOME": str(root),
@@ -2840,10 +2940,7 @@ class AutopilotStateTest(unittest.TestCase):
                     "work_item_id": "current",
                 },
             ]
-            (run_dir / "events.jsonl").write_text(
-                "\n".join(json.dumps(event) for event in seeded) + "\n",
-                encoding="utf-8",
-            )
+            _fixture_write_text(run_dir / "events.jsonl", "\n".join(json.dumps(event) for event in seeded) + "\n", encoding="utf-8")
 
             payload = aps.adapter_payload_from_env({
                 "HOME": str(root),
@@ -2854,7 +2951,7 @@ class AutopilotStateTest(unittest.TestCase):
             items = aps.read_work_items(run_dir / "tasks.jsonl")
             events = [
                 json.loads(line)
-                for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+                for line in _fixture_read_text(run_dir / "events.jsonl", encoding="utf-8").splitlines()
             ]
 
         self.assertTrue(payload["continue"])
@@ -2872,7 +2969,7 @@ class AutopilotStateTest(unittest.TestCase):
             run_dir = root / "run"
             run_dir.mkdir(parents=True, exist_ok=True)
             intent_events = root / "intent-events.jsonl"
-            intent_events.write_text('{"event": "intent-1"}\n', encoding="utf-8")  # watermark = 1
+            _fixture_write_text(intent_events, '{"event": "intent-1"}\n', encoding="utf-8")  # watermark = 1
             run_record = {
                 "schema_version": "autopilot-run.v1",
                 "run_id": "run-1",
@@ -2888,16 +2985,14 @@ class AutopilotStateTest(unittest.TestCase):
                 "stop_conditions": ["budget_exhausted", "user_stop"],
                 "approval_evidence": {"decision": "GO", "source": "unit-test"},
             }
-            (run_dir / "approved-run.json").write_text(json.dumps(run_record), encoding="utf-8")
+            _standalone_authority(run_dir)
+            _fixture_write_text(run_dir / "approved-run.json", json.dumps(run_record), encoding="utf-8")
             aps.write_work_items(run_dir / "tasks.jsonl", [_item("current", status="running")])
             _write_io_trace(root, "s-run", command="apply_patch current work")
-            (run_dir / "events.jsonl").write_text(
-                "\n".join(json.dumps(e) for e in [
+            _fixture_write_text(run_dir / "events.jsonl", "\n".join(json.dumps(e) for e in [
                     {"schema_version": "autopilot-event.v1", "event": "resume_running_item_without_decision", "run_id": "run-1", "work_item_id": "current"},
                     {"schema_version": "autopilot-event.v1", "event": "resume_running_item_from_iotrace", "run_id": "run-1", "work_item_id": "current"},
-                ]) + "\n",
-                encoding="utf-8",
-            )
+                ]) + "\n", encoding="utf-8")
             env = {
                 "HOME": str(root),
                 "GHOST_ALICE_SESSION_ID": "s-run",
@@ -2906,13 +3001,11 @@ class AutopilotStateTest(unittest.TestCase):
             }
 
             # A NEW intent line grows the ledger -> replenish -> continue.
-            intent_events.write_text(
-                '{"event": "intent-1"}\n{"event": "intent-2"}\n', encoding="utf-8"
-            )
+            _fixture_write_text(intent_events, '{"event": "intent-1"}\n{"event": "intent-2"}\n', encoding="utf-8")
             first = aps.adapter_payload_from_env(env)
             events_after_first = [
                 json.loads(line)
-                for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+                for line in _fixture_read_text(run_dir / "events.jsonl", encoding="utf-8").splitlines()
             ]
 
             # No further intent advance -> ceiling holds -> terminates.
@@ -2937,9 +3030,7 @@ class AutopilotStateTest(unittest.TestCase):
             run_dir = root / "run"
             run_dir.mkdir(parents=True, exist_ok=True)
             intent_events = root / "intent-events.jsonl"
-            intent_events.write_text(
-                '{"event": "intent-1"}\n{"event": "intent-2"}\n', encoding="utf-8"
-            )  # count == last replenish watermark (2) -> no new replenish
+            _fixture_write_text(intent_events, '{"event": "intent-1"}\n{"event": "intent-2"}\n', encoding="utf-8")  # count == last replenish watermark (2) -> no new replenish
             run_record = {
                 "schema_version": "autopilot-run.v1",
                 "run_id": "run-1",
@@ -2955,19 +3046,17 @@ class AutopilotStateTest(unittest.TestCase):
                 "stop_conditions": ["budget_exhausted", "user_stop"],
                 "approval_evidence": {"decision": "GO", "source": "unit-test"},
             }
-            (run_dir / "approved-run.json").write_text(json.dumps(run_record), encoding="utf-8")
+            _standalone_authority(run_dir)
+            _fixture_write_text(run_dir / "approved-run.json", json.dumps(run_record), encoding="utf-8")
             aps.write_work_items(run_dir / "tasks.jsonl", [_item("current", status="running")])
             _write_io_trace(root, "s-run", command="apply_patch current work")
-            (run_dir / "events.jsonl").write_text(
-                "\n".join(json.dumps(e) for e in [
+            _fixture_write_text(run_dir / "events.jsonl", "\n".join(json.dumps(e) for e in [
                     {"schema_version": "autopilot-event.v1", "event": "resume_running_item_without_decision", "run_id": "run-1", "work_item_id": "current"},
                     {"schema_version": "autopilot-event.v1", "event": "resume_budget_replenished", "run_id": "run-1", "work_item_id": "current", "intent_events_seen": 1},
                     {"schema_version": "autopilot-event.v1", "event": "resume_running_item_from_iotrace", "run_id": "run-1", "work_item_id": "current"},
                     {"schema_version": "autopilot-event.v1", "event": "resume_budget_replenished", "run_id": "run-1", "work_item_id": "current", "intent_events_seen": 2},
                     {"schema_version": "autopilot-event.v1", "event": "resume_running_item_from_iotrace", "run_id": "run-1", "work_item_id": "current"},
-                ]) + "\n",
-                encoding="utf-8",
-            )
+                ]) + "\n", encoding="utf-8")
 
             payload = aps.adapter_payload_from_env({
                 "HOME": str(root),
@@ -2990,7 +3079,7 @@ class AutopilotStateTest(unittest.TestCase):
             items = aps.read_work_items(run_dir / "tasks.jsonl")
             events = [
                 json.loads(line)
-                for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+                for line in _fixture_read_text(run_dir / "events.jsonl", encoding="utf-8").splitlines()
             ]
 
         self.assertEqual(payload, {"continue": True, "systemMessage": ""})
@@ -3004,16 +3093,16 @@ class AutopilotStateTest(unittest.TestCase):
             _write_run(run_dir, [])
             record = _approved_run_record()
             record["allowed_surfaces"] = ["skill-evolution/..."]
-            (run_dir / "approved-run.json").write_text(json.dumps(record), encoding="utf-8")
-            (run_dir / "conduct-plan.json").write_text(json.dumps(_conduct_plan()), encoding="utf-8")
+            _fixture_write_text(run_dir / "approved-run.json", json.dumps(record), encoding="utf-8")
+            _fixture_write_text(run_dir / "conduct-plan.json", json.dumps(_conduct_plan()), encoding="utf-8")
 
             payload = aps.advance_approved_run(run_dir)
             items = aps.read_work_items(run_dir / "tasks.jsonl")
-            conduct_plan_removed = not (run_dir / "conduct-plan.json").exists()
-            applied_conduct_plan_exists = (run_dir / "conduct-plan.applied.json").is_file()
+            conduct_plan_consumed = not aps.storage.pending(run_dir / "conduct-plan.json")
+            applied_conduct_plan_exists = _fixture_is_file(run_dir / "conduct-plan.applied.json")
             events = [
                 json.loads(line)
-                for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+                for line in _fixture_read_text(run_dir / "events.jsonl", encoding="utf-8").splitlines()
             ]
 
         self.assertTrue(payload["continue"])
@@ -3021,7 +3110,7 @@ class AutopilotStateTest(unittest.TestCase):
         self.assertIn("observer-agent: required", payload["systemMessage"])
         self.assertIn("observer-mode: read_only", payload["systemMessage"])
         self.assertEqual(items[0]["status"], "running")
-        self.assertTrue(conduct_plan_removed)
+        self.assertTrue(conduct_plan_consumed)
         self.assertTrue(applied_conduct_plan_exists)
         self.assertEqual([event["event"] for event in events], ["conduct_plan_imported", "continue_next_item"])
 
@@ -3030,8 +3119,9 @@ class AutopilotStateTest(unittest.TestCase):
             run_dir = Path(tmp)
             record = _approved_run_record()
             record["allowed_surfaces"] = ["skill-evolution/..."]
-            (run_dir / "approved-run.json").write_text(json.dumps(record), encoding="utf-8")
-            (run_dir / "conduct-plan.json").write_text(json.dumps(_conduct_plan()), encoding="utf-8")
+            _standalone_authority(run_dir)
+            _fixture_write_text(run_dir / "approved-run.json", json.dumps(record), encoding="utf-8")
+            _fixture_write_text(run_dir / "conduct-plan.json", json.dumps(_conduct_plan()), encoding="utf-8")
 
             payload = aps.advance_approved_run(run_dir)
             items = aps.read_work_items(run_dir / "tasks.jsonl")
@@ -3058,10 +3148,14 @@ class AutopilotStateTest(unittest.TestCase):
                     payload = aps.advance_approved_run(run_dir)
                     self.assertEqual(payload, {"continue": True, "systemMessage": ""})
                     self.assertEqual((run_dir / "tasks.jsonl").read_bytes(), queue_bytes)
+                    _assert_authority_matches_bytes(self, run_dir / "tasks.jsonl", queue_bytes)
                     self.assertEqual((run_dir / "conduct-plan.json").read_bytes(), plan_bytes)
+                    _assert_authority_matches_bytes(self, run_dir / "conduct-plan.json", plan_bytes)
                     self.assertEqual((run_dir / "conduct-plan.applied.json").read_bytes(), prior_applied)
+                    _assert_authority_matches_bytes(self, run_dir / "conduct-plan.applied.json", prior_applied)
                     self.assertEqual((run_dir / "approved-run.json").read_bytes(), run_bytes)
-                events = [json.loads(line) for line in (run_dir / "events.jsonl").read_text().splitlines()]
+                    _assert_authority_matches_bytes(self, run_dir / "approved-run.json", run_bytes)
+                events = [json.loads(line) for line in _fixture_read_text(run_dir / "events.jsonl").splitlines()]
                 rejected = [e for e in events if e["event"] == "conduct_plan_outside_allowed_surfaces"]
                 self.assertEqual(len(rejected), 2)
                 self.assertEqual(rejected[0]["run_id"], "run-1")
@@ -3076,16 +3170,17 @@ class AutopilotStateTest(unittest.TestCase):
             plan = _conduct_plan("inside")
             plan["proposed_queue_items"][0]["task_template"]["allowed_surface"] = ["_shared/report.md"]
             plan["proposed_queue_items"].extend(_conduct_plan("outside")["proposed_queue_items"])
-            (run_dir / "conduct-plan.json").write_text(json.dumps(plan), encoding="utf-8")
+            _fixture_write_text(run_dir / "conduct-plan.json", json.dumps(plan), encoding="utf-8")
             queue_bytes = (run_dir / "tasks.jsonl").read_bytes()
 
             payload = aps.advance_approved_run(run_dir)
 
             self.assertEqual(payload, {"continue": True, "systemMessage": ""})
             self.assertEqual((run_dir / "tasks.jsonl").read_bytes(), queue_bytes)
-            self.assertTrue((run_dir / "conduct-plan.json").is_file())
-            self.assertFalse((run_dir / "conduct-plan.applied.json").exists())
-            events = [json.loads(line) for line in (run_dir / "events.jsonl").read_text().splitlines()]
+            _assert_authority_matches_bytes(self, run_dir / "tasks.jsonl", queue_bytes)
+            self.assertTrue(aps.storage.pending(run_dir / "conduct-plan.json"))
+            self.assertFalse(_fixture_exists(run_dir / "conduct-plan.applied.json"))
+            events = [json.loads(line) for line in _fixture_read_text(run_dir / "events.jsonl").splitlines()]
             self.assertEqual(events[0]["rejected_work_item_ids"], ["outside"])
 
     def test_outside_conduct_plan_does_not_block_existing_approved_ready_work(self):
@@ -3101,8 +3196,9 @@ class AutopilotStateTest(unittest.TestCase):
             self.assertIn("work-item: existing", payload["systemMessage"])
             self.assertEqual([(item["id"], item["status"]) for item in items], [("existing", "running")])
             self.assertEqual((run_dir / "conduct-plan.json").read_bytes(), plan_bytes)
-            self.assertFalse((run_dir / "conduct-plan.applied.json").exists())
-            events = [json.loads(line) for line in (run_dir / "events.jsonl").read_text().splitlines()]
+            _assert_authority_matches_bytes(self, run_dir / "conduct-plan.json", plan_bytes)
+            self.assertFalse(_fixture_exists(run_dir / "conduct-plan.applied.json"))
+            events = [json.loads(line) for line in _fixture_read_text(run_dir / "events.jsonl").splitlines()]
             self.assertEqual([e["event"] for e in events], ["conduct_plan_outside_allowed_surfaces", "continue_next_item"])
 
     def test_conduct_plan_preflight_preserves_exact_and_subtree_surface_policy(self):
@@ -3112,7 +3208,7 @@ class AutopilotStateTest(unittest.TestCase):
                 _write_run(run_dir, [])
                 record = _approved_run_record()
                 record["allowed_surfaces"] = [allowed]
-                (run_dir / "approved-run.json").write_text(json.dumps(record), encoding="utf-8")
+                _fixture_write_text(run_dir / "approved-run.json", json.dumps(record), encoding="utf-8")
                 plan = _conduct_plan()
                 plan["proposed_queue_items"][0]["task_template"]["allowed_surface"] = [candidate]
                 plan_bytes = json.dumps(plan).encode()
@@ -3123,6 +3219,7 @@ class AutopilotStateTest(unittest.TestCase):
                 self.assertIn("work-item: conduct-scope-drift", payload["systemMessage"])
                 self.assertEqual(len(aps.read_work_items(run_dir / "tasks.jsonl")), 1)
                 self.assertEqual((run_dir / "conduct-plan.applied.json").read_bytes(), plan_bytes)
+                _assert_authority_matches_bytes(self, run_dir / "conduct-plan.applied.json", plan_bytes)
 
     def test_conduct_plan_preflight_does_not_reimport_or_replace_existing_item(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -3135,8 +3232,10 @@ class AutopilotStateTest(unittest.TestCase):
             for _ in range(2):
                 self.assertEqual(aps.advance_approved_run(run_dir), {"continue": True, "systemMessage": ""})
                 self.assertEqual((run_dir / "tasks.jsonl").read_bytes(), queue_bytes)
+                _assert_authority_matches_bytes(self, run_dir / "tasks.jsonl", queue_bytes)
             self.assertEqual((run_dir / "conduct-plan.applied.json").read_bytes(), plan_bytes)
-            events = [json.loads(line) for line in (run_dir / "events.jsonl").read_text().splitlines()]
+            _assert_authority_matches_bytes(self, run_dir / "conduct-plan.applied.json", plan_bytes)
+            events = [json.loads(line) for line in _fixture_read_text(run_dir / "events.jsonl").splitlines()]
             imports = [e for e in events if e["event"] == "conduct_plan_imported"]
             self.assertEqual(len(imports), 1)
             self.assertEqual(imports[0]["imported_work_item_ids"], [])
@@ -3150,7 +3249,7 @@ class AutopilotStateTest(unittest.TestCase):
             items = aps.read_work_items(run_dir / "tasks.jsonl")
             events = [
                 json.loads(line)
-                for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+                for line in _fixture_read_text(run_dir / "events.jsonl", encoding="utf-8").splitlines()
             ]
 
         self.assertTrue(payload["continue"])
@@ -3174,7 +3273,7 @@ class AutopilotStateTest(unittest.TestCase):
             })
             events = [
                 json.loads(line)
-                for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+                for line in _fixture_read_text(run_dir / "events.jsonl", encoding="utf-8").splitlines()
             ]
 
         self.assertTrue(payload["continue"])
@@ -3219,7 +3318,7 @@ class AutopilotStateTest(unittest.TestCase):
 
             events = [
                 json.loads(line)
-                for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+                for line in _fixture_read_text(run_dir / "events.jsonl", encoding="utf-8").splitlines()
             ]
 
         self.assertEqual(errors, [])
@@ -3271,12 +3370,12 @@ class AutopilotStateTest(unittest.TestCase):
 
             payload = aps.advance_approved_run(run_dir)
             items = aps.read_work_items(run_dir / "tasks.jsonl")
-            decision_removed = not (run_dir / "consistency-decision.json").exists()
-            applied_decision_exists = (run_dir / "consistency-decision.applied.json").is_file()
+            decision_consumed = not aps.storage.pending(run_dir / "consistency-decision.json")
+            applied_decision_exists = _fixture_is_file(run_dir / "consistency-decision.applied.json")
 
         self.assertEqual(items[0]["status"], "completed")
         self.assertEqual(items[1]["status"], "running")
-        self.assertTrue(decision_removed)
+        self.assertTrue(decision_consumed)
         self.assertTrue(applied_decision_exists)
         self.assertIn("work-item: next", payload["systemMessage"])
 
@@ -3299,17 +3398,17 @@ class AutopilotStateTest(unittest.TestCase):
             items = aps.read_work_items(run_dir / "tasks.jsonl")
             events = [
                 json.loads(line)
-                for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+                for line in _fixture_read_text(run_dir / "events.jsonl", encoding="utf-8").splitlines()
             ]
-            decision_removed = not (run_dir / "consistency-decision.json").exists()
-            applied_decision_exists = (run_dir / "consistency-decision.applied.json").is_file()
-            rejected_decision_exists = (run_dir / "consistency-decision.rejected.json").exists()
+            decision_consumed = not aps.storage.pending(run_dir / "consistency-decision.json")
+            applied_decision_exists = _fixture_is_file(run_dir / "consistency-decision.applied.json")
+            rejected_decision_exists = _fixture_exists(run_dir / "consistency-decision.rejected.json")
 
         self.assertEqual(payload, {"continue": True, "systemMessage": ""})
         self.assertEqual(items[0]["status"], "completed")
         self.assertEqual(items[0]["completion"]["state"], "completed")
         self.assertEqual(items[0]["completion"]["completion_check_digest"], VALID_COMPLETION_DIGEST)
-        self.assertTrue(decision_removed)
+        self.assertTrue(decision_consumed)
         self.assertTrue(applied_decision_exists)
         self.assertFalse(rejected_decision_exists)
         self.assertEqual([event["event"] for event in events], ["consistency_decision_applied", "no_ready_item"])
@@ -3346,33 +3445,33 @@ class AutopilotStateTest(unittest.TestCase):
                     "platform": "codex",
                     "session_id": "session-1",
                     "state_path": str(state_path),
+                    "latest_input_event": {"event_id": "evt-stop-1"},
+                    "acceptance_criteria": json.loads(_fixture_read_text(state_path))["acceptance_criteria"],
                 },
             }
-            (run_dir / "approved-run.json").write_text(json.dumps(run_record), encoding="utf-8")
+            _fixture_write_text(run_dir / "approved-run.json", json.dumps(run_record), encoding="utf-8")
             aps.write_work_items(run_dir / "tasks.jsonl", [
                 _item("current", status="running"),
                 _item("next", depends_on=["current"]),
             ])
-            (run_dir / "consistency-decision.json").write_text(
-                json.dumps(_decision_action(
+            _fixture_write_text(run_dir / "consistency-decision.json", json.dumps(_decision_action(
                     "current",
                     "continue_next",
                     completion_check_digest=VALID_COMPLETION_DIGEST,
                     verdict="pass",
+                    approval_generation=aps.SESSION_MATERIAL.approval_generation(run_record),
                     evidence=VALID_COMPLETION_EVIDENCE,
-                )),
-                encoding="utf-8",
-            )
+                )), encoding="utf-8")
 
             aps.advance_approved_run(run_dir)
-            ledger_state = json.loads(state_path.read_text(encoding="utf-8"))
+            ledger_state = json.loads(_fixture_read_text(state_path, encoding="utf-8"))
 
         ac = next(c for c in ledger_state["acceptance_criteria"] if c["id"] == "AC-TEST")
         # A validated continue_next flips the admitted criterion to met via the core API.
         self.assertEqual(ac["status"], "met")
         self.assertEqual(ac["met_completion_check_digest"], "a" * 64)
 
-    def test_continue_next_without_reachable_core_ledger_continues_without_crash(self):
+    def test_continue_next_without_reachable_core_ledger_parks_bound_completion(self):
         with tempfile.TemporaryDirectory() as tmp:
             tmp = Path(tmp)
             # No core repo is mirrored, so import-by-path cannot resolve the ledger.
@@ -3397,31 +3496,32 @@ class AutopilotStateTest(unittest.TestCase):
                     "platform": "codex",
                     "session_id": "session-1",
                     "state_path": str(state_path),
+                    "latest_input_event": {"event_id": "evt-stop-1"},
+                    "acceptance_criteria": json.loads(_fixture_read_text(state_path))["acceptance_criteria"],
                 },
             }
-            (run_dir / "approved-run.json").write_text(json.dumps(run_record), encoding="utf-8")
+            _fixture_write_text(run_dir / "approved-run.json", json.dumps(run_record), encoding="utf-8")
             aps.write_work_items(run_dir / "tasks.jsonl", [
                 _item("current", status="running"),
                 _item("next", depends_on=["current"]),
             ])
-            (run_dir / "consistency-decision.json").write_text(
-                json.dumps(_decision_action(
+            _fixture_write_text(run_dir / "consistency-decision.json", json.dumps(_decision_action(
                     "current",
                     "continue_next",
                     completion_check_digest=VALID_COMPLETION_DIGEST,
                     verdict="pass",
+                    approval_generation=aps.SESSION_MATERIAL.approval_generation(run_record),
                     evidence=VALID_COMPLETION_EVIDENCE,
-                )),
-                encoding="utf-8",
-            )
+                )), encoding="utf-8")
 
-            payload = aps.advance_approved_run(run_dir)
+            with mock.patch("autopilot_work_items._load_core_ledger_module", return_value=None):
+                with self.assertRaisesRegex(ValueError, "compatible Core SQLite storage API is required"):
+                    aps.advance_approved_run(run_dir)
             items = aps.read_work_items(run_dir / "tasks.jsonl")
-            ledger_state = json.loads(state_path.read_text(encoding="utf-8"))
+            ledger_state = json.loads(_fixture_read_text(state_path, encoding="utf-8"))
 
-        # The decision still applies (item completed) and the run keeps going; the criterion stays unmet because the met-flip is gracefully skipped.
-        self.assertEqual(items[0]["status"], "completed")
-        self.assertEqual(payload["continue"], True)
+        # A bound task cannot become completed when its required core receipt failed.
+        self.assertEqual(items[0]["status"], "running")
         ac = next(c for c in ledger_state["acceptance_criteria"] if c["id"] == "AC-TEST")
         self.assertEqual(ac["status"], "unmet")
 
@@ -3453,9 +3553,11 @@ class AutopilotStateTest(unittest.TestCase):
                     "platform": "codex",
                     "session_id": "session-1",
                     "state_path": str(state_path),
+                    "latest_input_event": {"event_id": "evt-stop-1"},
+                    "acceptance_criteria": json.loads(_fixture_read_text(state_path))["acceptance_criteria"],
                 },
             }
-            (run_dir / "approved-run.json").write_text(json.dumps(run_record), encoding="utf-8")
+            _fixture_write_text(run_dir / "approved-run.json", json.dumps(run_record), encoding="utf-8")
             aps.write_work_items(run_dir / "tasks.jsonl", [
                 _item("current", status="running"),
                 _item("next", depends_on=["current"]),
@@ -3473,19 +3575,17 @@ class AutopilotStateTest(unittest.TestCase):
                 "- unverified:",
                 "  - none",
             ])]
-            (run_dir / "consistency-decision.json").write_text(
-                json.dumps(_decision_action(
+            _fixture_write_text(run_dir / "consistency-decision.json", json.dumps(_decision_action(
                     "current",
                     "continue_next",
                     completion_check_digest=VALID_COMPLETION_DIGEST,
                     verdict="pass",
+                    approval_generation=aps.SESSION_MATERIAL.approval_generation(run_record),
                     evidence=evidence,
-                )),
-                encoding="utf-8",
-            )
+                )), encoding="utf-8")
 
             aps.advance_approved_run(run_dir)
-            ledger_state = json.loads(state_path.read_text(encoding="utf-8"))
+            ledger_state = json.loads(_fixture_read_text(state_path, encoding="utf-8"))
 
         by_id = {c["id"]: c for c in ledger_state["acceptance_criteria"]}
         # A single claim binding multiple criteria flips every named criterion.

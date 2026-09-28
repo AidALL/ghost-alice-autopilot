@@ -90,27 +90,32 @@ def _short_digest(value: Any) -> str:
     return hashlib.sha256(_json_bytes(value)).hexdigest()[:16]
 
 
+def _storage():
+    import sys
+    adapter_dir = Path(__file__).resolve().parents[1] / "adapters"
+    if str(adapter_dir) not in sys.path:
+        sys.path.insert(0, str(adapter_dir))
+    import autopilot_storage
+    return autopilot_storage
+
+
 def _read_json_object(path: str | Path | None) -> dict[str, Any]:
     if path is None:
         return {}
-    value = json.loads(Path(path).read_text(encoding="utf-8"))
+    value = _storage().read(Path(path))
     if not isinstance(value, dict):
         raise ValueError(f"{path}: expected JSON object")
     return value
 
 
 def _read_jsonl_objects(path: str | Path) -> list[dict[str, Any]]:
-    source = Path(path)
-    if not source.is_file():
+    try:
+        rows = _storage().read(Path(path))
+    except FileNotFoundError:
         return []
-    values: list[dict[str, Any]] = []
-    for line in source.read_text(encoding="utf-8").splitlines():
-        if not line.strip():
-            continue
-        parsed = json.loads(line)
-        if isinstance(parsed, dict):
-            values.append(parsed)
-    return values
+    if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
+        raise ValueError(f"{path}: expected JSONL objects")
+    return rows
 
 
 def _write_json_atomic(path: str | Path, value: Mapping[str, Any]) -> None:
@@ -261,6 +266,7 @@ def _candidate(
             "max_retry_attempts": max_retry_attempts,
         },
         "promotion_state": "candidate",
+        "approval_generation": state_payload.get("approval_generation"),
         "action_file_allowed": False,
         "created_at": _utc_now(),
     }
@@ -412,6 +418,7 @@ def decision_candidate_from_governance(
     routing_surface: Mapping[str, Any] | None = None,
     completion_validation: Mapping[str, Any] | None = None,
     governance_signal: Mapping[str, Any] | None = None,
+    approval_generation: str | None = None,
 ) -> dict[str, Any] | None:
     """Return a diagnostic decision candidate, never an adapter action file."""
 
@@ -420,6 +427,7 @@ def decision_candidate_from_governance(
         "routing_surface": dict(routing_surface or {}),
         "completion_validation": dict(completion_validation or {}),
         "governance_signal": dict(governance_signal or {}),
+        "approval_generation": approval_generation,
     }
     if completion_validation:
         completion_candidate = _completion_decision(
@@ -489,6 +497,7 @@ def _action_from_candidate(
         "decision_key": candidate.get("decision_key"),
         "state_hash": candidate.get("state_hash"),
         "loop_key": _as_mapping(candidate.get("loop_guard")).get("loop_key"),
+        "approval_generation": candidate.get("approval_generation"),
     }
     return {key: value for key, value in payload.items() if value is not None}
 
@@ -510,10 +519,13 @@ def promote_candidate_to_action(
     current_attempt: int = 0,
     work_item_status: str | None = None,
     promotion_evidence: Mapping[str, Any] | None = None,
+    expected_approval_generation: str | None = None,
 ) -> dict[str, Any] | None:
     """Promote an evidence-backed candidate into an adapter-consumable action."""
 
     if candidate is None or not _is_promotable_candidate(candidate):
+        return None
+    if expected_approval_generation and candidate.get("approval_generation") != expected_approval_generation:
         return None
     evidence = _non_empty_strings(candidate.get("evidence"))
     loop_guard = _as_mapping(candidate.get("loop_guard"))
@@ -601,6 +613,7 @@ def conduct_plan_candidate_from_governance(
     intent_state: Mapping[str, Any],
     current_work_item_id: str,
     plan_path: str,
+    approval_generation: str | None = None,
 ) -> dict[str, Any] | None:
     """Return a conduct-plan candidate; it is not an approved conduct plan."""
 
@@ -667,7 +680,8 @@ def conduct_plan_candidate_from_governance(
         "current_work_item_id": current_work_item_id,
         "evidence": evidence,
         "evidence_digest": _digest(evidence),
-        "state_hash": _digest({"intent_state": intent_state, "current_work_item_id": current_work_item_id}),
+        "state_hash": _digest({"intent_state": intent_state, "current_work_item_id": current_work_item_id, "approval_generation": approval_generation}),
+        "approval_generation": approval_generation,
         "conduct_plan": plan,
         "created_at": _utc_now(),
     }
@@ -695,6 +709,8 @@ def promote_conduct_plan_candidate(
     approved["evidence_digest"] = candidate.get("evidence_digest")
     approved["approval_evidence"] = dict(approval_evidence)
     approved["approved_at"] = _utc_now()
+    if candidate.get("approval_generation"):
+        approved["approval_generation"] = candidate["approval_generation"]
     return approved
 
 
@@ -705,6 +721,7 @@ def _cmd_decision_candidate(args: argparse.Namespace) -> int:
         routing_surface=_read_json_object(args.routing_surface),
         completion_validation=_read_json_object(args.completion_validation),
         governance_signal=_read_json_object(args.governance_signal),
+        approval_generation=args.approval_generation,
     )
     if candidate is None:
         return 3
@@ -718,6 +735,11 @@ def _cmd_promote_decision(args: argparse.Namespace) -> int:
     if not isinstance(work_item_id, str):
         return 3
     run_dir = args.run_dir or Path(args.candidate).parent
+    material_path = Path(__file__).with_name("autopilot_session_material.py")
+    spec = importlib.util.spec_from_file_location("autopilot_session_material", material_path)
+    material = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(material)
+    expected_generation = material.approval_generation(_read_json_object(Path(run_dir) / "approved-run.json")) if _storage().exists(Path(run_dir) / "approved-run.json") else None
     context = _promotion_context_from_run_dir(run_dir, work_item_id)
     work_item_status = context["work_item_status"]
     if not isinstance(work_item_status, str):
@@ -731,6 +753,7 @@ def _cmd_promote_decision(args: argparse.Namespace) -> int:
         prior_loop_keys=prior_loop_keys,
         current_attempt=current_attempt,
         work_item_status=work_item_status,
+        expected_approval_generation=expected_generation,
     )
     if action is None:
         return 3
@@ -743,6 +766,7 @@ def _cmd_conduct_plan_candidate(args: argparse.Namespace) -> int:
         intent_state=_read_json_object(args.intent_state),
         current_work_item_id=args.current_work_item_id,
         plan_path=args.plan_path,
+        approval_generation=args.approval_generation,
     )
     if candidate is None:
         return 3
@@ -774,6 +798,7 @@ def _parser() -> argparse.ArgumentParser:
     decision_candidate.add_argument("--routing-surface")
     decision_candidate.add_argument("--completion-validation")
     decision_candidate.add_argument("--governance-signal")
+    decision_candidate.add_argument("--approval-generation", help="approval receipt captured when producing this decision; never inferred during promotion")
     decision_candidate.add_argument("--out", required=True)
     decision_candidate.set_defaults(func=_cmd_decision_candidate)
 
@@ -789,6 +814,7 @@ def _parser() -> argparse.ArgumentParser:
     conduct_plan_candidate.add_argument("--intent-state", required=True)
     conduct_plan_candidate.add_argument("--current-work-item-id", required=True)
     conduct_plan_candidate.add_argument("--plan-path", required=True)
+    conduct_plan_candidate.add_argument("--approval-generation", help="approval receipt captured when producing this plan; never inferred during promotion")
     conduct_plan_candidate.add_argument("--out", required=True)
     conduct_plan_candidate.set_defaults(func=_cmd_conduct_plan_candidate)
 

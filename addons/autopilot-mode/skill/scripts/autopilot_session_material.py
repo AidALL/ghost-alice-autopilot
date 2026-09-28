@@ -7,9 +7,13 @@ Dependencies: Python 3.11+ standard library only.
 from __future__ import annotations
 
 import importlib.util
+import copy
+import hashlib
 import json
 import os
+import shutil
 import tempfile
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
@@ -135,6 +139,21 @@ def safe_recent_events(events: list[dict[str, Any]], limit: int = 20) -> list[di
     return [compact_event(event) for event in events[-limit:]]
 
 
+def session_evidence(material: Mapping[str, Any]) -> dict[str, Any]:
+    """Capture the exact input and criterion definitions used to approve work."""
+    events = material["events"]
+    return {
+        "platform": material["platform"], "session_id": material["session_id"],
+        "state_path": str(material["state_path"]), "events_path": str(material["events_path"]),
+        "event_count": len(events), "latest_event": compact_event(events[-1] if events else None),
+        "latest_input_event": compact_event(material["latest_input_event"]),
+        "ledger_revision": material["intent_state"].get("ledger_revision"),
+        "latest_intent_update_event": latest_event_of(events, "intent-updated"),
+        "recent_events": safe_recent_events(events),
+        "acceptance_criteria": copy.deepcopy(material["intent_state"].get("acceptance_criteria", [])),
+    }
+
+
 def run_summary(intent_state: Mapping[str, Any]) -> str:
     for key in ("current_goal", "user_intent_summary"):
         value = intent_state.get(key)
@@ -143,25 +162,40 @@ def run_summary(intent_state: Mapping[str, Any]) -> str:
     return "Autopilot run bootstrapped from session-intent ledger."
 
 
+def _criterion_context(raw: Any) -> str | None:
+    if isinstance(raw, str) and raw.strip():
+        return f"{raw.strip()} [source: inferred, admitted: false, status: unknown]"
+    if not isinstance(raw, Mapping):
+        return None
+    summary = raw.get("summary") or raw.get("text")
+    if not isinstance(summary, str) or not summary.strip():
+        return None
+    criterion_id = raw.get("id")
+    label = f"{criterion_id.strip()}: " if isinstance(criterion_id, str) and criterion_id.strip() else ""
+    source = raw.get("source") or "unknown"
+    admitted = "true" if raw.get("admitted") is True else "false"
+    status = raw.get("status") or "unknown"
+    return f"{label}{summary.strip()} [source: {source}, admitted: {admitted}, status: {status}]"
+
+
 def acceptance_criteria_from_intent(intent_state: Mapping[str, Any]) -> list[str]:
-    criteria: list[str] = []
+    """Project only explicitly admitted criteria as completion obligations."""
     raw = intent_state.get("acceptance_criteria")
-    if isinstance(raw, list):
-        for item in raw:
-            if isinstance(item, str) and item.strip():
-                criteria.append(item.strip())
-            elif isinstance(item, Mapping):
-                summary = item.get("summary")
-                criterion_id = item.get("id")
-                if isinstance(summary, str) and summary.strip():
-                    if isinstance(criterion_id, str) and criterion_id.strip():
-                        criteria.append(f"{criterion_id.strip()}: {summary.strip()}")
-                    else:
-                        criteria.append(summary.strip())
-    return criteria or ["Satisfy the approved session-intent scope with fresh verification evidence."]
+    if not isinstance(raw, list):
+        return []
+    return [text for row in raw if isinstance(row, Mapping) and row.get("admitted") is True
+            if (text := _criterion_context(row))]
 
 
-def _labeled_summary_items(value: Any, *, limit: int = 6) -> list[str]:
+def contextual_protections_from_intent(intent_state: Mapping[str, Any]) -> list[str]:
+    raw = intent_state.get("acceptance_criteria")
+    if not isinstance(raw, list):
+        return []
+    return [text for row in raw if not isinstance(row, Mapping) or row.get("admitted") is not True
+            if (text := _criterion_context(row))]
+
+
+def _labeled_summary_items(value: Any, *, limit: int | None = 6) -> list[str]:
     if not isinstance(value, list):
         return []
     items: list[str] = []
@@ -178,7 +212,7 @@ def _labeled_summary_items(value: Any, *, limit: int = 6) -> list[str]:
                     items.append(summary.strip())
             elif isinstance(item_id, str) and item_id.strip():
                 items.append(item_id.strip())
-        if len(items) >= limit:
+        if limit is not None and len(items) >= limit:
             break
     return items
 
@@ -223,6 +257,13 @@ def session_intent_task(
     }
     if isinstance(source_locator, str) and source_locator.strip():
         task["source_locator"] = source_locator.strip()
+    protections = contextual_protections_from_intent(intent_state)
+    if protections:
+        task["contextual_protections"] = protections
+    for key in ("constraints", "non_goals"):
+        values = _labeled_summary_items(intent_state.get(key), limit=None)
+        if values:
+            task[key] = values
     decisions = decision_context_from_intent(intent_state)
     if decisions:
         task["decision_context"] = decisions
@@ -241,7 +282,7 @@ def build_approved_run(
     allowed_surfaces: list[str],
     stop_conditions: list[str],
 ) -> dict[str, Any]:
-    return {
+    run = {
         "schema_version": RUN_SCHEMA_VERSION,
         "run_id": run_id,
         "approved": True,
@@ -253,6 +294,57 @@ def build_approved_run(
         "approval_evidence": dict(approval_evidence),
         "created_at": utc_now(),
     }
+    run["approval_generation"] = approval_generation(run)
+    return run
+
+
+def approval_generation(run: Mapping[str, Any]) -> str | None:
+    """Content-address the immutable approved contract, excluding progress.
+
+    Completion status, proof, timestamps and the decreasing budget are mutable
+    observations. They must not reset or reapprove an otherwise identical run.
+    """
+    approval = run.get("approval_evidence")
+    binding = approval.get("session_intent") if isinstance(approval, Mapping) else None
+    if not isinstance(binding, Mapping):
+        return None  # Legacy standalone task-only contract.
+    criteria = binding.get("acceptance_criteria")
+    definitions = [{key: row.get(key) for key in ("id", "summary", "source", "admitted")}
+                   for row in criteria if isinstance(row, Mapping)] if isinstance(criteria, list) else None
+    if definitions is not None:
+        definitions.sort(key=lambda row: str(row.get("id")))
+    event = binding.get("latest_input_event") or {}
+    contract = {
+        "schema_version": "autopilot-approval-contract.v1", "run_id": run.get("run_id"),
+        "platform": binding.get("platform"), "session_id": binding.get("session_id"),
+        "input_event_id": event.get("event_id"), "input_digest": event.get("input_digest"),
+        "acceptance_criteria": definitions, "scope": run.get("scope"),
+        "allowed_surfaces": run.get("allowed_surfaces"), "stop_conditions": run.get("stop_conditions"),
+    }
+    return "sha256:" + hashlib.sha256(json.dumps(contract, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
+
+
+def validate_approval_generation(run: Mapping[str, Any], artifact: Mapping[str, Any]) -> None:
+    expected = approval_generation(run)
+    if expected and artifact.get("approval_generation") != expected:
+        raise SessionMaterialError("artifact approval generation differs from the approved run")
+
+
+def archive_superseded_run(run_dir: Path, old_generation: str | None) -> Path:
+    """Preserve one run generation before replacing it, under the caller's lock."""
+    history = run_dir / ".approval-history" / f"{(old_generation or 'legacy').removeprefix('sha256:')}-{uuid.uuid4().hex}"
+    history.mkdir(parents=True)
+    paths = {run_dir / name for name in ("approved-run.json", "tasks.jsonl", "events.jsonl")}
+    paths.update(run_dir.glob("consistency-decision*.json"))
+    paths.update(run_dir.glob("conduct-plan*.json"))
+    paths = sorted(path for path in paths if path.is_file())
+    for path in paths:
+        shutil.copyfile(path, history / path.name)
+    # Remove actionable old-generation files only after every copy exists.
+    # OFF is intentionally outside this set: reapproval cannot remove a pause.
+    for path in paths:
+        path.unlink()
+    return history
 
 
 def load_governance_signal_module(*, required: bool = False):

@@ -41,9 +41,8 @@ CONDUCT_PLAN_SCHEMA = "autopilot-conduct-plan.v2"
 COMPLETION_CHECK_DIGEST_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
 TOP_LEVEL_FIELD_RE = re.compile(r"^-\s*[A-Za-z0-9_-]+\s*:")
 ACCEPTANCE_ID_RE = re.compile(r"^\s*-\s*([A-Za-z0-9_.=-]+)\s*:")
-CLAIM_RE = re.compile(r"^\s*-\s*claim\s*:\s*(.+?)\s*$", re.I)
-CRITERION_RE = re.compile(r"^\s*criterion\s*:\s*(.+?)\s*$", re.I)
-VERDICT_RE = re.compile(r"^\s*verdict\s*:\s*(.+?)\s*$", re.I)
+CLAIM_RE = re.compile(r"^\s*-\s*claim\s*:\s*(.*?)\s*$", re.I)
+ENTRY_FIELD_RE = re.compile(r"^\s*(criterion|evidence|verdict)\s*:\s*(.*?)\s*$", re.I)
 APPROVAL_DECISIONS = frozenset({"go", "approve", "approved", "auto"})
 
 
@@ -64,105 +63,111 @@ def _validate_string_list(value: Any, field: str) -> list[str]:
 
 
 def _extract_top_level_section(text: str, field_name: str) -> str:
-    lines = text.splitlines()
+    """Preserve inline and nested values, matching Core's evidence contract."""
+    lines = re.split(r"\r?\n", text)
     field_pattern = re.compile(r"^-\s*" + re.escape(field_name) + r"\s*:", re.I)
-    start = -1
     for index, line in enumerate(lines):
-        if field_pattern.search(line):
-            start = index
-            break
-    if start < 0:
-        return ""
-
-    kept = []
-    for index in range(start + 1, len(lines)):
-        if TOP_LEVEL_FIELD_RE.search(lines[index]):
-            break
-        kept.append(lines[index])
-    return "\n".join(kept).strip()
-
-
-def _extract_completion_acceptance_ids(evidence_text: str) -> set[str]:
-    section = _extract_top_level_section(evidence_text, "acceptance-criteria")
-    ids: set[str] = set()
-    for line in section.splitlines():
-        match = ACCEPTANCE_ID_RE.match(line)
-        if match and "<" not in match.group(1):
-            ids.add(match.group(1))
-    return ids
-
-
-def _extract_completion_claim_criteria(evidence_text: str) -> list[str]:
-    section = _extract_top_level_section(evidence_text, "claim-evidence-map")
-    criteria: list[str] = []
-    current_claim = False
-    for line in section.splitlines():
-        if CLAIM_RE.match(line):
-            current_claim = True
-            criteria.append("")
+        if not field_pattern.search(line):
             continue
-        if current_claim:
-            match = CRITERION_RE.match(line)
-            if match:
-                criteria[-1] = match.group(1).strip()
-    return criteria
+        inline = field_pattern.sub("", line, count=1).strip()
+        kept = [inline] if inline else []
+        for body in lines[index + 1:]:
+            if TOP_LEVEL_FIELD_RE.search(body) or (body.strip() and body == body.lstrip()):
+                break
+            kept.append(body)
+        return "\n".join(kept).strip()
+    return ""
 
 
-def _extract_completion_claim_verdicts(evidence_text: str) -> list[str]:
-    section = _extract_top_level_section(evidence_text, "claim-evidence-map")
-    verdicts: list[str] = []
-    current_claim = False
-    for line in section.splitlines():
-        if CLAIM_RE.match(line):
-            current_claim = True
-            verdicts.append("")
+def _split_entry_fields(line: str) -> list[str]:
+    """Split only explicit, unquoted semicolon fields; commands stay evidence."""
+    parts: list[str] = []
+    start = 0
+    quote = None
+    escaped = False
+    for index, char in enumerate(line):
+        if escaped:
+            escaped = False
             continue
-        if current_claim:
-            match = VERDICT_RE.match(line)
-            if match:
-                verdicts[-1] = match.group(1).strip().lower()
-    return verdicts
-
-
-def _extract_unverified_items(evidence_text: str) -> list[str]:
-    section = _extract_top_level_section(evidence_text, "unverified")
-    items: list[str] = []
-    for line in section.splitlines():
-        stripped = line.strip()
-        if not stripped.startswith("-"):
+        if char == "\\" and quote:
+            escaped = True
             continue
-        item = stripped[1:].strip()
-        if item:
-            items.append(item)
-    return items
+        if quote:
+            if char == quote:
+                quote = None
+            continue
+        if char in ('"', "'", "`"):
+            if char != "'" or index == 0 or not line[index - 1].isalnum():
+                quote = char
+            continue
+        if char == ";" and re.match(r"\s*(?:criterion|evidence|verdict)\s*:", line[index + 1:], re.I):
+            parts.append(line[start:index])
+            start = index + 1
+    parts.append(line[start:])
+    return parts
 
 
-def _validate_completion_claim_criteria(evidence_text: str) -> None:
-    acceptance_ids = _extract_completion_acceptance_ids(evidence_text)
-    claim_criteria = _extract_completion_claim_criteria(evidence_text)
+def _parse_completion_evidence(evidence_text: str) -> dict[str, Any]:
+    """Return one validated interpretation for AP transition and Core met writes.
+
+    Syntax/evidence semantics match Core. AP additionally requires known criterion
+    bindings and all-pass outcomes. This parser is packaged with standalone AP.
+    """
+    for name in ("acceptance-criteria", "claim-evidence-map", "unverified"):
+        headers = re.findall(r"^-\s*" + re.escape(name) + r"\s*:", evidence_text, re.I | re.M)
+        if len(headers) > 1:
+            raise AutopilotStateError(f"continue_next evidence must not contain duplicate {name} sections")
+    acceptance_ids = {
+        match.group(1)
+        for line in _extract_top_level_section(evidence_text, "acceptance-criteria").splitlines()
+        if (match := ACCEPTANCE_ID_RE.match(line)) and "<" not in match.group(1)
+    }
     if not acceptance_ids:
         raise AutopilotStateError(
             "continue_next evidence must include acceptance-criteria criterion ids for completion-check claims"
         )
-    if not claim_criteria:
+    entries: list[dict[str, str]] = []
+    current = None
+    for raw_line in re.split(r"\r?\n", _extract_top_level_section(evidence_text, "claim-evidence-map")):
+        for line in _split_entry_fields(raw_line):
+            claim = CLAIM_RE.match(line)
+            if claim:
+                current = {"claim": claim.group(1).strip()}
+                entries.append(current)
+                continue
+            if re.match(r"^\s*-\s*\S", line):
+                raise AutopilotStateError("Every claim-evidence-map entry must begin with an explicit claim")
+            field = ENTRY_FIELD_RE.match(line)
+            if field and current is not None:
+                key = field.group(1).lower()
+                if key in current:
+                    raise AutopilotStateError("claim-evidence-map entries must not contain duplicate fields")
+                current[key] = field.group(2).strip()
+    if not entries:
         raise AutopilotStateError("continue_next evidence must include claim-evidence-map entries")
-    for criterion in claim_criteria:
-        criterion_ids = [token for token in re.split(r"[,\s]+", criterion.strip()) if token]
-        if not criterion_ids or any(token not in acceptance_ids for token in criterion_ids):
+    criterion_ids: list[str] = []
+    for entry in entries:
+        if not entry.get("claim"):
+            raise AutopilotStateError("claim-evidence-map entries must include a non-empty claim")
+        bound_ids = [token for token in re.split(r"[,;\s]+", entry.get("criterion", "")) if token]
+        if not bound_ids or any(token not in acceptance_ids for token in bound_ids):
             raise AutopilotStateError(
                 "continue_next evidence claim-evidence-map entries must reference acceptance-criteria criterion ids"
             )
-
-
-def _validate_completion_claim_outcomes(evidence_text: str) -> None:
-    claim_verdicts = _extract_completion_claim_verdicts(evidence_text)
-    if not claim_verdicts or any(verdict != "pass" for verdict in claim_verdicts):
-        raise AutopilotStateError("continue_next evidence claim-evidence-map verdicts must all be pass")
-    unverified_items = _extract_unverified_items(evidence_text)
-    if not unverified_items:
+        if not entry.get("evidence"):
+            raise AutopilotStateError("claim-evidence-map entries must include evidence")
+        if entry.get("verdict", "").lower() != "pass":
+            raise AutopilotStateError("continue_next evidence claim-evidence-map verdicts must all be pass")
+        for criterion_id in bound_ids:
+            if criterion_id not in criterion_ids:
+                criterion_ids.append(criterion_id)
+    unverified = _extract_top_level_section(evidence_text, "unverified")
+    meaningful = [line.strip() for line in re.split(r"\r?\n", unverified) if line.strip()]
+    if not meaningful:
         raise AutopilotStateError("continue_next evidence must include unverified: none")
-    if any(item.strip().lower() != "none" for item in unverified_items):
+    if any(not re.fullmatch(r"(?:-\s*)?none\s*", line, re.I) for line in meaningful):
         raise AutopilotStateError("continue_next evidence unverified items must be none")
+    return {"claims": entries, "criterion_ids": criterion_ids}
 
 
 def _validate_completion(value: Any, item_id: str) -> dict[str, Any]:
@@ -198,8 +203,7 @@ def _validate_continue_next_evidence(
     evidence_text = "\n".join(validated)
     if "[completion-check]" not in evidence_text or "claim-evidence-map" not in evidence_text:
         raise AutopilotStateError("continue_next evidence must include a [completion-check] claim-evidence-map")
-    _validate_completion_claim_criteria(evidence_text)
-    _validate_completion_claim_outcomes(evidence_text)
+    _parse_completion_evidence(evidence_text)
     return validated
 
 
@@ -251,6 +255,11 @@ def validate_work_items(items: Iterable[dict[str, Any]]) -> list[dict[str, Any]]
 
 
 def read_work_items(path: str | Path) -> list[dict[str, Any]]:
+    from autopilot_storage import read
+    return validate_work_items(read(Path(path)))
+
+
+def _read_legacy_work_items(path):
     state_path = Path(path)
     items: list[dict[str, Any]] = []
     for lineno, line in enumerate(state_path.read_text(encoding="utf-8").splitlines(), start=1):
@@ -267,6 +276,9 @@ def read_work_items(path: str | Path) -> list[dict[str, Any]]:
 def write_work_items(path: str | Path, items: Iterable[dict[str, Any]]) -> None:
     state_path = Path(path)
     validated = validate_work_items(items)
+    from autopilot_storage import write
+    if write(state_path, validated):
+        return
     state_path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp_name = tempfile.mkstemp(
         prefix=f".{state_path.name}.",
@@ -394,12 +406,15 @@ def _load_core_ledger_module(state_path: Path, source: Mapping[str, str] | None 
     skip the met-flip gracefully instead of crashing.
     """
     candidates: list[Path] = []
+    if source is None:
+        source = os.environ
     if source is not None:
-        core_root = str(source.get("GHOST_ALICE_CORE_ROOT") or "").strip()
+        core_root = str(source.get("GHOST_ALICE_CORE_ROOT") or os.environ.get("GHOST_ALICE_CORE_ROOT") or "").strip()
         if core_root:
             candidates.append(
                 Path(core_root) / "session-intent-analyzer" / "scripts" / "session_intent_ledger.py"
             )
+    candidates.append(Path(__file__).resolve().parents[2] / "session-intent-analyzer" / "scripts" / "session_intent_ledger.py")
     for parent in Path(state_path).resolve().parents:
         candidates.append(parent / "session-intent-analyzer" / "scripts" / "session_intent_ledger.py")
     for candidate in candidates:
@@ -423,49 +438,78 @@ def materialize_met_criteria_from_continue_next(
     run: Mapping[str, Any],
     applied_decision: Mapping[str, Any],
     source: Mapping[str, str] | None = None,
+    *, require_success: bool = False,
 ) -> list[str]:
     """Flip the satisfied admitted criteria to "met" after a validated continue_next.
 
     Hybrid B.3: the core ledger owns the write-only "met" invariant; the adapter
     only calls it, using the same validated completion-check digest that
-    continue_next already required. Any resolution or flip failure is a graceful
-    skip (the criterion stays unmet, so the run keeps going) rather than a crash
-    or a premature stop.
+    continue_next already required. A session-bound adapter uses require_success
+    before committing task completion. Diagnostic callers may request a skipped
+    result; neither path rebinds old proof to a new input or criterion.
     """
+    def reject(reason: str) -> list[str]:
+        if require_success:
+            raise AutopilotStateError(f"completion proof was not recorded by core: {reason}")
+        return []
+
     approval = run.get("approval_evidence")
     if not isinstance(approval, Mapping):
-        return []
+        return reject("missing approval")
     session_intent = approval.get("session_intent")
     if not isinstance(session_intent, Mapping):
-        return []
+        return reject("missing session binding")
+    material_path = Path(__file__).resolve().parents[1] / "scripts" / "autopilot_session_material.py"
+    spec = importlib.util.spec_from_file_location("autopilot_session_material", material_path)
+    material = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(material)
+    try:
+        material.validate_approval_generation(run, applied_decision)
+    except ValueError as exc:
+        return reject(str(exc))
+    approved_criteria = session_intent.get("acceptance_criteria")
+    if not isinstance(approved_criteria, list):
+        return reject("missing approved criterion snapshots; inspect current input and reapprove work")
+    snapshots = {row["id"]: row for row in approved_criteria
+                 if isinstance(row, Mapping) and isinstance(row.get("id"), str)}
+    approved_input = session_intent.get("latest_input_event")
+    expected_input = approved_input.get("event_id") if isinstance(approved_input, Mapping) else None
     state_path_raw = session_intent.get("state_path")
     if not isinstance(state_path_raw, str) or not state_path_raw:
-        return []
+        return reject("missing session state path")
     raw_digest = str(applied_decision.get("completion_check_digest") or "").strip()
     if not COMPLETION_CHECK_DIGEST_PATTERN.fullmatch(raw_digest):
-        return []
+        return reject("invalid completion digest")
     core_digest = raw_digest[len("sha256:"):] if raw_digest.startswith("sha256:") else raw_digest
     evidence = applied_decision.get("evidence")
     if not isinstance(evidence, list):
-        return []
-    # A single claim may bind several criteria ("criterion: AC1, AC2"); split the same way the continue_next validator does so each real ledger id is flipped.
-    raw_criteria = _extract_completion_claim_criteria("\n".join(str(line) for line in evidence))
-    criterion_ids: list[str] = []
-    for raw in raw_criteria:
-        for token in re.split(r"[,\s]+", str(raw).strip()):
-            if token and token not in criterion_ids:
-                criterion_ids.append(token)
-    if not criterion_ids:
-        return []
+        return reject("missing completion evidence")
+    try:
+        validated_evidence = _validate_string_list(evidence, "continue_next evidence")
+        parsed = _parse_completion_evidence("\n".join(validated_evidence))
+    except AutopilotStateError as exc:
+        return reject(str(exc))
+    criterion_ids = parsed["criterion_ids"]
     state_path = Path(state_path_raw)
+    if (session_intent.get("platform") != state_path.parent.parent.name
+            or session_intent.get("session_id") != state_path.parent.name):
+        return reject("session identity differs from target state path")
     ledger = _load_core_ledger_module(state_path, source)
     if ledger is None or not hasattr(ledger, "mark_acceptance_criterion_met"):
-        return []
+        return reject("compatible core met writer is unavailable")
     intent_root = state_path.parent.parent.parent
     platform = state_path.parent.parent.name
     session_id = state_path.parent.name
+    from autopilot_storage import core_transaction
+    connection = core_transaction(intent_root)
+    if require_success and connection is None:
+        return reject("bound completion requires the shared Autopilot transaction")
     flipped: list[str] = []
     for criterion_id in criterion_ids:
+        if criterion_id not in snapshots:
+            if require_success:
+                return reject(f"criterion {criterion_id!r} was not part of the approval snapshot")
+            continue
         try:
             ledger.mark_acceptance_criterion_met(
                 root=intent_root,
@@ -473,9 +517,14 @@ def materialize_met_criteria_from_continue_next(
                 session_id=session_id,
                 criterion_id=criterion_id,
                 completion_check_digest=core_digest,
+                expected_input_event_id=expected_input,
+                expected_criterion=dict(snapshots[criterion_id]),
+                transaction=connection,
             )
             flipped.append(criterion_id)
-        except Exception:
+        except Exception as exc:
+            if require_success:
+                return reject(f"criterion {criterion_id!r}: {exc}")
             continue
     return flipped
 
