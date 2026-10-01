@@ -1025,7 +1025,7 @@ class AutopilotStateTest(unittest.TestCase):
                      "GHOST_ALICE_PLATFORM": "codex", "GHOST_ALICE_SESSION_ID": "session-1"}, project)
             self.assertTrue(observed)
             self.assertIn("approved-run.json", [name for name, _, _ in observed])
-            self.assertTrue(all(active and path == run_dir for _, active, path in observed))
+            self.assertTrue(all(active and path == run_dir.resolve() for _, active, path in observed))
             self.assertTrue(payload["systemMessage"])
 
 
@@ -1059,7 +1059,7 @@ class AutopilotStateTest(unittest.TestCase):
         self.assertTrue(payload["continue"])
         self.assertIn("work-item: conduct-stop-event-noop", payload["systemMessage"])
         self.assertIn("observer-agent: required", payload["systemMessage"])
-        self.assertEqual(approved_run["approval_evidence"]["session_intent"]["state_path"], str(state_path))
+        self.assertEqual(approved_run["approval_evidence"]["session_intent"]["state_path"], str(state_path.resolve()))
         self.assertEqual(items[0]["status"], "running")
         self.assertEqual([event["event"] for event in events], ["session_intent_bootstrapped", "conduct_plan_imported", "continue_next_item"])
 
@@ -2217,6 +2217,8 @@ class AutopilotStateTest(unittest.TestCase):
                                 payload = aps.adapter_payload_from_env(env, hook_input=hook_input)
                             selected_sid = payload_sid or (native if platform == "codex" else "approved")
                             run_dir = project / ".autopilot"
+                            if declared == platform and (payload_sid or platform == "codex"):
+                                run_dir = run_dir / "sessions" / platform / selected_sid
                             if selected_sid == "approved":
                                 self.assertTrue(payload["systemMessage"])
                                 run = json.loads(_fixture_read_text(run_dir / "approved-run.json"))
@@ -2475,7 +2477,7 @@ class AutopilotStateTest(unittest.TestCase):
             payload = aps.adapter_payload_from_env({"PWD": str(project), "GHOST_ALICE_PLATFORM": "agent-runtime", "GHOST_ALICE_SESSION_INTENT_ROOT": str(intent_root), "GHOST_ALICE_SESSION_ID": "same-id"})
 
             self.assertTrue(payload["systemMessage"])
-            run = json.loads(_fixture_read_text(project / ".autopilot/approved-run.json"))
+            run = json.loads(_fixture_read_text(project / ".autopilot/sessions/agent-runtime/same-id/approved-run.json"))
             self.assertEqual(run["approval_evidence"]["session_intent"]["platform"], "agent-runtime")
             self.assertIn("physical AI", run["scope"]["summary"])
 

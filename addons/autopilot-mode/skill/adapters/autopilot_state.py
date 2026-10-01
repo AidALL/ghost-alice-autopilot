@@ -7,6 +7,7 @@ Dependencies: Python 3.11+ standard library plus sibling adapter modules.
 from __future__ import annotations
 
 import copy
+import errno
 import hashlib
 import autopilot_storage as storage
 from autopilot_provenance import bind_origin, reapproval_payload, default_intent_root
@@ -34,6 +35,8 @@ from autopilot_runtime_context import (
     project_cwd_from_env as _project_cwd_from_env,
     read_session_material,
     resolve_run_target,
+    session_intent_root_candidates as _session_intent_root_candidates,
+    run_is_paused,
     run_state_available as _run_state_available,
 )
 from autopilot_lineage import (
@@ -367,33 +370,6 @@ def _approval_from_session_decisions(intent_state: Mapping[str, Any]) -> dict[st
         return evidence
     return None
 
-def _session_intent_root_candidates(source: Mapping[str, str], project_cwd: Path) -> list[Path]:
-    candidates: list[Path] = []
-    configured = str(source.get("GHOST_ALICE_SESSION_INTENT_ROOT") or "").strip()
-    if configured:
-        candidates = [Path(configured).expanduser()]
-    else:
-        candidates.extend([
-            project_cwd / ".tmp" / "session-intent",
-            project_cwd.parent / "ghost-alice" / ".tmp" / "session-intent",
-        ])
-        home_text = str(source.get("HOME") or "").strip()
-        if home_text:
-            home = Path(home_text).expanduser()
-            candidates.extend([
-                home / "ghost-alice" / ".tmp" / "session-intent",
-                home / ".ghost-alice" / "session-intent",
-            ])
-    if not configured and (core_default := default_intent_root(source, project_cwd)) is not None:
-        candidates.append(core_default)
-    unique: list[Path] = []
-    seen: set[str] = set()
-    for candidate in candidates:
-        key = str(candidate)
-        if key not in seen and candidate.is_dir():
-            seen.add(key)
-            unique.append(candidate)
-    return unique
 
 def _platform_candidates(source: Mapping[str, str]) -> list[str]:
     platform = str(source.get("GHOST_ALICE_PLATFORM") or "").strip().lower()
@@ -441,7 +417,7 @@ def _bootstrap_from_session_intent_if_approved(
     *, hook_input: Mapping[str, Any] | None = None, permission_denied_noop: bool = False,
     expected_input_event: Mapping[str, Any] | None = None,
 ) -> bool:
-    if (run_dir / OFF_FILE).exists() or _run_state_available(run_dir):
+    if run_is_paused(run_dir) or _run_state_available(run_dir):
         return False
     if not _has_explicit_session_intent_context(source, project_cwd):
         return False
@@ -960,7 +936,7 @@ def _advance_approved_run_locked(
     root = Path(root)
     approved_run_path = root / APPROVED_RUN_FILE
     tasks_path = root / TASKS_FILE
-    if (root / OFF_FILE).exists():
+    if run_is_paused(root):
         return _noop_payload()
     conduct_plan_path = root / CONDUCT_PLAN_FILE
     if not _run_state_available(root):
@@ -1173,9 +1149,7 @@ def advance_approved_run(
 ) -> dict[str, Any]:
     root = Path(run_dir)
     approved_run_path = root / APPROVED_RUN_FILE
-    tasks_path = root / TASKS_FILE
-    conduct_plan_path = root / CONDUCT_PLAN_FILE
-    if (root / OFF_FILE).exists():
+    if run_is_paused(root):
         return _noop_payload()
     if not _run_state_available(root):
         return _noop_payload()
@@ -1216,16 +1190,18 @@ def advance_approved_run(
             except (OSError, ValueError):
                 pass
         raise
-
-
 def _bootstrap_then_advance(
     root: Path, source: Mapping[str, str], project_cwd: Path, *, derived_run_dir: bool = False,
     hook_input: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
+    if run_is_paused(root):
+        return _noop_payload()
     try:
         root.mkdir(parents=True, exist_ok=True)
-    except PermissionError:
-        if derived_run_dir:
+    except OSError as exc:
+        # Only access failure in a derived path is best-effort. Keep the chosen
+        # project boundary and surface unexpected storage errors.
+        if derived_run_dir and (isinstance(exc, PermissionError) or exc.errno == errno.EROFS):
             return _noop_payload()
         raise
     if not _run_state_available(root):
@@ -1240,7 +1216,9 @@ def adapter_payload_from_env(
     source = os.environ if env is None else env
     if env is not None and not source:
         return _noop_payload()
-    selected = resolve_run_target(env)
+    source = current_session_context(source, hook_input=hook_input) or source
+    selected = resolve_run_target(source if hook_input is not None else env)
+    source = selected["source"]
     if not selected["bootstrap"]:
         return advance_approved_run(selected["run_dir"], source, hook_input=hook_input)
     return _bootstrap_then_advance(

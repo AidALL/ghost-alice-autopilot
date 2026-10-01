@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 import json
 from pathlib import Path
 import sys
+from autopilot_runtime_context import run_owner_hint, run_owner_matches
 
 
 def _helper():
@@ -148,7 +149,7 @@ def _unbound_conduct_reapproval(connection, origin, run, snapshot):
     return helper.adapter.SESSION_MATERIAL.approval_generation(previous) == helper.adapter.SESSION_MATERIAL.approval_generation(run)
 
 
-def _capture_result(connection, origin, *, preflight):
+def _capture_result(connection, origin, *, preflight, ownership_conflict=False):
     result = {"status": "prospective", "origin_token": origin["origin_token"],
               "captured_at": origin["captured_at"]}
     if preflight:
@@ -158,8 +159,15 @@ def _capture_result(connection, origin, *, preflight):
         claimed = connection.execute("INSERT INTO ap_completion_preflight_notices VALUES(?) ON CONFLICT(origin_token) DO NOTHING",
                                      (origin["origin_token"],)).rowcount
         if claimed:
-            from autopilot_messages import completion_preflight_guidance
-            result["additional_context"] = completion_preflight_guidance(origin)
+            if ownership_conflict:
+                result["additional_context"] = "\n".join([
+                    "[autopilot]", "completion-preflight: ownership-conflict",
+                    "The selected run belongs to a different session or standalone owner. Its approval and state are preserved.",
+                    "recovery-action: correct the explicit run-dir override within the authorized scope; default selection uses the current session's own run. No completion command was issued.",
+                ])
+            else:
+                from autopilot_messages import completion_preflight_guidance
+                result["additional_context"] = completion_preflight_guidance(origin)
     return result
 
 
@@ -167,8 +175,10 @@ def capture_origin(source, *, preflight=False):
     helper = _helper(); current = helper._source(source)
     root = Path(current["GHOST_ALICE_SESSION_INTENT_ROOT"]).resolve()
     run_dir = Path(helper.adapter.resolve_run_target(current)["run_dir"]).resolve()
-    if (run_dir / helper.adapter.OFF_FILE).exists() or not (root / "ghost-state.sqlite3").is_file():
+    if helper.adapter.run_is_paused(run_dir) or not (root / "ghost-state.sqlite3").is_file():
         return {"status": "skipped"}
+    owner = run_owner_hint(run_dir)
+    ownership_conflict = owner is not None and not run_owner_matches(owner, current)
     material = helper.adapter.read_session_material(root, current["GHOST_ALICE_PLATFORM"],
         current["GHOST_ALICE_SESSION_ID"], source=current, require_input=True, recover_audit=False)
     before = material["intent_state"]
@@ -181,7 +191,7 @@ def capture_origin(source, *, preflight=False):
         state = _locked_state(core, root, current, connection)
         if _snapshot(state, current, run_dir) != snapshot or _blocked(state):
             raise ValueError("current input or contract changed during prospective capture")
-        if (run_dir / helper.adapter.OFF_FILE).exists():
+        if helper.adapter.run_is_paused(run_dir):
             return {"status": "skipped"}
         _tables(connection)
         existing = _head(connection, _key(snapshot))
@@ -191,13 +201,13 @@ def capture_origin(source, *, preflight=False):
                 and (generation is None or pinned is None or generation == pinned)):
             # Admission after capture does not refresh origin age or manufacture
             # a new preverification generation receipt.
-            return _capture_result(connection, existing, preflight=preflight)
+            return _capture_result(connection, existing, preflight=preflight, ownership_conflict=ownership_conflict)
         body = {"schema_version": "autopilot-prospective-origin.v1", "contract": snapshot,
             "captured_at": datetime.now(timezone.utc).isoformat(), "existing_generation": generation}
         token = helper._digest(body)
         connection.execute("INSERT INTO ap_completion_origins VALUES(?,?)", (token, json.dumps(body, sort_keys=True)))
         connection.execute("INSERT INTO ap_completion_origin_heads VALUES(?,?) ON CONFLICT(origin_key) DO UPDATE SET token=excluded.token", (_key(snapshot), token))
-        return _capture_result(connection, {"origin_token": token, **body}, preflight=preflight)
+        return _capture_result(connection, {"origin_token": token, **body}, preflight=preflight, ownership_conflict=ownership_conflict)
 
 
 def bind_origin(run_dir, run, items, source):

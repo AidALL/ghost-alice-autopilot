@@ -83,8 +83,12 @@ class CompletionEvidenceSourceTest(unittest.TestCase):
         self.assertEqual(json.loads(result.stdout)["evidence_source"], self.top_evidence)
 
     def test_skill_default_omits_redundant_source_and_explains_limits(self):
-        text = (Path(os.environ["GHOST_ALICE_CORE_ROOT"]) /
-                "coding-convention/verification-before-completion/SKILL.md").read_text()
+        skill = Path(os.environ["GHOST_ALICE_CORE_ROOT"]) / "coding-convention/verification-before-completion/SKILL.md"
+        entry = skill.read_text()
+        reference = "references/autopilot-publication.md"
+        self.assertIn(f"[{reference}]({reference})", entry)
+        self.assertIn("before preparation, business verification or the first final answer", entry)
+        text = (skill.parent / reference).read_text()
         default = next(line for line in text.splitlines() if "autopilot_completion.py publish" in line)
         self.assertNotIn("--evidence-source ORIGINAL_LOCATOR", default)
         for required in ("top-level", "placeholder", "unchanged", "nested", "exactly one"):

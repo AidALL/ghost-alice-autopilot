@@ -77,6 +77,10 @@ RELEASE_PACKAGE_FILES = (
     "addons/autopilot-mode/skill/scripts/autopilot_completion.py",
     "docs/ko/release/2026-09-28-release-notes.md",
     "docs/release/2026-09-28-release-notes.md",
+    "docs/ko/release/2026-10-01-release-notes.md",
+    "docs/release/2026-10-01-release-notes.md",
+    "tests/test_session_run_selection.py",
+    "tests/test_adapter_readonly_cwd.py",
     "tests/test_completion_behavior_repair.py",
     "tests/test_completion_evidence_source.py",
     "tests/test_completion_preflight.py",
@@ -325,17 +329,18 @@ class CompatibilitySurfaceTest(unittest.TestCase):
         self.assertNotIn(".worktrees", text)
         self.assertNotIn("p6-autopilot", text)
 
-    def test_user_docs_warn_old_core_can_install_inert_skill_without_adapter(self) -> None:
-        english_expected = ("0.2.2", "inert", "without wiring the privileged adapter")
-        for rel in ("README.md", "addons/autopilot-mode/skill/SKILL.md"):
+    def test_user_docs_state_current_core_floor_and_hook_requirement(self) -> None:
+        for rel in ("README.md", "README_ko.md"):
             text = (REPO_ROOT / rel).read_text(encoding="utf-8")
-            for phrase in english_expected:
-                with self.subTest(rel=rel, phrase=phrase):
-                    self.assertIn(phrase, text)
-        korean = (REPO_ROOT / "README_ko.md").read_text(encoding="utf-8")
-        for phrase in ("0.2.2", "skill만 복사", "privileged adapter", "inert"):
-            with self.subTest(rel="README_ko.md", phrase=phrase):
-                self.assertIn(phrase, korean)
+            with self.subTest(rel=rel):
+                self.assertIn("Core `0.4.0`", text)
+                self.assertIn("SQLite", text)
+                self.assertIn("Claude Code", text)
+                self.assertIn("Codex", text)
+                self.assertIn("Core installer" if rel == "README.md" else "Core 설치기로 설치한", text)
+        skill = (REPO_ROOT / "addons/autopilot-mode/skill/SKILL.md").read_text(encoding="utf-8")
+        self.assertIn("Ghost-ALICE core must be 0.4.0 or newer", skill)
+        self.assertIn("shared SQLite transaction APIs", skill)
 
     def test_public_docs_do_not_describe_io_trace_as_bootstrap_condition(self) -> None:
         stale_phrases = (
@@ -369,11 +374,19 @@ class CompatibilitySurfaceTest(unittest.TestCase):
             "reopen_micro",
             "reopen_macro",
         )
-        for rel in ("README.md", "README_ko.md", "addons/autopilot-mode/skill/SKILL.md"):
+        reference = "./addons/autopilot-mode/skill/SKILL.md#consistency-decisions"
+        skill = (REPO_ROOT / reference.split("#", 1)[0]).read_text(encoding="utf-8")
+        self.assertIn("## Consistency Decisions", skill)
+        for phrase in required_phrases:
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, skill)
+        for rel in ("README.md", "README_ko.md"):
             text = (REPO_ROOT / rel).read_text(encoding="utf-8")
-            for phrase in required_phrases:
-                with self.subTest(rel=rel, phrase=phrase):
-                    self.assertIn(phrase, text)
+            with self.subTest(rel=rel):
+                self.assertIn(reference, text)
+                self.assertIn("before-stop", text)
+                self.assertIn("<selected-run-dir>/consistency-decision.json", text)
+                self.assertIn("SQLite", text)
 
     def test_docs_describe_governance_candidate_boundary(self) -> None:
         required_phrases = (
