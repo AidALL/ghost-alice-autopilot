@@ -46,7 +46,7 @@ class CompletionPublicationTest(unittest.TestCase):
             "source": "user-explicit", "admitted": True, "status": "unmet"}
             for key, summary in [("report", "Saved report matches input"), ("protected", "Protected file is unchanged")]]
         self.state_path.write_text(json.dumps(state))
-        self.run_dir = self.root / ".autopilot"
+        self.run_dir = self.root / ".autopilot/sessions/codex/session-1"
         self.source = {"GHOST_ALICE_CORE_ROOT": os.environ["GHOST_ALICE_CORE_ROOT"],
             "GHOST_ALICE_PLATFORM": "codex", "GHOST_ALICE_SESSION_ID": "session-1",
             "GHOST_ALICE_SESSION_INTENT_ROOT": str(self.root / "intent"),
@@ -305,7 +305,12 @@ class CompletionPublicationTest(unittest.TestCase):
 
     def test_core_skill_exposes_publication_before_initial_verification(self):
         skill = Path(os.environ["GHOST_ALICE_CORE_ROOT"]) / "coding-convention/verification-before-completion/SKILL.md"
-        text = skill.read_text()
+        entry = skill.read_text()
+        reference = "references/autopilot-publication.md"
+        self.assertIn(f"[{reference}]({reference})", entry)
+        self.assertIn("before preparation, business verification or the first final answer", entry)
+        self.assertIn("current session has admitted criteria for authorized execution", entry)
+        text = (skill.parent / reference).read_text()
         self.assertIn("autopilot_completion.py prepare", text)
         self.assertIn("autopilot_completion.py publish", text)
         self.assertIn("--reapprove-current-input", text)

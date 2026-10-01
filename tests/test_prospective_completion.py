@@ -93,7 +93,7 @@ class ProspectiveCompletionTest(unittest.TestCase):
         self.assertFalse(self.run_dir.exists())
         self.change_intent({"model_security_decision": {"decision": "allow", "input_event_id": "event-1",
             "reason": "Resolved", "risk_flags": []}})
-        self.run_dir.mkdir(); (self.run_dir / "OFF").write_text("")
+        self.run_dir.mkdir(parents=True); (self.run_dir / "OFF").write_text("")
         self.assertEqual(self.capture()["status"], "skipped")
         (self.run_dir / "OFF").unlink(); self.run_dir.rmdir()
         self.assertEqual(self.capture(dict(self.source, GHOST_ALICE_PLATFORM="agent-runtime"))["status"], "skipped")
@@ -387,6 +387,7 @@ class ProspectiveCompletionTest(unittest.TestCase):
             raw_user_input="Write the report", intent_delta={"current_goal": "Write and verify the requested report.",
                 "acceptance_criteria": self.read_state()["acceptance_criteria"]})
         self.source["GHOST_ALICE_PLATFORM"] = "claude"
+        self.run_dir = self.root / ".autopilot/sessions/claude/session-1"
         self.test_installed_codex_pretool_command_captures_before_single_verification()
 
 

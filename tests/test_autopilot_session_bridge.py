@@ -51,6 +51,20 @@ def update_criteria(path, criteria):
 
 
 
+def _adapter_fixture_environment(root: Path, intent_root: Path) -> dict[str, str]:
+    """Bind the subprocess to the fixture ledger rather than the host session."""
+    env = {
+        key: value for key, value in os.environ.items()
+        if (not key.startswith("GHOST_ALICE_") or key in
+            {"GHOST_ALICE_CORE_REPO", "GHOST_ALICE_CORE_ROOT"})
+        and key not in {"CODEX_THREAD_ID", "CLAUDE_PROJECT_DIR", "CLAUDE_SESSION_ID"}
+    }
+    env.update(HOME=str(root), GHOST_ALICE_PLATFORM="codex",
+               GHOST_ALICE_SESSION_ID="session-1",
+               GHOST_ALICE_SESSION_INTENT_ROOT=str(intent_root))
+    return env
+
+
 def _write_current_session_ledger(
     root: Path,
     *,
@@ -229,8 +243,7 @@ class AutopilotSessionBridgeTest(unittest.TestCase):
             )
             self.assertEqual(len(session_intent["recent_events"]), 2)
 
-            env = os.environ.copy()
-            env.pop("CODEX_THREAD_ID", None)
+            env = _adapter_fixture_environment(root, intent_root)
             env["GHOST_ALICE_AUTOPILOT_RUN_DIR"] = str(run_dir)
             adapter = subprocess.run(
                 [sys.executable, str(ADAPTER_SCRIPT)],
@@ -286,8 +299,7 @@ class AutopilotSessionBridgeTest(unittest.TestCase):
             self.assertTrue(aps_storage.exists(run_dir / "tasks.jsonl"))
             self.assertFalse(aps_storage.exists(run_dir / "conduct-plan.json"))
 
-            env = os.environ.copy()
-            env.pop("CODEX_THREAD_ID", None)
+            env = _adapter_fixture_environment(root, intent_root)
             env["GHOST_ALICE_AUTOPILOT_RUN_DIR"] = str(run_dir)
             adapter = subprocess.run(
                 [sys.executable, str(ADAPTER_SCRIPT)],
@@ -346,8 +358,7 @@ class AutopilotSessionBridgeTest(unittest.TestCase):
                 check=False,
             )
 
-            env = os.environ.copy()
-            env.pop("CODEX_THREAD_ID", None)
+            env = _adapter_fixture_environment(root, intent_root)
             env["GHOST_ALICE_AUTOPILOT_RUN_DIR"] = str(run_dir)
             adapter = subprocess.run(
                 [sys.executable, str(ADAPTER_SCRIPT)],

@@ -26,6 +26,20 @@ AUTOPILOT_SOURCE = REPO_ROOT
 VALID_SIGNAL_DIGEST = "sha256:" + ("b" * 64)
 
 
+def _fixture_environment(project: Path | None = None) -> dict[str, str]:
+    """Keep standalone fixture runs independent of the invoking agent session."""
+    env = {
+        key: value for key, value in os.environ.items()
+        if (not key.startswith("GHOST_ALICE_") or key in
+            {"GHOST_ALICE_CORE_REPO", "GHOST_ALICE_CORE_ROOT"})
+        and key not in {"CODEX_THREAD_ID", "CLAUDE_PROJECT_DIR", "CLAUDE_SESSION_ID"}
+    }
+    if project is not None:
+        env.update(PWD=str(project), HOME=str(project),
+                   GHOST_ALICE_AUTOPILOT_CWD=str(project))
+    return env
+
+
 def _candidate_core_repos() -> list[Path]:
     candidates: list[Path] = []
     env_core = os.environ.get("GHOST_ALICE_CORE_REPO")
@@ -238,7 +252,7 @@ class OfficialAutopilotAddonTest(unittest.TestCase):
                 / "adapters"
                 / "autopilot_mode.py"
             )
-            env = os.environ.copy()
+            env = _fixture_environment(run_dir.parent)
             env["GHOST_ALICE_AUTOPILOT_RUN_DIR"] = str(run_dir)
 
             result = subprocess.run(
@@ -270,7 +284,7 @@ class OfficialAutopilotAddonTest(unittest.TestCase):
                 / "adapters"
                 / "autopilot_mode.py"
             )
-            env = os.environ.copy()
+            env = _fixture_environment(run_dir.parent)
             env["GHOST_ALICE_AUTOPILOT_RUN_DIR"] = str(run_dir)
 
             result = subprocess.run(
@@ -301,7 +315,7 @@ class OfficialAutopilotAddonTest(unittest.TestCase):
                 / "adapters"
                 / "autopilot_mode.py"
             )
-            env = os.environ.copy()
+            env = _fixture_environment(run_dir.parent)
             env["GHOST_ALICE_AUTOPILOT_RUN_DIR"] = str(run_dir)
 
             result = subprocess.run(
@@ -392,7 +406,7 @@ class OfficialAutopilotAddonTest(unittest.TestCase):
                 text=True,
                 check=False,
             )
-            env = os.environ.copy()
+            env = _fixture_environment(run_dir.parent)
             env["GHOST_ALICE_AUTOPILOT_RUN_DIR"] = str(run_dir)
             adapter_result = subprocess.run(
                 [sys.executable, str(adapter_script)],
@@ -430,7 +444,7 @@ class OfficialAutopilotAddonTest(unittest.TestCase):
                 / "adapters"
                 / "autopilot_mode.py"
             )
-            env = os.environ.copy()
+            env = _fixture_environment(run_dir.parent)
             env["GHOST_ALICE_AUTOPILOT_RUN_DIR"] = str(run_dir)
 
             result = subprocess.run(
@@ -468,7 +482,7 @@ class OfficialAutopilotAddonTest(unittest.TestCase):
                 / "adapters"
                 / "autopilot_mode.py"
             )
-            env = os.environ.copy()
+            env = _fixture_environment()
             env.pop("GHOST_ALICE_AUTOPILOT_RUN_DIR", None)
 
             result = subprocess.run(
@@ -500,7 +514,7 @@ class OfficialAutopilotAddonTest(unittest.TestCase):
                 / "adapters"
                 / "autopilot_mode.py"
             )
-            env = os.environ.copy()
+            env = _fixture_environment()
             env.pop("GHOST_ALICE_AUTOPILOT_RUN_DIR", None)
             env.pop("GHOST_ALICE_AUTOPILOT_CWD", None)
             env["CLAUDE_PROJECT_DIR"] = str(project)
@@ -542,7 +556,7 @@ class OfficialAutopilotAddonTest(unittest.TestCase):
             )
             for platform, hook_cwd, claude_project_dir in cases:
                 with self.subTest(platform=platform):
-                    env = os.environ.copy()
+                    env = _fixture_environment()
                     for name in (
                         "GHOST_ALICE_AUTOPILOT_RUN_DIR",
                         "GHOST_ALICE_AUTOPILOT_CWD",
@@ -611,7 +625,7 @@ class OfficialAutopilotAddonTest(unittest.TestCase):
             run_dir = root / "run"
             _write_approved_run(run_dir, [_work_item("next")])
             script = installed_skill / "adapters" / "autopilot_mode.py"
-            env = os.environ.copy()
+            env = _fixture_environment(run_dir.parent)
             env.pop("PYTHONDONTWRITEBYTECODE", None)
             env["GHOST_ALICE_AUTOPILOT_RUN_DIR"] = str(run_dir)
 

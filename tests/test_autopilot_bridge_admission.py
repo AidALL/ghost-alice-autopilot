@@ -130,7 +130,7 @@ class BridgeAdmissionBoundaryTest(unittest.TestCase):
             result = self.invoke(root, check=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             target = json.loads(result.stdout)["automatic_target"]
-            self.assertEqual(Path(target["run_dir"]), (root / ".autopilot").resolve())
+            self.assertEqual(Path(target["run_dir"]), (root / ".autopilot/sessions/codex/session-1").resolve())
             created = self.invoke(root, extra=["--run-dir", target["run_dir"]])
             self.assertEqual(created.returncode, 0, created.stderr)
             source = {k: v for k, v in os.environ.items() if not k.startswith("GHOST_ALICE_") or k == "GHOST_ALICE_CORE_ROOT"}

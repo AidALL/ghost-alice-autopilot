@@ -3,7 +3,7 @@ name: autopilot-mode
 description: "Use when a Ghost-ALICE autonomous run has approved run state or current-session runtime material and verified work items must continue through the privileged adapter."
 compatibility:
   - "Python 3.11+ standard library"
-  - "Ghost-ALICE core installer 0.2.2+ and runtime with shared SQLite transaction APIs"
+  - "Ghost-ALICE core installer 0.4.0+ and runtime with shared SQLite transaction APIs"
   - "Claude Code or Codex hooks installed by the Ghost-ALICE core installer"
 ---
 
@@ -14,14 +14,14 @@ autopilot-mode is a Ghost-ALICE addon for approved autonomous continuation. The 
 ## Critical Rules
 
 - Installation is not runtime activation. Installing this addon only registers a privileged adapter hook. The adapter is a no-op until an approved run state exists.
-- Ghost-ALICE core must be 0.2.2 or newer. Older core installers may copy this skill without wiring the privileged adapter, runtime-core audit, ledger met-flip path, or schema-preserving hook renderer required by the current addon contract; that install is inert or incomplete and should be removed before upgrading.
+- Ghost-ALICE core must be 0.4.0 or newer and expose the shared SQLite transaction APIs required by this addon. Use the core installer to wire the privileged adapter, runtime-core audit, ledger met-flip path and schema-preserving hook renderer; copying the skill alone does not activate those services.
 - The adapter accepts no arguments. Any argv value is rejected with exit code 64.
-- The adapter reads project-local state from `<project>/.autopilot/` by default. `GHOST_ALICE_AUTOPILOT_RUN_DIR` is a strict run-directory override and `GHOST_ALICE_AUTOPILOT_CWD` is the next project-root override. The project-root override must be absolute; a relative value surfaces as a blocking adapter reason instead of being resolved against the process directory. Without either override, Claude hooks select the first non-empty absolute path from `CLAUDE_PROJECT_DIR` and hook-time `cwd`; Codex ignores an inherited `CLAUDE_PROJECT_DIR` and selects hook-time `cwd`. Both platforms then fall back to the absolute process working directory. Relative derived candidates are skipped, while an access failure after selection does not retry a lower-priority source. Only `PermissionError` during derived-directory creation or lock acquisition becomes the empty no-op payload; later state-processing exceptions and explicit run-directory errors still surface.
+- Pretool, completion preparation/publication and Stop share one target selector. An identified session defaults to `<project>/.autopilot/sessions/<platform>/<session-id>/`; reuse the project-level legacy run only when its platform, session and known authority root match the current context. Missing identity retains the legacy default. Never open a foreign authority database just to choose the path. `GHOST_ALICE_AUTOPILOT_RUN_DIR` is a strict run-directory override and `GHOST_ALICE_AUTOPILOT_CWD` is the next project-root override. The project-root override must be absolute; a relative value surfaces as a blocking adapter reason instead of being resolved against the process directory. Without either override, Claude hooks select the first non-empty absolute path from `CLAUDE_PROJECT_DIR` and hook-time `cwd`; Codex ignores an inherited `CLAUDE_PROJECT_DIR` and selects hook-time `cwd`. Both platforms then fall back to the absolute process working directory. Relative derived candidates are skipped, while an access failure after selection does not retry a lower-priority source. Only `PermissionError` or `errno.EROFS` during derived-directory creation, and `PermissionError` during storage acquisition, become the empty no-op payload; later state-processing exceptions and explicit run-directory errors still surface.
 - Runtime activation requires validated run state (legacy `approved-run.json` on first import, then SQLite authority) with `approved: true`, `status: "running"`, a positive `budget.remaining_steps`, non-empty `scope`, non-empty `allowed_surfaces`, non-empty `stop_conditions`, and non-empty `approval_evidence`.
 - `skill/scripts/autopilot_session_bridge.py` can bootstrap approved run state through the Core authoritative state/event APIs for Codex or Claude only when explicit approval evidence is supplied. In an installed skill, run it as `scripts/autopilot_session_bridge.py` from the skill root; in a source checkout, the repository wrapper at `scripts/autopilot_session_bridge.py` delegates to the skill-local bridge.
 - The Stop adapter can also materialize current-session `.autopilot/` state when authoritative Core state records admitted, not-yet-met acceptance criteria. That path records `approval_evidence.decision: "AUTO"` (`source: "admitted-unmet-criterion"`); io-trace material alone never bootstraps a run and is fed through the existing `autopilot-observation-signal.v1` receptor.
 - SQLite is the durable source of truth after import; `tasks.jsonl` is a legacy import or export shape. The ready queue is derived from task status and dependencies; `ready` and `reopened` items can be selected when dependencies are satisfied, and work items are never popped.
-- A pause file at `.autopilot/OFF` disables continuation without deleting state.
+- `<project>/.autopilot/OFF` pauses all default session runs before state inspection. `<selected-run-dir>/OFF` pauses only that run. Both controls preserve state and apply to pretool, preparation/publication and Stop, including explicit completion commands targeting a session subdirectory.
 - `autopilot_governance_signal.py` writes evidence-backed `consistency-decision.candidate.json` and `conduct-plan.candidate.json` files first. Candidate files are diagnostic and are not adapter-consumable.
 - Promotion creates adapter-consumable `consistency-decision.json`; the adapter requires `schema_version: "autopilot-consistency-decision.v1"`, `promotion_state: "promoted"`, `promotion_evidence.decision`, `promotion_evidence.source`, `candidate_id`, `governance_signal_digest`, `state_hash`, `decision_key`, and `loop_key`. `promotion_evidence.decision` accepts `go`, `approve`, `approved`, `promote`, `promoted`, or `direct`; use `direct` only for a current-turn before-stop resolution without a promotable candidate.
 - State-aware promotion resolves the target work-item status from `--run-dir` or the candidate file's parent run directory before writing an action. `continue_next` accepts `running`, `ready`, or `reopened`; all other decisions require `running`. A missing or incompatible target exits without creating `consistency-decision.json`, while the candidate remains diagnostic.
@@ -39,10 +39,12 @@ autopilot-mode is a Ghost-ALICE addon for approved autonomous continuation. The 
 
 ## Run Directory
 
+Use the checked `automatic_target.run_dir` or completion receipt `run_dir` for action inboxes and inspection; `.autopilot/` locators below describe the selected run directory. A strict explicit override selecting a foreign owner stays rejected: pretool reports `ownership-conflict` without issuing an impossible prepare command. Correct that override within the authorized scope; do not replace the foreign approval.
+
 Run-directory inputs and locators (state JSON/JSONL files become legacy inputs after migration):
 
 ```text
-<project>/.autopilot/
+<project>/.autopilot/sessions/<platform>/<session-id>/
   authority.json
   ghost-state.sqlite3  # standalone runs; bound runs share the Core database
   approved-run.json
@@ -95,7 +97,7 @@ python3 scripts/autopilot_session_bridge.py \
   --platform codex \
   --session-id <current-session-id> \
   --input-event-id <checked-event-id> \
-  --run-dir .autopilot \
+  --run-dir <checked-run-dir> \
   --current-work-item-id current \
   --plan-path .tmp/implementation-plans/current.md \
   --approval-evidence-json '{"decision":"GO","source":"user-confirmation"}'
@@ -187,9 +189,9 @@ Repository `compatibility-matrix.json` is the compatibility SSOT for this addon.
 ## Operating It
 
 - Start: create `.autopilot/approved-run.json` and `.autopilot/tasks.jsonl` after the user explicitly approves the autonomous run, or let the Stop adapter materialize current-session state when session intent records admitted, unmet acceptance criteria (io-trace alone never bootstraps a run). If the approved work comes from conduct feedback, create `conduct-plan.candidate.json` first, then use promotion to place the approved `conduct-plan.json` in the same run directory; the adapter creates authoritative tasks when it imports the plan.
-- Pause: create `.autopilot/OFF`.
-- Resume: remove `.autopilot/OFF`.
-- Stop: create `.autopilot/OFF` for immediate stop, then set the authoritative run status to `stopped` through the storage API inside its transaction. Deleting or editing a legacy `approved-run.json` does not stop a migrated run.
+- Pause: create `<selected-run-dir>/OFF` for this run or `<project>/.autopilot/OFF` for every default session run.
+- Resume: remove the corresponding `OFF`; a remaining project pause still takes precedence.
+- Stop: create `<selected-run-dir>/OFF` for immediate stop, then set the authoritative run status to `stopped` through the storage API inside its transaction. Deleting or editing a legacy `approved-run.json` does not stop a migrated run.
 - Replan: preserve terminal work items and update open work through the validated bridge or adapter work-item APIs inside the authority transaction. Do not overwrite legacy `tasks.jsonl` or write SQL directly.
 
 For inspection, import `autopilot_storage` from the installed `adapters` directory and call `read(run_dir / "approved-run.json")`, `read(run_dir / "tasks.jsonl")` or `read(run_dir / "events.jsonl")`. These are API locators, not instructions to open the files. Check `storage.pending(path)` for action inboxes: a physically retained file may already be consumed. After-commit archiving copies the consumed snapshot and never removes a producer-owned inbox, so a concurrently published newer action remains available. To stop after an explicit user instruction, run the following from that adapters directory:

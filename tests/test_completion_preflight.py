@@ -115,7 +115,7 @@ class CompletionPreflightTest(unittest.TestCase):
         self.assertEqual(self.hook(), {"continue": True})
         self.change_intent({"model_security_decision": {"decision": "allow", "input_event_id": "event-1",
             "reason": "Resolved", "risk_flags": []}})
-        self.run_dir.mkdir(); (self.run_dir / "OFF").write_text("")
+        self.run_dir.mkdir(parents=True); (self.run_dir / "OFF").write_text("")
         self.assertEqual(self.hook(), {"continue": True})
         (self.run_dir / "OFF").unlink(); self.run_dir.rmdir()
         self.assertEqual(self.hook(env=self.environment(GHOST_ALICE_PLATFORM="agent-runtime")), {"continue": True})
@@ -418,6 +418,7 @@ class CompletionPreflightTest(unittest.TestCase):
                 raw_user_input="Write the report", intent_delta={"current_goal": "Write and verify the requested report.",
                     "acceptance_criteria": self.read_state()["acceptance_criteria"]})
             self.source["GHOST_ALICE_PLATFORM"] = platform
+            self.run_dir = self.root / ".autopilot/sessions/claude/session-1"
         sys.path.insert(0, str(Path(self.source["GHOST_ALICE_CORE_ROOT"]) / "_shared"))
         import install_hooks
         home = self.root / "installed home"; (home / ".codex").mkdir(parents=True); (home / ".claude").mkdir()

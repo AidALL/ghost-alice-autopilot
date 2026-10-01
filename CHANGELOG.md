@@ -8,6 +8,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 Use this section for changes that have landed after the latest tagged public release.
 
+## [0.4.1] - 2026-10-01
+
+### Changed
+
+- Coordinate Core and Autopilot 0.4.1 while retaining the addon's Core 0.4.0 technical minimum.
+- Select execution state by the exact current session; preserve explicit run selection and foreign-session state.
+- Share validated run selection across bootstrap, runtime provenance and completion publication.
+
+### Fixed
+
+- Avoid refusal caused by an unrelated session's approved run and keep completion bound to the current session.
+- Handle unwritable derived working directories and read-only filesystems without changing explicit authority requirements.
+
+### Documentation
+
+- Synchronize paired polite English/Korean guidance, current SQLite authority and session-run documentation, and complete release notes for the 0.4.1 pair; preserve historical release facts.
+
+### Verification Scope
+
+- Selected independent gpt-6.1-sol Codex cases cover observed completion reporting, approved-work continuation and scoped execution. Claude guidance installation was checked without fresh Claude model inference. Each case supports its own evidence scope.
+- See the [current release notes](docs/release/2026-10-01-release-notes.md#verification-scope); these observations do not establish universal reliability, causal improvement or quantified token savings.
+
 ## [0.4.0] - 2026-09-28
 
 ### Changed

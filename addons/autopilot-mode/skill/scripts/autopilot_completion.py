@@ -177,7 +177,7 @@ def prepare_completion(*, intent_root: Path, platform: str, session_id: str,
                                             require_input=True, expected_input_event_id=input_event_id)
     target = adapter.resolve_run_target(current)
     root = Path(target["run_dir"]).expanduser().resolve()
-    if (root / adapter.OFF_FILE).exists():
+    if adapter.run_is_paused(root):
         raise ValueError("Autopilot is OFF; completion publication was not prepared")
     plan = str(current.get("GHOST_ALICE_AUTOPILOT_PLAN_PATH") or
                adapter._project_cwd_from_env(current) / ".tmp/implementation-plans/autopilot-session-intent.md")
@@ -406,7 +406,7 @@ def publish_completion(*, receipt_token: str, completion_check: str, verified_at
     root = Path(adapter.resolve_run_target(current)["run_dir"]).expanduser().resolve()
     if not receipt_token or not adapter._run_state_available(root):
         raise ValueError("missing prepared completion receipt; do not relabel earlier proof")
-    if (root / adapter.OFF_FILE).exists():
+    if adapter.run_is_paused(root):
         raise ValueError("Autopilot is OFF; completion publication was not queued")
     with storage.transaction(root, current) as store:
         try:
