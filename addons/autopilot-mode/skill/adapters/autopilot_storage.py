@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from contextvars import ContextVar
+import errno
 import hashlib
 import json
 import os
@@ -509,8 +510,8 @@ def accessible_transaction(run_dir, source=None, *, authority=None, permission_d
     try:
         manager = transaction(run_dir, source, authority=authority)
         store = manager.__enter__()
-    except PermissionError:
-        if not permission_denied_noop:
+    except OSError as exc:
+        if not permission_denied_noop or not (isinstance(exc, PermissionError) or exc.errno == errno.EROFS):
             raise
         yield None
         return
