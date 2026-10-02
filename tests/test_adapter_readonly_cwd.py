@@ -26,6 +26,7 @@ sys.path.insert(0, str(ADAPTER_DIR))
 
 import autopilot_mode as apm  # noqa: E402
 import autopilot_state as aps  # noqa: E402
+import autopilot_storage as storage  # noqa: E402
 
 
 class ReadOnlyCwdFallbackTest(unittest.TestCase):
@@ -98,6 +99,37 @@ class ReadOnlyCwdFallbackTest(unittest.TestCase):
         self.assertNotIn("Read-only file system", result.stderr)
         payload = json.loads(result.stdout)
         self.assertNotIn("adapter error", payload.get("systemMessage", ""))
+
+
+    def test_derived_acquisition_erofs_is_noop(self):
+        with mock.patch.object(storage, "transaction") as transaction:
+            transaction.return_value.__enter__.side_effect = OSError(errno.EROFS, "read-only")
+            with storage.accessible_transaction("unused", {}, permission_denied_noop=True) as store:
+                self.assertIsNone(store)
+
+    def test_explicit_acquisition_erofs_remains_error(self):
+        with mock.patch.object(storage, "transaction") as transaction:
+            transaction.return_value.__enter__.side_effect = OSError(errno.EROFS, "read-only")
+            with self.assertRaises(OSError) as caught:
+                with storage.accessible_transaction("unused", {}):
+                    self.fail("explicit target must not enter")
+            self.assertEqual(caught.exception.errno, errno.EROFS)
+
+    def test_unexpected_acquisition_error_remains_error(self):
+        with mock.patch.object(storage, "transaction") as transaction:
+            transaction.return_value.__enter__.side_effect = OSError(errno.EIO, "device error")
+            with self.assertRaises(OSError) as caught:
+                with storage.accessible_transaction("unused", {}, permission_denied_noop=True):
+                    self.fail("unexpected error must not enter")
+            self.assertEqual(caught.exception.errno, errno.EIO)
+
+    def test_processing_erofs_remains_error(self):
+        with mock.patch.object(storage, "transaction") as transaction:
+            transaction.return_value.__exit__.return_value = False
+            with self.assertRaises(OSError) as caught:
+                with storage.accessible_transaction("unused", {}, permission_denied_noop=True):
+                    raise OSError(errno.EROFS, "processing error")
+            self.assertEqual(caught.exception.errno, errno.EROFS)
 
 
 if __name__ == "__main__":
