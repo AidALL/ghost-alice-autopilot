@@ -8,10 +8,8 @@ from __future__ import annotations
 
 import copy
 import hashlib
-import importlib.util
 from pathlib import Path
 import sqlite3
-import sys
 from typing import Any, Mapping
 
 
@@ -21,16 +19,10 @@ SEMANTIC_DELTA_STARVATION_THRESHOLD = 3
 
 def _core_native_assessor(core):
     """Load Core's authority boundary, without assembling Core policy inputs."""
-    shared = Path(core.__file__).resolve().parents[2] / "_shared"
-    spec = importlib.util.spec_from_file_location("ap_core_native_completion", shared / "native_completion.py")
-    if spec is None or spec.loader is None:
+    from autopilot_work_items import _load_core_shared_module
+    module = _load_core_shared_module(core, "native_completion.py", "ap_core_native_completion")
+    if module is None:
         raise ImportError("Core native completion assessment unavailable")
-    sys.path.insert(0, str(shared))
-    try:
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-    finally:
-        sys.path.remove(str(shared))
     return module.assess_native_completion
 
 

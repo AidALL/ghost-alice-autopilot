@@ -52,6 +52,37 @@ from response_route_fixture import native_ledger, register_route
 
 
 class BridgeAdmissionBoundaryTest(unittest.TestCase):
+    def test_native_provider_uses_one_installed_runtime_without_source_fallback(self):
+        from autopilot_intent_recovery import _core_native_assessor
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source_root, runtime_root = root / "source", root / "runtime"
+            for provider, identity in ((source_root, "source"), (runtime_root, "installed")):
+                ledger = provider / "session-intent-analyzer/scripts/session_intent_ledger.py"
+                ledger.parent.mkdir(parents=True)
+                ledger.write_text(f"identity = {identity!r}\n")
+                shared = provider / "_shared"
+                shared.mkdir()
+                (shared / "completion_check_validator.py").write_text(f"identity = {identity!r}\n")
+                (shared / "native_completion.py").write_text(
+                    f"def assess_native_completion(*args, **kwargs): return {identity!r}\n")
+            source = {"GHOST_ALICE_CORE_ROOT": str(source_root),
+                      "GHOST_ALICE_RUNTIME_SHARED_DIR": str(runtime_root / "_shared")}
+            locator = root / "ledger/codex/fixture/intent-state.json"
+            ledger = work_items._load_core_ledger_module(locator, source)
+            self.assertEqual(ledger.identity, "installed")
+            self.assertEqual(_core_native_assessor(ledger)(), "installed")
+            with work_items._bind_core_policy_source(source):
+                parser = work_items._load_core_policy_module("completion_check_validator.py", "fixture_parser")
+                self.assertEqual(parser.identity, "installed")
+            (runtime_root / "session-intent-analyzer/scripts/session_intent_ledger.py").unlink()
+            self.assertIsNone(work_items._load_core_ledger_module(locator, source))
+            with work_items._bind_core_policy_source(source):
+                self.assertIsNone(work_items._load_core_policy_module("completion_check_validator.py", "fixture_parser"))
+            source.pop("GHOST_ALICE_RUNTIME_SHARED_DIR")
+            self.assertEqual(work_items._load_core_ledger_module(locator, source).identity, "source")
+
     def invoke(self, root, *, extra=(), check=False, session="session-1", env=None, input_token="event-1"):
         source = dict(os.environ)
         for key in list(source):

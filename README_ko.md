@@ -8,7 +8,7 @@
 
 언어: [English](./README.md) | 한국어
 
-Ghost-ALICE Autopilot 0.5.0에는 현재 response-route·completion·공유 SQLite API를 제공하는 Ghost-ALICE Core 0.5.0 이상과 Python 3.11+가 필요합니다. 설치만으로 실행 권한이 생기지는 않습니다.
+Ghost-ALICE Autopilot 0.5.1에는 현재 response-route·completion·공유 SQLite API를 제공하는 Ghost-ALICE Core 0.5.1 이상과 Python 3.11+가 필요합니다. 설치만으로 실행 권한이 생기지는 않습니다.
 
 ## 역할
 
@@ -45,7 +45,7 @@ flowchart TD
   C -->|두 검토 단계 모두 supported인 경우 정확한 response_text| R[응답 모델이 검토된 답변을 native host에 제출합니다]
   C -->|unsupported 또는 unavailable 결과에는 response_text 없음| N
   R -->|제출 답변과 현재 hook receipt| K[Native host가 완료 guard와 Ghost-ALICE Autopilot Stop 훅을 각각 호출합니다]
-  K -->|답변과 receipt를 담은 완료 guard 호출| G[Ghost-ALICE Core 완료 guard가 제출 답변을 저장된 검토와 연결하여 인증합니다]
+  K -->|답변과 receipt를 담은 완료 guard 호출| G[설치된 Ghost-ALICE Core 완료 guard가 제출 답변을 저장된 검토와 연결하여 인증합니다]
   K -->|답변과 receipt를 담은 Ghost-ALICE Autopilot Stop 호출| B[Ghost-ALICE Autopilot apply_completion_v2가 Core가 선택한 완료 근거만 접수하고<br/>인증된 publication을 적용하거나 재사용합니다]
   C -->|저장된 검토와 정확한 근거 바인딩| G
   C -->|동일한 저장 검토와 정확한 근거 바인딩| B
@@ -84,6 +84,8 @@ bash install.sh --platform codex --addon autopilot
 Ghost-ALICE Core 설치 프로그램은 Ghost-ALICE Autopilot adapter를 등록하고 source/hash 바인딩을 확인하며 훅을 설치합니다. Ghost-ALICE Autopilot에는 독립 설치 프로그램이 없습니다. 플랫폼 설정은 [Ghost-ALICE Core 설치 안내](https://github.com/AidALL/ghost-alice/blob/main/docs/getting-started/installation.md)를 참고해 주세요.
 
 운영자는 bash `<ghost-alice>/install.sh` --platform codex --uninstall --addon autopilot-mode로 애드온을 제거합니다. Claude에는 --platform claude를 사용합니다. Ghost-ALICE Core 전체 제거 명령은 bash `<ghost-alice>/install.sh` --uninstall입니다.
+
+설치된 어댑터는 `GHOST_ALICE_RUNTIME_SHARED_DIR`로 지정한 Core 설치본을 사용하며, 그 설치본의 원장과 공유 정책 모듈을 함께 불러옵니다. `GHOST_ALICE_CORE_ROOT`는 소스 위치를 유지하지만 지정한 런타임을 대체하지 않습니다. 지정한 설치본을 사용할 수 없으면 소스로 대체하지 않고 사용 불가로 반환합니다. 런타임을 지정하지 않은 명시적 소스 CLI 실행은 선택한 소스 공급자를 사용합니다.
 
 ## 완료 기록과 응답 전달
 

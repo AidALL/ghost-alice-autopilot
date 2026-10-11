@@ -86,10 +86,10 @@ class CompatibilitySurfaceTest(unittest.TestCase):
         )
 
     def test_addon_manifest_core_floor_matches_public_contract(self) -> None:
-        self.assertEqual(_addon_manifest()["min_core_version"], "0.5.0")
+        self.assertEqual(_addon_manifest()["min_core_version"], "0.5.1")
         entry = _top_level_addons_manifest()["addons"][0]
         self.assertEqual(entry["id"], "autopilot-mode")
-        self.assertEqual(entry["min_core_version"], "0.5.0")
+        self.assertEqual(entry["min_core_version"], "0.5.1")
 
     def test_compatibility_matrix_enumerates_required_targets(self) -> None:
         matrix = _compatibility_matrix()
@@ -174,13 +174,13 @@ class CompatibilitySurfaceTest(unittest.TestCase):
         for rel in ("README.md", "README_ko.md"):
             text = (REPO_ROOT / rel).read_text(encoding="utf-8")
             with self.subTest(rel=rel):
-                self.assertIn("Ghost-ALICE Core 0.5.0", text)
+                self.assertIn("Ghost-ALICE Core 0.5.1", text)
                 self.assertIn("SQLite", text)
                 self.assertIn("Claude", text)
                 self.assertIn("--platform codex", text)
                 self.assertIn("The Ghost-ALICE Core installer registers Ghost-ALICE Autopilot adapters" if rel == "README.md" else "Ghost-ALICE Core 설치 프로그램은 Ghost-ALICE Autopilot adapter를 등록", text)
         skill = (REPO_ROOT / "addons/autopilot-mode/skill/SKILL.md").read_text(encoding="utf-8")
-        self.assertIn("Ghost-ALICE Core 0.5.0+", skill)
+        self.assertIn("Ghost-ALICE Core 0.5.1+", skill)
         self.assertIn("shared SQLite APIs", skill)
 
     def test_public_docs_do_not_describe_io_trace_as_bootstrap_condition(self) -> None:

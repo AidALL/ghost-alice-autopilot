@@ -8,7 +8,7 @@ Official Ghost-ALICE addon for completion recording and approved task continuati
 
 Language: English | [Korean](./README_ko.md)
 
-Ghost-ALICE Autopilot 0.5.0 requires Ghost-ALICE Core 0.5.0+ with the current response-route, completion and shared SQLite APIs, plus Python 3.11+. Installation grants no execution authority.
+Ghost-ALICE Autopilot 0.5.1 requires Ghost-ALICE Core 0.5.1+ with the current response-route, completion and shared SQLite APIs, plus Python 3.11+. Installation grants no execution authority.
 
 ## Responsibilities
 
@@ -45,7 +45,7 @@ flowchart TD
   C -->|Both review stages supported: exact response_text| R[Responding model submits the reviewed answer to the native host]
   C -->|Unsupported or unavailable outcome: no response_text| N
   R -->|Submitted answer and current hook receipt| K[Native host invokes the registered completion guard and Ghost-ALICE Autopilot Stop hook independently]
-  K -->|Completion-guard invocation with answer and receipt| G[Ghost-ALICE Core completion guard authenticates the submitted answer against stored review]
+  K -->|Completion-guard invocation with answer and receipt| G[The installed Ghost-ALICE Core completion guard authenticates the submitted answer against stored review]
   K -->|Ghost-ALICE Autopilot Stop invocation with answer and receipt| B[Ghost-ALICE Autopilot apply_completion_v2 publishes only Core-selected completion proof<br/>and applies or reuses authenticated publications]
   C -->|Stored review and exact evidence bindings| G
   C -->|The same stored review and exact evidence bindings| B
@@ -84,6 +84,8 @@ The operator selects Claude with --platform claude. For a development checkout, 
 The Ghost-ALICE Core installer registers Ghost-ALICE Autopilot adapters, checks their source/hash bindings and installs hooks; Ghost-ALICE Autopilot has no standalone installer. The [Ghost-ALICE Core installation guide](https://github.com/AidALL/ghost-alice/blob/main/docs/getting-started/installation.md) describes platform setup.
 
 The operator removes the addon with bash `<ghost-alice>/install.sh` --platform codex --uninstall --addon autopilot-mode, substituting --platform claude for Claude. Full Ghost-ALICE Core removal uses bash `<ghost-alice>/install.sh` --uninstall.
+
+The installed adapters use the Core deployment selected by `GHOST_ALICE_RUNTIME_SHARED_DIR`. They load its sibling ledger and shared policy modules together. `GHOST_ALICE_CORE_ROOT` retains the source coordinate; it does not override the selected runtime. An unavailable selected deployment remains unavailable, without source fallback. Explicit source CLI execution uses its selected source provider when no runtime is bound.
 
 ## Completion recording and delivery
 

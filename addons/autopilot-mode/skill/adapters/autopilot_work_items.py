@@ -15,6 +15,7 @@ import inspect
 import json
 import os
 import re
+import sys
 import tempfile
 from pathlib import Path
 from typing import Any, Iterable, Mapping
@@ -91,21 +92,11 @@ def _with_core_policy_source(function):
     return bound
 
 
-def _load_core_policy_module(filename: str, module_name: str):
-    """Resolve a Core policy module through the existing managed Core lookup."""
-    source = _CORE_POLICY_SOURCE.get()
-    if source is not None:
-        # Match Core native_completion's explicit module authority. A bound
-        # call must never substitute the process environment or discover a
-        # different Core installation when its selected source is unavailable.
-        root = source.get('GHOST_ALICE_CORE_ROOT') or source.get('GHOST_ALICE_SKILLS_DIR')
-        if not isinstance(root, str) or not Path(root).is_absolute():
-            return None
-        source = dict(source, GHOST_ALICE_CORE_ROOT=root)
-    core = _load_core_ledger_module(Path(__file__), source)
-    if core is None:
-        return None
-    path = Path(core.__file__).resolve().parents[2] / '_shared' / filename
+def _load_core_shared_module(core, filename: str, module_name: str):
+    """Load policy and its imports from the selected ledger's installation."""
+    shared = str(Path(core.__file__).resolve().parents[2] / '_shared')
+    path = Path(shared) / filename
+    sys.path.insert(0, shared)
     try:
         spec = importlib.util.spec_from_file_location(module_name, path)
         if spec is None or spec.loader is None:
@@ -115,6 +106,20 @@ def _load_core_policy_module(filename: str, module_name: str):
         return module
     except (OSError, ImportError):
         return None
+    finally:
+        sys.path.remove(shared)
+
+
+def _load_core_policy_module(filename: str, module_name: str):
+    """Resolve Core policy through the same provider as the selected ledger."""
+    source = _CORE_POLICY_SOURCE.get()
+    if source is not None and 'GHOST_ALICE_RUNTIME_SHARED_DIR' not in source:
+        root = source.get('GHOST_ALICE_CORE_ROOT') or source.get('GHOST_ALICE_SKILLS_DIR')
+        if not isinstance(root, str) or not Path(root).is_absolute():
+            return None
+        source = dict(source, GHOST_ALICE_CORE_ROOT=root)
+    core = _load_core_ledger_module(Path(__file__), source)
+    return _load_core_shared_module(core, filename, module_name) if core is not None else None
 
 
 def _parse_completion_evidence(evidence_text: str, *, allow_partial: bool = False) -> dict[str, Any]:
@@ -362,16 +367,21 @@ def apply_consistency_decision(
 def _load_core_ledger_module(state_path: Path, source: Mapping[str, str] | None = None):
     """Resolve the Core ledger provider from the selected source.
 
-    An explicit source or inherited environment root selects one provider.
-    Discovery applies only when neither is supplied. Return None when the
-    selected source is unavailable so callers report that gap.
+    A native runtime selects its installed ledger. Without a runtime, an explicit
+    source or inherited environment root selects the provider. Discovery applies
+    only when neither is supplied; an unavailable selection is not replaced.
     """
     candidates: list[Path] = []
     if source is None:
         source = os.environ
+    runtime = source.get("GHOST_ALICE_RUNTIME_SHARED_DIR")
     selected = str(source.get("GHOST_ALICE_CORE_ROOT") or os.environ.get("GHOST_ALICE_CORE_ROOT") or "")
     explicit = selected.strip()
-    if selected:
+    if "GHOST_ALICE_RUNTIME_SHARED_DIR" in source:
+        if not isinstance(runtime, str) or not Path(runtime).is_absolute() or not Path(runtime).is_dir():
+            return None
+        candidates.append(Path(runtime).parent / "session-intent-analyzer/scripts/session_intent_ledger.py")
+    elif selected:
         if not explicit or not Path(explicit).is_absolute():
             return None
         candidates.append(Path(explicit) / "session-intent-analyzer" / "scripts" / "session_intent_ledger.py")

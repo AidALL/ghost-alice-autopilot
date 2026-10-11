@@ -61,12 +61,7 @@ def _repeated_notice(captured, source, hook_input):
         if not core_root or not intent_root or not Path(core_root).is_absolute() or not Path(intent_root).is_absolute():
             return False
         with _bind_core_policy_source(current):
-            shared = str(Path(core_root)/'_shared')
-            sys.path.insert(0, shared)
-            try:
-                cache = _load_core_policy_module('session_check_cache.py', 'ap_core_notice_cache')
-            finally:
-                sys.path.remove(shared)
+            cache = _load_core_policy_module('session_check_cache.py', 'ap_core_notice_cache')
         if cache is None:
             return False
         material = _helper().adapter.read_session_material(Path(intent_root), current['GHOST_ALICE_PLATFORM'],

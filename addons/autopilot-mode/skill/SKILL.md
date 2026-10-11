@@ -3,7 +3,7 @@ name: autopilot-mode
 description: "Use when approved Ghost-ALICE run state or current-session runtime material requires completion recording or continuation of authorized work."
 compatibility:
   - "Python 3.11+ standard library"
-  - "Ghost-ALICE Core 0.5.0+ with response-route, completion and shared SQLite APIs"
+  - "Ghost-ALICE Core 0.5.1+ with response-route, completion and shared SQLite APIs"
   - "Claude Code or Codex hooks registered by the Ghost-ALICE Core installer"
 ---
 
