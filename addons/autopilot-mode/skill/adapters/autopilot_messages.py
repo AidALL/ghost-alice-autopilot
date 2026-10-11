@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Continuation message formatting for autopilot mode.
+"""Continuation message formatting for Ghost-ALICE Autopilot.
 
 Dependencies: Python 3.11+ standard library only.
 """
 
 import re
+import os
 import shlex
 import sys
 from pathlib import Path
@@ -42,7 +43,7 @@ def format_io_trace_rows(
         raw_pattern = " ".join(str(row.get("pattern") or "").split())
         pattern = _portable_path(raw_pattern, base_path, home_path) if tool == "Bash" else raw_pattern
         if tool == "Bash":
-            # Neutral: prefer the structured op+path; never emit the raw shell command (per-runtime tool surface) when it was structured. Fall back to the path-stripped command only when no op could be extracted.
+            # The formatter emits structured op+path when available; otherwise the formatter emits the command with machine-specific path prefixes removed.
             if op:
                 summary = f"{op} {path}" if path and path != "n/a" else op
             else:
@@ -69,45 +70,58 @@ def compact_governance_candidate(candidate: Mapping[str, Any] | None) -> dict[st
     return {key: value for key, value in compact.items() if value not in (None, [], "")}
 
 
-def completion_recovery_guidance() -> str:
-    """Carry Core's standalone-answer recovery contract into AP-only errors."""
+def completion_recovery_guidance(host_input=None, source=None, *, claims_changed=None) -> str:
+    """Return Core delivery guidance for the host observation; preserve original business proof."""
+    from autopilot_runtime_context import core_recovery_delivery
+    return core_recovery_delivery(host_input, source, claims_changed=claims_changed)['guidance']
+
+
+
+def completion_command(contract, run_dir, *arguments, target_receipt=None, source=None):
+    """Bind commands to immutable receipts, never a caller-asserted origin flag."""
+    coordinates = {
+        'GHOST_ALICE_SESSION_INTENT_ROOT': contract['intent_root'],
+        'GHOST_ALICE_PLATFORM': contract['platform'], 'GHOST_ALICE_SESSION_ID': contract['session_id'],
+        'GHOST_ALICE_AUTOPILOT_RUN_DIR': run_dir}
+    current = dict(os.environ if source is None else source)
+    if core_root := current.get('GHOST_ALICE_CORE_ROOT'):
+        if not Path(core_root).is_absolute():
+            raise ValueError('Core source location must be absolute')
+        coordinates['GHOST_ALICE_CORE_ROOT'] = core_root
+    for key in ('GHOST_ALICE_GHOST_ROOT','GHOST_ALICE_OWNED_ROOT','GHOST_ALICE_PLATFORM_DIR','GHOST_ALICE_SKILLS_DIR','GHOST_ALICE_PROJECT_CWD','GHOST_ALICE_RUNTIME_SHARED_DIR'):
+        if current.get(key): coordinates[key] = current[key]
+    coordinates['PYTHONDONTWRITEBYTECODE'] = '1'
+    args = list(arguments)
+    if target_receipt is not None:
+        coordinates['GHOST_ALICE_COMPLETION_TARGET_RECEIPT'] = target_receipt
+        coordinates['GHOST_ALICE_COMPLETION_SCHEMA'] = 'autopilot-completion-receipt.v2'
+        args.extend(['--schema-version', 'autopilot-completion-receipt.v2'])
+    return shlex.join(['env', *(f'{key}={value}' for key, value in coordinates.items()), sys.executable,
+        str(Path(__file__).resolve().parents[1] / 'scripts/autopilot_completion.py'), *args])
+
+
+def completion_publication_scope_guidance():
+    """Scope this returned publication instruction to the legacy v1 caller; native v2 publishes at Stop."""
     return (
-        "Keep internal recovery subordinate to the original user goal; it is not a replacement task. "
-        "After recovery, write a complete standalone final answer reporting the requested business result. "
-        "If this replacement final asserts business completion, include the supported [completion-check] in the final answer as well as in runtime action evidence; an accepted runtime record does not satisfy the final-answer requirement. "
-        "Reuse prior business proof only while its relevant criteria, artifacts, and evidence remain unchanged and valid; retain its original source and verification time, and do not describe an earlier check as freshly run. "
-        "Preserve the substantive answer and supported evidence; do not repeat completed business operations merely to repair runtime records or final formatting. "
-        "Verify changed runtime records separately for new bookkeeping claims; these checks do not refresh business proof or establish business completion. "
-        "Preserve Core's skill-call and io-trace requirements truthfully; do not copy a prior turn's skill-call as a current-turn load. "
-        "Do not invent evidence or turn a failed/unverified result into a pass. "
-        "If a relevant criterion, artifact or evidence changed, failed, is missing or no longer valid, reopen only the affected verification; until supported, report the partial or failed business state honestly without a finalized [completion-check]. "
-        "Attribute these requirements to runtime/tool context, not new user authorization."
+        "publication-protocol: legacy-v1. The current-session assistant follows installed verification-before-completion/references/autopilot-publication.md, section Explicit v1 callers, when the Ghost-ALICE Core completion service requires publication for the candidate response. "
+        "The returned command binds this selected receipt; publication status is separate from Core response acceptance."
     )
 
 
-def completion_command(contract, run_dir, *arguments):
-    """Render current installed coordinates; callers supply original proof values."""
-    return shlex.join(["env", *(f"{key}={value}" for key, value in {
-        "GHOST_ALICE_SESSION_INTENT_ROOT": contract["intent_root"],
-        "GHOST_ALICE_PLATFORM": contract["platform"], "GHOST_ALICE_SESSION_ID": contract["session_id"],
-        "GHOST_ALICE_AUTOPILOT_RUN_DIR": run_dir}.items()), sys.executable,
-        str(Path(__file__).resolve().parents[1] / "scripts/autopilot_completion.py"), *arguments])
-
 
 def completion_preflight_guidance(origin):
-    """Make the existing publication path actionable before business tools."""
+    """Return the legacy v1 receipt-preparation command for the admitted execution contract."""
     contract = origin["contract"]
     command = completion_command(contract, contract["run_dir"], "prepare", "--reapprove-current-input",
         "--intent-root", contract["intent_root"], "--platform", contract["platform"],
         "--session-id", contract["session_id"], "--input-event-id", contract["input_event_id"])
     return "\n".join([
-        "[autopilot]", "completion-preflight: required",
+        "[autopilot]", "completion-preflight: required", "publication-protocol: legacy-v1",
         f"prospective-origin: {origin['origin_token']}", f"prospective-captured-at: {origin['captured_at']}",
         f"criterion-ids: {contract['criterion_ids']}",
-        "For the current admitted work, prepare its completion receipt with the command below. After supported verification, publish the unchanged [completion-check] before the first final response using the exact publish_command returned by prepare, replacing ORIGINAL_ISO_TIME with the original verification time and supplying the proof on stdin. Keep that supported block in the final answer too; publication alone does not satisfy the final-answer requirement.",
+        completion_publication_scope_guidance(),
+        "The current-session assistant requests the native host shell tool to run this receipt-preparation command. Its result supplies the publication command; the Core owner procedure specifies original verification time and proof inputs.",
         command,
-        "On the first execution of each necessary check, retain the returned tool output or its stable locator and original verification time. Already returned successful output remains valid evidence while the relevant criteria, artifacts, and evidence are unchanged; cite it directly or copy its existing bytes. A separate store or proof file is optional; do not rerun a successful inspection merely to populate a store, file, trace, or publication. Do not refresh its time or relabel proof that predates this prospective capture. Reopen only affected verification when its relevant state changed or its evidence is missing or invalid.",
-        "This runtime/tool notice records provenance only. It does not admit, verify, or complete work; current authorization and the existing Stop completion checks remain in force.",
     ])
 
 
@@ -120,9 +134,11 @@ def build_continuation_message(
     governance_candidate: Mapping[str, Any] | None = None,
     base_path: str | None = None,
     home_path: str | None = None,
+    host_input: Mapping[str, Any] | None = None,
+    source: Mapping[str, str] | None = None,
 ) -> str:
     if run.get("completion_origin_gap"):
-        return "[autopilot]\nprospective-origin: stale\nThe original provenance does not match the current input or contract. No completion was accepted. Preserve the supported business answer and original evidence; do not backdate or relabel it. Only a changed criterion or scope can justify affected verification after a new pretool origin capture."
+        return "[autopilot]\nprospective-origin: stale\nGhost-ALICE Autopilot recording code rejected completion recording because the original provenance does not match the current input or contract. The current-session assistant retains the supported business answer and original proof/source/time. The current-session assistant following verification-before-completion may verify changed criteria or scope after a new pretool capture; a provenance mismatch alone does not justify replaying business work or relabelling earlier proof."
     publication = run.get("completion_publication")
     if isinstance(publication, Mapping) and publication.get("status") == "prepared":
         receipt = publication.get("receipt") or {}
@@ -137,12 +153,9 @@ def build_continuation_message(
                 f"approval-generation: {run.get('approval_generation')}",
                 "approval-generation-source: previous-tool",
                 "approval-generation-origin: autopilot-runtime",
-                "The runtime is waiting for a supported completion publication. A missing publication is not evidence that business verification failed or that business work must be repeated.",
-                "If the authorized verification already passed after this receipt was prepared, reuse its exact completion block and original timestamp. Supply that timestamp once through --verified-at in the command below and pass the unchanged proof on stdin; do not insert a timestamp into proof that lacks one. Explicit verification time declarations must agree with the original raw string. Keep the returned criterion IDs unchanged. The helper derives the exact reference from exactly one nonempty top-level evidence section in one supported completion block. It does not select nested claim evidence, invent missing references, or authenticate an external verifier output; missing, duplicate, placeholder, or partial evidence stays rejected.",
+                "Ghost-ALICE Autopilot has no accepted publication under this receipt. The current-session assistant follows installed verification-before-completion/references/autopilot-publication.md, section Explicit v1 callers, for a required publication using original proof and time.",
                 completion_command(receipt["contract"], receipt["run_dir"], "publish", "--receipt-token", publication["receipt_token"], "--verified-at", "ORIGINAL_ISO_TIME", "--completion-file", "-"),
-                "If verification has not run, perform the necessary authorized check once before publishing. Do not prepare a new receipt to relabel earlier proof, infer success from this message, or refresh the proof time. The helper rejects stale input, criterion, scope, and receipt bindings.",
-                "Keep the current user goal, constraints, and protections in force. Publication writes runtime records only; the Stop adapter applies the existing completion transaction.",
-                "recovery-and-final-answer:", completion_recovery_guidance(),
+                "recovery-and-final-answer:", completion_recovery_guidance(host_input, source),
             ])
     lines = [
         "[autopilot]",
@@ -196,8 +209,8 @@ def build_continuation_message(
     if any(item.get(key) for key in ("contextual_protections", "constraints", "non_goals")):
         lines.extend([
             "context-use:",
-            "- Preserve contextual protections as boundary checks and auxiliary evidence; do not bind unadmitted IDs as met criteria or change admission to satisfy proof.",
-            "- Interpret accumulated context with the current goal and newer explicit decisions; do not revive superseded scope or discard protections outside an authorized exception.",
+            "- The current-session assistant uses contextual protections as boundary checks and auxiliary evidence; only Core-admitted criterion IDs can receive applied proof.",
+            "- The current-session assistant applies the current goal and newer explicit decisions to accumulated context; superseded scope remains inactive and protections remain binding unless the user authorized an exception.",
         ])
     reopen_target = item.get("completion", {}).get("reopen_target")
     if isinstance(reopen_target, str) and reopen_target:
@@ -216,20 +229,11 @@ def build_continuation_message(
             lines.extend(f"- {action}" for action in prohibited)
     lines.extend([
         "before-stop:",
-        "- continue from the latest io-trace when no promoted consistency decision exists.",
-        "- promote an eligible evidence-backed candidate with scripts/autopilot_governance_signal.py promote-decision; preserve its source and approval generation.",
-        "- observation_signal candidates are diagnostic; do not promote or relabel them. Continue from observed work and produce a fresh resolved decision only after verification.",
-        "- otherwise write .autopilot/consistency-decision.json only with the full promoted schema when a completion/retry/reopen decision is resolved.",
-        "- promoted schema requires schema_version, decision_id, work_item_id, decision, promotion_state: promoted, promotion_evidence.decision, promotion_evidence.source, candidate_id, governance_signal_digest, decision_key, state_hash, loop_key, and evidence.",
-        "- session-bound actions must preserve approval_generation from the approval receipt used to produce the evidence; never relabel old evidence with a newer generation.",
-        "- promotion_evidence.decision must be one of go, approve, approved, promote, promoted, or direct; use direct only for a current-turn before-stop resolution without a promotable candidate.",
-        "- evidence must be a JSON array of strings; do not nest verdict, completion_check_digest, or text inside evidence.",
-        "- for continue_next, put verdict and completion_check_digest at top level and put the full [completion-check] block in evidence strings.",
-        "- use continue_next only after [completion-check] with verdict pass, sha256 completion_check_digest, acceptance-criteria, and criterion-bound claim-evidence-map evidence.",
-        "- use retry_same_unit or reopen_micro/reopen_meso/reopen_macro when verification fails or drift remains.",
-        "- use ask_user_meta only when neither io-trace nor work state can resolve the next action.",
+        "- The current-session assistant judges the next necessary authorized action from the displayed task and evidence; tool-trace presence supplies no semantic mismatch or focus decision.",
+        "- For a resolved queue action, follow the Approved queue API section of installed Ghost-ALICE Autopilot SKILL.md. That procedure owns promotion and the consistency-decision.json in the selected run directory, including original approval_generation and evidence bindings.",
+        "- Core verification-before-completion owns claim review; task-router selects judgment focus and verification depth; boundary-contract and systematic-debugging own authority and incident limits.",
     ])
-    lines.extend(["recovery-and-final-answer:", completion_recovery_guidance(), "prompt:", item["prompt"]])
+    lines.extend(["recovery-and-final-answer:", completion_recovery_guidance(host_input, source), "prompt:", item["prompt"]])
     return "\n".join(lines)
 
 
@@ -254,29 +258,6 @@ def build_meta_intervention_message(
     lines.extend(f"- {item}" for item in evidence)
     lines.extend([
         "prompt:",
-        "Ask the user for a meta-level decision before continuing this autonomous run.",
-    ])
-    return "\n".join(lines)
-
-
-def build_semantic_delta_starvation_message(event: Mapping[str, Any]) -> str:
-    lines = [
-        "[autopilot]",
-        "decision: reopen_macro",
-        "evidence:",
-        f"- semantic-delta-starvation: {event.get('digest_only_count', 0)} consecutive digest-only user inputs",
-    ]
-    session_id = event.get("session_id")
-    if isinstance(session_id, str) and session_id.strip():
-        lines.append(f"- session_id: {session_id.strip()}")
-    latest_event_id = event.get("latest_event_id")
-    if isinstance(latest_event_id, str) and latest_event_id.strip():
-        lines.append(f"- latest_event_id: {latest_event_id.strip()}")
-    state_path = event.get("state_path")
-    if isinstance(state_path, str) and state_path.strip():
-        lines.append(f"- state_path: {state_path.strip()}")
-    lines.extend([
-        "prompt:",
-        "Before stopping, run the session-intent-analyzer recovery path for the current turn: record the current goal, constraints, decisions, acceptance criteria, and open conduct feedback as a semantic delta, then continue the actual work from that updated intent state.",
+        "The current-session assistant asks the user for the unresolved decision identified by the displayed evidence before resuming the displayed run and work-item.",
     ])
     return "\n".join(lines)

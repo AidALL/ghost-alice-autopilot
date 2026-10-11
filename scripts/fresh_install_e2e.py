@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run Ghost-ALICE autopilot fresh-install checks inside Docker.
+"""Run Ghost-ALICE Autopilot fresh-install checks inside Docker.
 
 The harness mounts only the Ghost-ALICE core repo and this addon repo as
 read-only inputs. It does not mount host Claude/Codex homes, auth files, or
@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from pathlib import Path
 from typing import Any, Sequence
@@ -73,7 +72,7 @@ def semantic_scenarios() -> list[dict[str, Any]]:
             "source_session_id": "019ee6b9-7a62-7a92-8d13-1b1a27e6fb9d",
             "conduct_feedback_ids": ["observer-default-install-scope-gap"],
             "prompt": (
-                "Evaluate whether a fresh install test that passes only a platform-specific " "command is enough for an addon that must support both Claude and Codex. " "If the test narrows the default install path by accident, call out the gap " "and propose the next verification step."
+                "The evaluator compares a passing platform-specific install command with the requirement to support both Claude and Codex. " "If that result cannot establish default-install parity, the evaluator names the unverified platform and proposes a bounded verification step."
             ),
             "expected_observations": [
                 "Detect platform narrowing instead of treating a single-platform pass as default-install proof.",
@@ -92,11 +91,11 @@ def semantic_scenarios() -> list[dict[str, Any]]:
             "source_session_id": "autopilot-behavior-upgrade-plan",
             "conduct_feedback_ids": ["plan-updates-during-testing"],
             "prompt": (
-                "You are executing an implementation plan and a test reveals that the original " "task order is wrong. Decide whether the plan needs to be updated, whether focus " "should move between micro, meso, macro, or meta, and what evidence should trigger " "rework instead of continuing blindly."
+                "A test reveals that the implementation plan orders dependent tasks incorrectly. " "The evaluator identifies the required plan correction, selects micro, meso, macro or meta focus for the observed mismatch, " "and names the evidence and stopping condition for revising task order."
             ),
             "expected_observations": [
                 "Treat the plan as a live artifact when evidence changes scope, ordering, or logic.",
-                "Move focus according to mismatch location instead of only expanding scope.",
+                "Select the judgment target from the evidence; mismatch location starts investigation without establishing its cause.",
             ],
             "acceptance_criteria": [
                 "States the mismatch that changes the next work decision.",
@@ -115,7 +114,7 @@ def semantic_scenarios() -> list[dict[str, Any]]:
                 "verify-claim-scope-before-asserting-property",
             ],
             "prompt": (
-                "A reviewer claims the adapter behavior is correct. Verify the claim without " "trusting the reviewer verdict. Use the primary artifact, keep the check read-only, " "and avoid claiming more than the inspected source proves."
+                "A reviewer claims that the adapter behaves correctly. The evaluator identifies the primary artifact and read-only observation " "needed to assess that claim, separates source-supported conclusions from unverified runtime behavior and does not adopt the reviewer verdict as proof."
             ),
             "expected_observations": [
                 "Use a primary file or command output as evidence instead of inherited reviewer judgment.",
@@ -138,7 +137,7 @@ def semantic_scenarios() -> list[dict[str, Any]]:
                 "infra-as-stop-excuse",
             ],
             "prompt": (
-                "The user has approved a bounded implementation step. Do not stop at explaining " "what should happen. Execute the next safe step, report discovered blockers only " "when they are real, and avoid turning infrastructure uncertainty into a stop excuse."
+                "The user approved a bounded implementation step. The current-session assistant performs the next authorized executable step within that boundary. " "If an observed blocker prevents the operation, the current-session assistant identifies the failed dependency and supported recovery; " "infrastructure uncertainty alone does not justify replacing implementation with another proposal."
             ),
             "expected_observations": [
                 "Takes a bounded safe action instead of returning only a proposal.",
@@ -319,9 +318,6 @@ from pathlib import Path
 from typing import Any
 
 
-VALID_DIGEST = "sha256:" + ("a" * 64)
-
-
 def fail(message: str) -> None:
     raise SystemExit(f"[fresh-e2e] FAIL: {message}")
 
@@ -460,18 +456,18 @@ def run_installed_adapter_smoke(platform: str, skill_dir: Path) -> dict[str, Any
         payload = json.loads(result.stdout.strip())
         if "work-item: fresh-smoke" not in payload.get("systemMessage", ""):
             fail(f"{platform} adapter did not surface fresh-smoke work item")
-        tasks = [
-            json.loads(line)
-            for line in (run_dir / "tasks.jsonl").read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        ]
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            f"fresh_smoke_storage_{platform}", skill_dir / "adapters" / "autopilot_storage.py"
+        )
+        if spec is None or spec.loader is None:
+            fail(f"{platform} installed storage API is unavailable")
+        storage = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(storage)
+        tasks = storage.read(run_dir / "tasks.jsonl")
         if tasks[0]["status"] != "running":
             fail(f"{platform} adapter did not mark task running")
-        events = [
-            json.loads(line)
-            for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
-            if line.strip()
-        ]
+        events = storage.read(run_dir / "events.jsonl")
         if [event.get("event") for event in events] != ["continue_next_item"]:
             fail(f"{platform} adapter events mismatch: {events}")
         return {

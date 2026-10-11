@@ -1,6 +1,6 @@
 """Prospective proof provenance; capture alone never admits or advances work.
 
-Dependencies: Python standard library, AP helpers and current Core SQLite API.
+Dependencies: Python standard library, Ghost-ALICE Autopilot helpers and current Core SQLite API.
 Origins are immutable rows in the current session's authority. They are not
 approval, business evidence, or a successful completion verdict.
 """
@@ -10,14 +10,13 @@ import copy
 from datetime import datetime, timezone
 import json
 from pathlib import Path
-import sys
 from autopilot_runtime_context import run_owner_hint, run_owner_matches
+from autopilot_intent_recovery import project_session_material
 
 
 def _helper():
-    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
-    import autopilot_completion
-    return autopilot_completion
+    import autopilot_completion_service
+    return autopilot_completion_service
 
 
 def _locked_state(core, root, source, connection):
@@ -25,20 +24,15 @@ def _locked_state(core, root, source, connection):
         session_id=source["GHOST_ALICE_SESSION_ID"], transaction=connection)
 
 
-def _blocked(state):
-    decision = state.get("model_security_decision") or {}
-    return (decision.get("input_event_id") == state.get("latest_input_event_id")
-            and decision.get("input_digest") in (None, "", state.get("latest_input_digest"))
-            and decision.get("decision") == "block")
 
-
-def _snapshot(state, source, run_dir):
+def _snapshot(state, source, run_dir, selected_work_units=None):
     helper = _helper()
     return {"platform": source["GHOST_ALICE_PLATFORM"], "session_id": source["GHOST_ALICE_SESSION_ID"],
         "intent_root": str(Path(source["GHOST_ALICE_SESSION_INTENT_ROOT"]).resolve()),
         "run_dir": str(run_dir.resolve()), "input_event_id": state.get("latest_input_event_id"),
         "input_digest": state.get("latest_input_digest"),
         "acceptance_criteria": helper._definitions(state.get("acceptance_criteria", [])),
+        "selected_work_units": copy.deepcopy(selected_work_units or []),
         "criterion_ids": sorted(row["id"] for row in state.get("acceptance_criteria", [])
             if row.get("admitted") is True and row.get("status") != "met"),
         "scope_summary": helper.adapter.SESSION_MATERIAL.run_summary(state),
@@ -86,15 +80,16 @@ def _current_generation(connection, snapshot):
     run = json.loads(row[0]); binding = (run.get("approval_evidence") or {}).get("session_intent") or {}
     event = binding.get("latest_input_event") or {}
     helper = _helper()
+    definitions, safe_v1 = helper._approval_selection(binding, snapshot)
     if (binding.get("platform") == snapshot["platform"] and binding.get("session_id") == snapshot["session_id"]
             and event.get("event_id") == snapshot["input_event_id"]
             and event.get("input_digest") == snapshot["input_digest"]
-            and helper._definitions(binding.get("acceptance_criteria", [])) == snapshot["acceptance_criteria"]
+            and definitions == snapshot["acceptance_criteria"] and safe_v1
             and run.get("scope") in _compatible_scopes(snapshot)
             and all(run.get(key) == snapshot[key] for key in ("allowed_surfaces", "stop_conditions"))):
         generation = helper.adapter.SESSION_MATERIAL.approval_generation(run)
         if run.get("scope") == {"summary": snapshot["scope_summary"]}:
-            # Legacy summary-only approvals lack historical semantic fields.
+            # Summary-only approvals lack captured semantic fields.
             # Reuse a checked receipt when one exists; otherwise retain the
             # existing generation conservatively rather than inventing history.
             previous = connection.execute("SELECT body_json FROM ap_objects WHERE run_key=? AND generation=? AND name=?",
@@ -163,7 +158,7 @@ def _capture_result(connection, origin, *, preflight, ownership_conflict=False):
                 result["additional_context"] = "\n".join([
                     "[autopilot]", "completion-preflight: ownership-conflict",
                     "The selected run belongs to a different session or standalone owner. Its approval and state are preserved.",
-                    "recovery-action: correct the explicit run-dir override within the authorized scope; default selection uses the current session's own run. No completion command was issued.",
+                    "recovery-action: The current-session assistant corrects GHOST_ALICE_AUTOPILOT_RUN_DIR only to an authorized exact-owner target. Default selection uses the current session run; Ghost-ALICE Autopilot adapter code issued no completion command.",
                 ])
             else:
                 from autopilot_messages import completion_preflight_guidance
@@ -172,24 +167,49 @@ def _capture_result(connection, origin, *, preflight, ownership_conflict=False):
 
 
 def capture_origin(source, *, preflight=False):
+    from autopilot_lineage import completion_protocol
+    if completion_protocol(source) == "autopilot-completion-receipt.v2":
+        helper = _helper()
+        if helper._v2_run_is_paused(source):
+            return {"status": "skipped", "reason": "autopilot-off"}
+        current = helper._source(source)
+        material = helper.adapter.read_session_material(Path(current['GHOST_ALICE_SESSION_INTENT_ROOT']),
+            current['GHOST_ALICE_PLATFORM'], current['GHOST_ALICE_SESSION_ID'], source=current,
+            require_input=True, recover_audit=False)
+        result = helper._prepare_completion_v2(intent_root=Path(current['GHOST_ALICE_SESSION_INTENT_ROOT']),
+            platform=current['GHOST_ALICE_PLATFORM'], session_id=current['GHOST_ALICE_SESSION_ID'],
+            input_event_id=material['latest_input_event']['event_id'], source=current)
+        if preflight and result.get('status') == 'prepared':
+            result = helper.v2_preflight_result(result, current)
+        return result
     helper = _helper(); current = helper._source(source)
     root = Path(current["GHOST_ALICE_SESSION_INTENT_ROOT"]).resolve()
     run_dir = Path(helper.adapter.resolve_run_target(current)["run_dir"]).resolve()
-    if helper.adapter.run_is_paused(run_dir) or not (root / "ghost-state.sqlite3").is_file():
-        return {"status": "skipped"}
+    if helper.adapter.run_is_paused(run_dir):
+        return {"status": "skipped", "reason": "autopilot-off"}
+    if not (root / "ghost-state.sqlite3").is_file():
+        return {"status": "recording-unavailable", "reason": "authority-unavailable"}
     owner = run_owner_hint(run_dir)
     ownership_conflict = owner is not None and not run_owner_matches(owner, current)
-    material = helper.adapter.read_session_material(root, current["GHOST_ALICE_PLATFORM"],
-        current["GHOST_ALICE_SESSION_ID"], source=current, require_input=True, recover_audit=False)
+    try:
+        material = helper.adapter.read_session_material(root, current["GHOST_ALICE_PLATFORM"],
+            current["GHOST_ALICE_SESSION_ID"], source=current, require_input=True, recover_audit=False)
+    except (ValueError, OSError) as exc:
+        return {"status": "recording-unavailable", "reason": "authority-unavailable", "detail": str(exc)}
+    material, selection = project_session_material(material, current, run_dir)
+    if selection["status"] != "selected":
+        return selection
     before = material["intent_state"]
-    snapshot = _snapshot(before, current, run_dir)
-    if _blocked(before) or not snapshot["criterion_ids"]:
+    snapshot = _snapshot(before, current, run_dir, material["selected_work_units"])
+    if not snapshot["criterion_ids"]:
         return {"status": "skipped"}
     from autopilot_work_items import _load_core_ledger_module
     core = _load_core_ledger_module(material["state_path"], current)
     with core.storage_transaction(root) as connection:
         state = _locked_state(core, root, current, connection)
-        if _snapshot(state, current, run_dir) != snapshot or _blocked(state):
+        locked, selected = project_session_material(dict(material, intent_state=state), current, run_dir, transaction=connection)
+        if (selected["status"] != "selected" or _snapshot(locked["intent_state"], current, run_dir,
+                locked.get("selected_work_units")) != snapshot):
             raise ValueError("current input or contract changed during prospective capture")
         if helper.adapter.run_is_paused(run_dir):
             return {"status": "skipped"}
@@ -214,23 +234,33 @@ def bind_origin(run_dir, run, items, source):
     """Attach an exact prospective origin only after ordinary admission checks."""
     helper = _helper(); store = helper.storage.active(run_dir)
     if (store is None or store.authority.get("kind") != "session"
-            or not store.connection.execute("SELECT name FROM sqlite_master WHERE name='ap_completion_origin_heads'").fetchone()):
+            or store.authority.get("platform") not in helper.SUPPORTED_PLATFORMS):
+        return {}
+    # A ready task cannot advance through an incompatible/accumulated v1
+    # approval merely because no prospective origin has yet been captured.
+    current = helper._source(source)
+    helper._current_contract(run, current)
+    if not store.connection.execute("SELECT name FROM sqlite_master WHERE name='ap_completion_origin_heads'").fetchone():
         return {}
     try:
         store.read(helper.PUBLICATION_OBJECT)
         return {}
     except FileNotFoundError:
         pass
-    current = helper._source(source)
     root = Path(current["GHOST_ALICE_SESSION_INTENT_ROOT"]).resolve()
     from autopilot_work_items import _load_core_ledger_module
     core = _load_core_ledger_module(root / current["GHOST_ALICE_PLATFORM"] / current["GHOST_ALICE_SESSION_ID"] / "intent-state.json", current)
     state = _locked_state(core, root, current, store.connection)
-    snapshot = _snapshot(state, current, Path(run_dir))
+    material, selected = project_session_material({"state_path": root / current["GHOST_ALICE_PLATFORM"] / current["GHOST_ALICE_SESSION_ID"] / "intent-state.json",
+        "platform": current["GHOST_ALICE_PLATFORM"], "session_id": current["GHOST_ALICE_SESSION_ID"], "intent_state": state}, current, run_dir)
+    if selected["status"] != "selected":
+        return {}
+    state = material["intent_state"]
+    snapshot = _snapshot(state, current, Path(run_dir), material["selected_work_units"])
     origin = _head(store.connection, _key(snapshot))
     if origin is None:
         return {}
-    if _blocked(state) or origin["contract"] != snapshot:
+    if origin["contract"] != snapshot:
         return {"completion_origin_gap": "stale"}
     contract = helper._current_contract(run, current)
     _tables(store.connection)
@@ -261,6 +291,7 @@ def reapproval_payload(run_dir, run, source):
     """Surface current authorized admission without advancing the previous run."""
     helper = _helper(); store = helper.storage.active(run_dir)
     if (store is None or store.authority.get("kind") != "session"
+            or store.authority.get("platform") not in helper.SUPPORTED_PLATFORMS
             or not store.connection.execute("SELECT name FROM sqlite_master WHERE name='ap_completion_origin_heads'").fetchone()):
         return None
     current = helper._source(source)
@@ -279,9 +310,12 @@ def reapproval_payload(run_dir, run, source):
         pass
     material = helper.adapter.read_session_material(Path(current["GHOST_ALICE_SESSION_INTENT_ROOT"]),
         current["GHOST_ALICE_PLATFORM"], current["GHOST_ALICE_SESSION_ID"], source=current, require_input=True)
-    state = material["intent_state"]; snapshot = _snapshot(state, current, Path(run_dir))
+    material, selected = project_session_material(material, current, run_dir)
+    if selected["status"] != "selected":
+        return None
+    state = material["intent_state"]; snapshot = _snapshot(state, current, Path(run_dir), material["selected_work_units"])
     origin = _head(store.connection, _key(snapshot))
-    if _blocked(state) or not snapshot["criterion_ids"] or origin is None or origin["contract"] != snapshot:
+    if not snapshot["criterion_ids"] or origin is None or origin["contract"] != snapshot:
         return None
     from autopilot_messages import completion_command, completion_recovery_guidance
     command = completion_command(snapshot, str(Path(run_dir).resolve()), "prepare", "--reapprove-current-input",
@@ -289,7 +323,7 @@ def reapproval_payload(run_dir, run, source):
         "--session-id", snapshot["session_id"], "--input-event-id", snapshot["input_event_id"])
     return {"continue": True, "systemMessage": "\n".join([
         "[autopilot]", "completion-admission: required", f"prospective-captured-at: {origin['captured_at']}",
-        "Current input has separately admitted execution criteria and original prospective provenance. The previous run is parked. For this already-authorized work, use the supported admission command below, then publish its unchanged original proof with the returned receipt. This archives the previous generation; it does not require another user permission round or a repeated business check. A proof older than this capture remains rejected.",
+        "The Core admission record contains execution criteria for the current input with original prospective provenance; Ghost-ALICE Autopilot adapter code parked the previous run. The current-session assistant uses the displayed admission command for the admitted work, then publishes unchanged original proof with the returned receipt. The command archives the previous generation under existing authority. The current-session assistant neither requests duplicate approval nor repeats business checks for admission; Ghost-ALICE Autopilot publication code still rejects proof older than the original capture.",
         command, completion_recovery_guidance()])}
 
 

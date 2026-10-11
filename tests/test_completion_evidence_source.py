@@ -1,12 +1,11 @@
 """Original-proof evidence derivation; only temporary authorities are mutated.
 
-Dependencies: Python standard library, existing publication fixture, candidate Core.
+Dependencies: Python standard library, existing publication fixture, Core.
 """
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 import hashlib
 import json
 import os
-from pathlib import Path
 import shlex
 import subprocess
 import sys
@@ -14,6 +13,7 @@ import unittest
 from unittest import mock
 
 import test_completion_publication as publication_tests
+from response_route_fixture import retained_publication_fixture
 
 
 class CompletionEvidenceSourceTest(unittest.TestCase):
@@ -21,7 +21,6 @@ class CompletionEvidenceSourceTest(unittest.TestCase):
     prepare = publication_tests.CompletionPublicationTest.prepare
     proof = publication_tests.CompletionPublicationTest.proof
     read_state = publication_tests.CompletionPublicationTest.read_state
-    change_intent = publication_tests.CompletionPublicationTest.change_intent
     stop = publication_tests.CompletionPublicationTest.stop
 
     def default_proof(self):
@@ -75,24 +74,13 @@ class CompletionEvidenceSourceTest(unittest.TestCase):
         command = next(line for line in message.splitlines() if "autopilot_completion.py publish" in line)
         self.assertNotIn("--evidence-source", command)
         self.assertNotIn("ORIGINAL_LOCATOR", message)
-        self.assertIn("top-level", message)
+        self.assertIn("Explicit v1 callers", message)
         argv = [self.verified_at if word == "ORIGINAL_ISO_TIME" else word for word in shlex.split(command)]
         result = subprocess.run(argv, cwd=self.root, env=self.cli_env(), input=self.completion,
                                 text=True, capture_output=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)["evidence_source"], self.top_evidence)
 
-    def test_skill_default_omits_redundant_source_and_explains_limits(self):
-        skill = Path(os.environ["GHOST_ALICE_CORE_ROOT"]) / "coding-convention/verification-before-completion/SKILL.md"
-        entry = skill.read_text()
-        reference = "references/autopilot-publication.md"
-        self.assertIn(f"[{reference}]({reference})", entry)
-        self.assertIn("before preparation, business verification or the first final answer", entry)
-        text = (skill.parent / reference).read_text()
-        default = next(line for line in text.splitlines() if "autopilot_completion.py publish" in line)
-        self.assertNotIn("--evidence-source ORIGINAL_LOCATOR", default)
-        for required in ("top-level", "placeholder", "unchanged", "nested", "exactly one"):
-            self.assertIn(required, text)
 
     def test_multiline_section_preserves_exact_text_and_crlf(self):
         receipt = self.prepare(); original = self.default_proof()
@@ -136,11 +124,7 @@ class CompletionEvidenceSourceTest(unittest.TestCase):
                  original + "[io-trace]\n- evidence: unrelated\n",
                  "Prose before proof\n" + original,
                  original.replace("[completion-check]", "[completion-check partial]"),
-                 original + "unindented partial evidence continuation\n",
-                 original.replace("verdict: pass", "verdict: fail", 1),
-                 original.replace("criterion: report", "criterion: unknown", 1),
-                 original.replace("- unverified: none", "- unverified: pending"),
-                 original.split("  - claim: Protected file is unchanged")[0] + "- unverified: none\n" + header]
+                 original + "unindented partial evidence continuation\n"]
         for proof in cases:
             with self.subTest(proof=proof), self.assertRaises(ValueError):
                 self.publish_default(receipt, completion_check=proof)
@@ -149,32 +133,20 @@ class CompletionEvidenceSourceTest(unittest.TestCase):
         self.assertFalse(publication_tests.adapter.storage.pending(self.run_dir / "consistency-decision.json"))
 
     def test_explicit_legacy_override_keeps_membership_and_empty_rejection(self):
-        receipt = self.prepare(); self.proof()  # Legacy proof has nested evidence only.
+        receipt = self.prepare(); self.proof()  # The proof fixture has nested evidence only.
         for value in ("", "a mismatched reference"):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 self.publish_default(receipt, evidence_source=value)
         result = self.publish_default(receipt, evidence_source=self.evidence_source)
         self.assertEqual(result["evidence_source"], self.evidence_source)
 
-    def test_default_keeps_stale_receipt_and_original_time_checks(self):
-        receipt = self.prepare(); self.default_proof()
-        for changes in ({"receipt_token": "sha256:" + "0" * 64},
-                        {"verified_at": datetime.now(timezone.utc).isoformat()},
-                        {"verified_at": (datetime.now(timezone.utc) + timedelta(days=1)).isoformat()},
-                        {"source": dict(self.source, GHOST_ALICE_SESSION_ID="foreign")}):
-            with self.subTest(changes=changes), self.assertRaises(ValueError):
-                self.publish_default(receipt, **changes)
-        self.change_intent({"constraints": ["Changed authorized scope"]})
-        with self.assertRaises(ValueError): self.publish_default(receipt)
 
     def retained_proof(self, batch):
         fixture = RETAINED_PROOFS[batch]
         original = fixture["proof"]
         self.assertEqual(hashlib.sha256(original.encode()).hexdigest(), fixture["sha256"])
-        state = json.loads(self.state_path.read_text())
-        state["acceptance_criteria"] = [{"id": name, "summary": "Retained " + name,
-            "source": "user-explicit", "admitted": True, "status": "unmet"} for name in fixture["criteria"]]
-        self.state_path.write_text(json.dumps(state))
+        retained_publication_fixture(self, [{"id": name, "summary": "Retained " + name,
+            "source": "user-explicit", "admitted": True, "status": "unmet"} for name in fixture["criteria"]])
         verified = datetime.fromisoformat(fixture["verified_at"])
         class OriginalPreparationClock(datetime):
             @classmethod

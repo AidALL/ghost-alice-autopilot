@@ -1,0 +1,31 @@
+{
+  "schema_version": "completion-route-regressions.v1",
+  "classification": "sanitized_public_condition_analogue",
+  "native_authority": false,
+  "historical_business_proof": false,
+  "original_report_time": "2026-10-08T12:38:25.211Z",
+  "historical_claim_map_count": 10,
+  "historical_block_sha256": "80b75ae948bb0098ccad9e1c9de7ce0e208b9ad246c5ce72b4f9ce46508ace9a",
+  "historical_parser_analogue": "[completion-check]\n\nacceptance-criteria:\ndesign-quality-only: Preserve sanitized parser data [source: user-explicit]\nclaim-evidence-map:\nclaim: Sanitized historical claim 1\ncriterion: design-quality-only\nevidence: historical-data:source-1\nverdict: pass\nclaim: Sanitized historical claim 2\ncriterion: design-quality-only\nevidence: historical-data:source-2\nverdict: pass\nclaim: Sanitized historical claim 3\ncriterion: design-quality-only\nevidence: historical-data:source-3\nverdict: pass\nclaim: Sanitized historical claim 4\ncriterion: design-quality-only\nevidence: historical-data:source-4\nverdict: pass\nclaim: Sanitized historical claim 5\ncriterion: design-quality-only\nevidence: historical-data:source-5\nverdict: pass\nclaim: Sanitized historical claim 6\ncriterion: design-quality-only\nevidence: historical-data:source-6\nverdict: pass\nclaim: Sanitized historical claim 7\ncriterion: design-quality-only\nevidence: historical-data:source-7\nverdict: pass\nclaim: Sanitized historical claim 8\ncriterion: design-quality-only\nevidence: historical-data:source-8\nverdict: pass\nclaim: Sanitized historical claim 9\ncriterion: design-quality-only\nevidence: historical-data:source-9\nverdict: pass\nclaim: Sanitized historical claim 10\ncriterion: design-quality-only\nevidence: historical-data:source-10\nverdict: pass\nunverified:\nnone\nevidence: historical-data:sanitized-source\n",
+  "current_fixture_body": "The owned fixture contains the expected input.",
+  "korean_incomplete": "수정 작업은 아직 미완료입니다.",
+  "korean_adjacent_positive": "수정 작업은 아직 미완료입니다. 테스트가 통과했습니다.",
+  "sourceUnavailable": [
+    "exact_failing_approval_bytes",
+    "original_native_status_conversation",
+    "historical_OS_denial_output"
+  ],
+  "cases": [
+    "discussion-history",
+    "visible-body-repair",
+    "historical-parser-and-current-rebinding",
+    "actual-recording-OSError",
+    "unfinished-status-selection",
+    "korean-closure",
+    "target-provenance-and-phase",
+    "qualified-ambiguity"
+  ],
+  "canonical_parser_control": "[completion-check]\n- verification-before-completion: done\n- skill-call: verification-before-completion (this turn)\n- acceptance-criteria:\n  - design-quality-only: Preserve fixture data [source: user-explicit]\n- claim-evidence-map:\n  - claim: Sanitized historical claim 1\n    criterion: design-quality-only\n    evidence: historical-data:source-1; sanitized parser input\n    verdict: pass\n  - claim: Sanitized historical claim 2\n    criterion: design-quality-only\n    evidence: historical-data:source-2; sanitized parser input\n    verdict: pass\n  - claim: Sanitized historical claim 3\n    criterion: design-quality-only\n    evidence: historical-data:source-3; sanitized parser input\n    verdict: pass\n  - claim: Sanitized historical claim 4\n    criterion: design-quality-only\n    evidence: historical-data:source-4; sanitized parser input\n    verdict: pass\n  - claim: Sanitized historical claim 5\n    criterion: design-quality-only\n    evidence: historical-data:source-5; sanitized parser input\n    verdict: pass\n  - claim: Sanitized historical claim 6\n    criterion: design-quality-only\n    evidence: historical-data:source-6; sanitized parser input\n    verdict: pass\n  - claim: Sanitized historical claim 7\n    criterion: design-quality-only\n    evidence: historical-data:source-7; sanitized parser input\n    verdict: pass\n  - claim: Sanitized historical claim 8\n    criterion: design-quality-only\n    evidence: historical-data:source-8; sanitized parser input\n    verdict: pass\n  - claim: Sanitized historical claim 9\n    criterion: design-quality-only\n    evidence: historical-data:source-9; sanitized parser input\n    verdict: pass\n  - claim: Sanitized historical claim 10\n    criterion: design-quality-only\n    evidence: historical-data:source-10; sanitized parser input\n    verdict: pass\n- unverified: none\n- evidence: historical-data:sanitized-source\n",
+  "historical_structure": "flattened_unbulleted_attachment_data",
+  "historical_native_rendered_bytes_available": false
+}

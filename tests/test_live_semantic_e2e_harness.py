@@ -111,20 +111,6 @@ def test_claude_parser_selects_the_only_fenced_json_with_expected_keys_amid_cont
     assert summary["hook_status"] == "complete"
 
 
-def test_claude_parser_accepts_first_fenced_json_before_trailing_control_block(tmp_path: Path) -> None:
-    harness = _load_harness()
-    stream = tmp_path / "claude.jsonl"
-    scenario = harness.LiveScenario(id="json-first", prompt="Return compact JSON.")
-    payload = _semantic_payload(verdict="request-verification")
-    assistant_text = f"{_fenced_json(payload)}\n\n[completion-check]\n- unverified: none"
-    _write_claude_semantic_stream(stream, assistant_text)
-
-    summary = harness.parse_claude_stream_json(stream, scenario=scenario)
-
-    assert summary["scenario_result"] == payload
-    assert summary["semantic_status"] == "parsed"
-
-
 def test_claude_parser_rejects_raw_json_before_trailing_non_whitespace_text(tmp_path: Path) -> None:
     harness = _load_harness()
     stream = tmp_path / "claude.jsonl"
@@ -191,7 +177,7 @@ def test_static_and_intent_prompts_share_one_fenced_json_response_contract(monke
         state={},
     )
     static_prompt = harness.live_scenarios(scenario_source="static")[0].prompt
-    response_contract = "Return exactly one fenced `json` object containing keys: verdict, mismatch_detected, focus_layer, next_action, loop_guard."
+    response_contract = "The evaluator returns exactly one fenced `json` object containing keys: verdict, mismatch_detected, focus_layer, next_action, loop_guard."
 
     assert intent_prompt.count(response_contract) == 1
     assert static_prompt.count(response_contract) == 1
@@ -214,8 +200,8 @@ def test_live_scenarios_wrap_source_prompt_as_evaluation_not_execution(monkeypat
 
     scenario = harness.live_scenarios(scenario_source="static")[0]
 
-    assert "Do not execute" in scenario.prompt
-    assert "Evaluate the scenario text" in scenario.prompt
+    assert "For the diagnostic evaluation only" in scenario.prompt
+    assert "The evaluator classifies the intended agent behavior" in scenario.prompt
     assert "Execute the next safe implementation step." in scenario.prompt
 
 
@@ -261,9 +247,9 @@ def test_intent_sourced_live_scenarios_build_prompt_from_conduct_feedback(tmp_pa
     scenario = by_id["intent-codex-session-1-use-real-intent"]
     assert "Compressed intent source:" in scenario.prompt
     assert "Source platform: codex" in scenario.prompt
-    assert "Do not use tools" in scenario.prompt
-    assert "Do not browse" in scenario.prompt
-    assert "Do not execute shell commands" in scenario.prompt
+    assert "For the diagnostic scenario evaluation only" in scenario.prompt
+    assert "without tools, browsing" in scenario.prompt
+    assert "shell commands or file access" in scenario.prompt
     assert "Current goal: Upgrade autopilot behavior from accumulated intent feedback." in scenario.prompt
     assert "Use actual session-intent deltas for semantic tests." in scenario.prompt
     assert "Hand-written synthetic scenarios do not exercise" in scenario.prompt
@@ -271,45 +257,9 @@ def test_intent_sourced_live_scenarios_build_prompt_from_conduct_feedback(tmp_pa
     assert "Build semantic prompts from compressed intent artifacts." in scenario.prompt
     assert harness.SEMANTIC_RESPONSE_FORMAT_INSTRUCTION in scenario.prompt
     assert "must not appear" not in scenario.prompt
-
-
-def test_intent_sourced_live_scenarios_include_acceptance_even_with_feedback(tmp_path: Path) -> None:
-    harness = _load_harness()
-    state_dir = tmp_path / "session-intent" / "codex" / "session-criteria"
-    state_dir.mkdir(parents=True)
-    state_path = state_dir / "intent-state.json"
-    state_path.write_text(
-        json.dumps(
-            {
-                "current_goal": "Verify a plan and repair implementation drift.",
-                "conduct_feedback": [
-                    {
-                        "id": "under-tested",
-                        "summary": "The agent ran too narrow a semantic loop.",
-                        "corrective_rule": "Run the full available intent surface.",
-                    }
-                ],
-                "acceptance_criteria": [
-                    {
-                        "id": "all-surfaces",
-                        "summary": "Exercise conduct feedback and acceptance criteria as separate semantic probes.",
-                    }
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    scenarios = harness.intent_sourced_live_scenarios(intent_roots=[tmp_path / "session-intent"], limit=None)
-    by_id = {scenario.id: scenario for scenario in scenarios}
-
-    assert set(by_id) == {
-        "intent-codex-session-criteria-under-tested",
-        "intent-codex-session-criteria-acceptance-criteria",
-    }
-    criteria = by_id["intent-codex-session-criteria-acceptance-criteria"]
-    assert criteria.source_locator == f"{state_path}#acceptance_criteria"
-    assert "Exercise conduct feedback and acceptance criteria" in criteria.prompt
+    criteria = by_id["intent-codex-session-1-acceptance-criteria"]
+    assert criteria.source_locator == f"{state_dir / 'intent-state.json'}#acceptance_criteria"
+    assert "Build semantic prompts from compressed intent artifacts." in criteria.prompt
 
 
 def test_intent_sourced_live_scenarios_include_decisions_and_open_questions(tmp_path: Path) -> None:
@@ -1183,7 +1133,7 @@ def test_cli_accepts_semantic_scenario_source_selection() -> None:
     assert args.scenario_source == "intent"
 
 
-def test_execute_jsonl_emits_one_result_per_scenario(monkeypatch, capsys, tmp_path: Path) -> None:
+def test_execute_jsonl_reports_each_scenario_and_fails_if_any_regresses(monkeypatch, capsys, tmp_path: Path) -> None:
     harness = _load_harness()
     scenarios = [
         harness.LiveScenario(id="one", prompt="Return compact JSON."),
@@ -1197,7 +1147,7 @@ def test_execute_jsonl_emits_one_result_per_scenario(monkeypatch, capsys, tmp_pa
             "runtime": runtime,
             "scenario_id": scenario.id,
             "inference_status": "ok",
-            "semantic_status": "parsed",
+            "semantic_status": "schema-mismatch" if scenario.id == "one" else "parsed",
             "hook_status": "complete",
         }
 
@@ -1214,7 +1164,7 @@ def test_execute_jsonl_emits_one_result_per_scenario(monkeypatch, capsys, tmp_pa
         ]
     )
 
-    assert rc == 0
+    assert rc == 1
     lines = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
     assert lines == [
         {
@@ -1222,7 +1172,7 @@ def test_execute_jsonl_emits_one_result_per_scenario(monkeypatch, capsys, tmp_pa
                 "runtime": "codex",
                 "scenario_id": "one",
                 "inference_status": "ok",
-                "semantic_status": "parsed",
+                "semantic_status": "schema-mismatch",
                 "hook_status": "complete",
             }
         },
@@ -1313,6 +1263,7 @@ def test_command_builders_do_not_embed_secret_values(tmp_path: Path) -> None:
     assert "--output-last-message" in codex
     assert scenario.prompt not in codex
     assert "--ephemeral" in codex
+    assert codex[-1] == "-"
     assert "--sandbox" in codex
     assert "read-only" in codex
     for command in (claude, codex):
@@ -1321,7 +1272,6 @@ def test_command_builders_do_not_embed_secret_values(tmp_path: Path) -> None:
 
 def test_codex_command_builder_prefers_cmd_and_conditional_hook_trust_on_windows(tmp_path: Path) -> None:
     harness = _load_harness()
-    scenario = harness.LiveScenario(id="probe", prompt="Return compact JSON.")
 
     def fake_which(name: str) -> str | None:
         return {

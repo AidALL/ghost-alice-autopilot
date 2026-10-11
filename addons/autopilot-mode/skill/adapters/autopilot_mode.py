@@ -13,8 +13,6 @@ from pathlib import Path
 
 sys.dont_write_bytecode = True
 
-from autopilot_messages import completion_recovery_guidance
-
 
 def _load_autopilot_state():
     adapter_dir = Path(__file__).resolve().parent
@@ -62,7 +60,10 @@ def _first_absolute_path_text(*values: object) -> str:
 
 def _format_payload_for_hook(payload: dict, hook_input: dict) -> dict:
     message = payload.get("systemMessage")
-    if not message or not _stop_hook_input(hook_input):
+    recovery = payload.get("recovery", {})
+    recording_only = bool(recovery) and recovery.get("claims_changed") is not True
+    task_dispatched = payload.get("continuation", {}).get("status") == "dispatched"
+    if not message or not _stop_hook_input(hook_input) or ((recording_only or recovery.get('status') == 'parked') and not task_dispatched):
         return payload
     formatted = dict(payload)
     formatted["decision"] = "block"
@@ -103,15 +104,9 @@ def main() -> int:
         payload = autopilot_state.adapter_payload_from_env(_env_with_hook_cwd(hook_input), hook_input=hook_input)
     except Exception as exc:  # pragma: no cover - defensive hook fallback
         sys.stderr.write(f"autopilot-mode adapter fell back to no-op: {exc}\n")
-        payload = {
-            "continue": True,
-            "systemMessage": (
-                "[autopilot-mode adapter error]\n"
-                f"error: {exc}\n"
-                "recovery-action: inspect and repair the .autopilot run state within the existing authorized scope. "
-                + completion_recovery_guidance()
-            ),
-        }
+        from autopilot_completion_service import recording_failure_payload
+        payload = recording_failure_payload(_env_with_hook_cwd(hook_input), hook_input, exc)
+
     sys.stdout.write(json.dumps(_format_payload_for_hook(payload, hook_input)) + "\n")
     return 0
 

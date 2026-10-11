@@ -4,8 +4,11 @@
     {
       "id": "autopilot-mode",
       "path": "addons/autopilot-mode",
-      "min_core_version": "0.4.0",
-      "tags": ["orchestration", "automation"]
+      "min_core_version": "0.5.0",
+      "tags": [
+        "orchestration",
+        "automation"
+      ]
     }
   ]
 }

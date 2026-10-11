@@ -1,4 +1,4 @@
-"""TDD for autopilot governance-signal candidates and promotion.
+"""Autopilot governance-signal candidates and promotion.
 
 Run: /opt/homebrew/bin/python3 -m pytest tests/test_governance_signal.py -q
 """
@@ -357,7 +357,7 @@ class GovernanceSignalTest(unittest.TestCase):
         )
 
         self.assertIsNotNone(candidate)
-        self.assertEqual(candidate["decision"], "ask_user_meta")
+        self.assertEqual(candidate["decision"], "reopen_meta")
         self.assertIn("observation_focus_layer:macro/meta", "\n".join(candidate["evidence"]))
 
     def test_semantic_observation_mismatch_with_unicode_arrow_focus_path_reopens_last_focus(self) -> None:
@@ -500,7 +500,22 @@ class GovernanceSignalTest(unittest.TestCase):
         bad_candidate["evidence"] = []
         self.assertIsNone(module.promote_candidate_to_action(bad_candidate))
 
-    def test_promotion_escalates_repeated_same_state_to_user_meta(self) -> None:
+    def test_meta_routing_promotion_preserves_authority_for_premise_reconsideration(self) -> None:
+        module = _load_module(self)
+        candidate = module.decision_candidate_from_governance(
+            work_item_id="work-1",
+            routing_surface={"intent_relation": "correction", "focus_layer": "meta",
+                "reason": "Reconsider the premise within existing authority"},
+            approval_generation="existing-authority",
+        )
+
+        action = module.promote_candidate_to_action(candidate, work_item_status="running",
+            expected_approval_generation="existing-authority")
+
+        self.assertEqual(action["decision"], "reopen_meta")
+        self.assertEqual(action["approval_generation"], "existing-authority")
+
+    def test_promotion_parks_repeated_same_state_without_human_escalation(self) -> None:
         module = _load_module(self)
         candidate = module.decision_candidate_from_governance(
             work_item_id="work-1",
@@ -510,10 +525,10 @@ class GovernanceSignalTest(unittest.TestCase):
 
         action = module.promote_candidate_to_action(candidate, prior_loop_keys=[loop_key])
 
-        self.assertEqual(action["decision"], "ask_user_meta")
+        self.assertEqual(action["decision"], "park")
         self.assertIn("loop-guard: repeated decision/state", "\n".join(action["evidence"]))
 
-    def test_promotion_escalates_retry_attempt_cap_to_user_meta(self) -> None:
+    def test_promotion_parks_retry_attempt_cap_without_human_escalation(self) -> None:
         module = _load_module(self)
         candidate = module.decision_candidate_from_governance(
             work_item_id="work-1",
@@ -522,7 +537,7 @@ class GovernanceSignalTest(unittest.TestCase):
 
         action = module.promote_candidate_to_action(candidate, current_attempt=2)
 
-        self.assertEqual(action["decision"], "ask_user_meta")
+        self.assertEqual(action["decision"], "park")
         self.assertIn("loop-guard: retry attempt cap", "\n".join(action["evidence"]))
 
     def test_cli_promotion_reads_run_dir_attempt_cap(self) -> None:
@@ -567,7 +582,7 @@ class GovernanceSignalTest(unittest.TestCase):
             action = json.loads(action_path.read_text(encoding="utf-8"))
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(action["decision"], "ask_user_meta")
+        self.assertEqual(action["decision"], "park")
         self.assertIn("loop-guard: retry attempt cap", "\n".join(action["evidence"]))
 
     def test_cli_promotion_reads_run_dir_prior_loop_key(self) -> None:
@@ -616,7 +631,7 @@ class GovernanceSignalTest(unittest.TestCase):
             action = json.loads(action_path.read_text(encoding="utf-8"))
 
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(action["decision"], "ask_user_meta")
+        self.assertEqual(action["decision"], "park")
         self.assertIn("loop-guard: repeated decision/state", "\n".join(action["evidence"]))
 
     def test_cli_promotion_rejects_reopen_for_ready_work_item(self) -> None:

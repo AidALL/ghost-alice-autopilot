@@ -2,7 +2,7 @@
   "schema_version": "autopilot-compatibility-matrix.v1",
   "scope": "autopilot-mode addon runtime, install surface, and documented shell/platform coverage",
   "full_compatibility_claim_rule": "Do not claim full compatibility while any required target has status not-run.",
-  "evidence_policy": "Evidence entries describe the current support contract. Historical run timestamps belong in external test logs, CI artifacts, or release notes, not in this matrix.",
+  "evidence_policy": "Each status applies only to its recorded target and evidence scope. Source checks, native runtime validation, installed adoption and publication require their own evidence. Preserve each evidence record’s original source and verification time; an unchanged record does not certify a changed artifact.",
   "targets": [
     {
       "id": "os-macos",
@@ -11,11 +11,14 @@
       "status": "verified-local",
       "full_compatibility_blocker": false,
       "evidence": [
-        "local unit suite covers compatibility, bridge, governance signal, live semantic harness, privileged adapter, and autopilot state surfaces",
-        "installed bridge-to-adapter smoke covers Codex and Claude installed skill layouts",
-        "fresh install E2E covers default install/status, Codex status, installed adapter smoke, Claude lifecycle uninstall, and overall uninstall cleanup"
+        "tests/test_autopilot_state.py, tests/test_autopilot_bridge_admission.py and tests/test_autopilot_sqlite.py exercise owned session selection, admission and stored state through the selected Core provider",
+        "tests/test_completion_preflight.py runs the actual registered PreToolUse and Stop commands from isolated Codex and Claude installations, then verifies automatic publication, final application and original proof preservation",
+        "tests/test_managed_location_chain.py runs isolated install/status/uninstall and rejects a changed registered event, hook source or hook arguments"
       ],
-      "next_evidence_required": []
+      "next_evidence_required": [
+        "Observe the release candidate in a running native host and retain the exact installed hashes and hook audit for that observation"
+      ],
+      "verification_scope": "Local Python tests and isolated installed hook processes on macOS; this status does not certify live model behavior."
     },
     {
       "id": "os-linux",
@@ -80,13 +83,15 @@
       "status": "verified-local",
       "full_compatibility_blocker": false,
       "evidence": [
-        "install status covers addon-registry ok, autopilot-mode skill/adapter content_hash-match, and overall ok for the Claude surface",
-        "installed-copy smoke covers the Claude skill bridge writing approved run state and the adapter emitting a continuation payload",
-        "fresh install E2E covers install/status and temporary HOME lifecycle for the Claude surface",
-        "scripts/live_semantic_e2e.py --runtime both --scenario-source intent --execute --jsonl produces Claude inference_status=ok, semantic_status=parsed, and hook_status=complete across the intent scenario set",
-        "the core blind controller confirms Claude passes five purpose-hidden fresh-session cases with all evaluator dimensions passing"
+        "tests/test_completion_preflight.py::CompletionPreflightTest.test_installed_claude_preflight_prepare_publish_needs_no_stop_recovery runs the installed Claude PreToolUse and Stop commands and verifies automatic preparation, publication and privileged application",
+        "tests/test_completion_route_e2e.py exercises Claude payload and delivery routing with explicit Core work selection and retained proof; fixture judgments do not certify a model semantic judgment",
+        "tests/test_autopilot_state.py verifies native session identity precedence and rejects foreign session ownership"
       ],
-      "next_evidence_required": []
+      "next_evidence_required": [
+        "Observe Claude model behavior with the release candidate instructions and runtime; retain its original response, exact installed hashes, Core review and native hook audit",
+        "Keep model semantic judgment, publication acceptance and privileged application as separate observed results"
+      ],
+      "verification_scope": "Isolated local installation and registered native hook processes with explicit synthetic Core review judgments; fresh model and live host behavior remain unverified."
     },
     {
       "id": "agent-platform-codex",
@@ -95,15 +100,15 @@
       "status": "verified-local",
       "full_compatibility_blocker": false,
       "evidence": [
-        "bash install.sh --platform codex --status covers addon-registry ok, autopilot-mode skill/adapter content_hash-match, and overall ok",
-        "installed-copy smoke covers ~/.agents/skills/autopilot-mode/scripts/autopilot_session_bridge.py writing approved run state and ~/.agents/skills/autopilot-mode/adapters/autopilot_mode.py emitting a continuation payload",
-        "fresh install E2E covers default install/status, Codex status, installed adapter smoke, Claude lifecycle uninstall, and overall uninstall cleanup",
-        "scripts/live_semantic_e2e.py --runtime both --scenario-source intent --execute --jsonl --timeout-sec 180 produces Codex inference_status=ok, semantic_status=parsed, and hook_status=complete",
-        "candidate-boundary check keeps Codex live observation signals candidate-only with action_file_allowed false and direct promotion false",
-        "the core blind controller confirms Codex passes five purpose-hidden fresh-session cases with all evaluator dimensions passing",
-        "tests/test_autopilot_session_bridge.py verifies --platform codex bridges current-session.json, intent-state.json, and intent-events.jsonl into approval-gated .autopilot run state"
+        "tests/test_completion_preflight.py::CompletionPreflightTest.test_installed_codex_preflight_prepare_publish_needs_no_stop_recovery runs the installed Codex PreToolUse and Stop commands and verifies automatic preparation, publication and privileged application",
+        "tests/test_completion_route_e2e.py exercises Codex payload and delivery routing with explicit Core work selection and retained proof; fixture judgments do not certify a model semantic judgment",
+        "tests/test_autopilot_state.py verifies native session identity precedence and rejects foreign session ownership"
       ],
-      "next_evidence_required": []
+      "next_evidence_required": [
+        "Observe Codex model behavior with the release candidate instructions and runtime; retain its original response, exact installed hashes, Core review and native hook audit",
+        "Keep model semantic judgment, publication acceptance and privileged application as separate observed results"
+      ],
+      "verification_scope": "Isolated local installation and registered native hook processes with explicit synthetic Core review judgments; fresh model and live host behavior remain unverified."
     }
   ]
 }

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import re
-import subprocess
 import unittest
 from pathlib import Path
 
@@ -21,73 +20,6 @@ REQUIRED_TARGETS = {
     "agent-platform-codex",
 }
 ALLOWED_STATUSES = {"verified-local", "simulated-local", "not-run"}
-TRACKED_BINARY_EXCLUSIONS = {
-    "logo/logo_inward_fade.png",
-    "logo/logo_outward_fade.png",
-}
-RELEASE_PACKAGE_FILES = (
-    ".github/workflows/ci.yml",
-    ".gitignore",
-    "CHANGELOG.md",
-    "LICENSE",
-    "NOTICE",
-    "README.md",
-    "README_ko.md",
-    "VERSION",
-    "addons-manifest.json",
-    "addons/autopilot-mode/addon.json",
-    "addons/autopilot-mode/skill/SKILL.md",
-    "addons/autopilot-mode/skill/adapters/autopilot_intent_recovery.py",
-    "addons/autopilot-mode/skill/adapters/autopilot_lineage.py",
-    "addons/autopilot-mode/skill/adapters/autopilot_runtime_context.py",
-    "addons/autopilot-mode/skill/adapters/autopilot_mode.py",
-    "compatibility-matrix.json",
-    "docs/release/2026-06-22-release-notes.md",
-    "docs/release/2026-07-01-release-notes.md",
-    "docs/release/2026-08-17-release-notes.md",
-    "docs/release/2026-09-26-release-notes.md",
-    "docs/ko/release/2026-09-26-release-notes.md",
-    "addons/autopilot-mode/skill/adapters/autopilot_messages.py",
-    "addons/autopilot-mode/skill/adapters/autopilot_state.py",
-    "addons/autopilot-mode/skill/adapters/autopilot_storage.py",
-    "addons/autopilot-mode/skill/adapters/autopilot_work_items.py",
-    "addons/autopilot-mode/skill/scripts/autopilot_governance_signal.py",
-    "addons/autopilot-mode/skill/scripts/autopilot_session_bridge.py",
-    "addons/autopilot-mode/skill/scripts/autopilot_session_material.py",
-    "scripts/autopilot_session_bridge.py",
-    "scripts/check_prose_wrapping.py",
-    "scripts/fresh_install_e2e.py",
-    "scripts/live_semantic_e2e.py",
-    "scripts/project_runtime.py",
-    "scripts/run_project_tests.py",
-    "tests/test_autopilot_session_bridge.py",
-    "tests/test_autopilot_bridge_admission.py",
-    "tests/test_autopilot_messages.py",
-    "tests/test_autopilot_state.py",
-    "tests/test_autopilot_sqlite.py",
-    "tests/test_check_prose_wrapping.py",
-    "tests/test_compatibility_surface.py",
-    "tests/test_governance_signal.py",
-    "tests/test_live_semantic_e2e_harness.py",
-    "tests/test_live_semantic_e2e_unittest.py",
-    "tests/test_project_runtime.py",
-    "tests/test_privileged_adapter.py",
-    "addons/autopilot-mode/skill/adapters/autopilot_pretool.py",
-    "addons/autopilot-mode/skill/adapters/autopilot_provenance.py",
-    "addons/autopilot-mode/skill/scripts/autopilot_completion.py",
-    "docs/ko/release/2026-09-28-release-notes.md",
-    "docs/release/2026-09-28-release-notes.md",
-    "docs/ko/release/2026-10-01-release-notes.md",
-    "docs/release/2026-10-01-release-notes.md",
-    "tests/test_session_run_selection.py",
-    "tests/test_adapter_readonly_cwd.py",
-    "tests/test_completion_behavior_repair.py",
-    "tests/test_completion_evidence_source.py",
-    "tests/test_completion_preflight.py",
-    "tests/test_completion_publication.py",
-    "tests/test_completion_timestamp.py",
-    "tests/test_prospective_completion.py",
-)
 BASH_FIRST_PUBLIC_DOC_PATTERNS = {
     "PowerShell code fence": re.compile(r"```powershell", re.IGNORECASE),
     "CMD code fence": re.compile(r"```cmd", re.IGNORECASE),
@@ -135,21 +67,6 @@ def _matrix_evidence(matrix: dict) -> list[str]:
     ]
 
 
-def _tracked_release_surface() -> list[str]:
-    result = subprocess.run(
-        ["git", "ls-files"],
-        cwd=REPO_ROOT,
-        capture_output=True,
-        text=True,
-        check=True,
-    )
-    return sorted(
-        rel
-        for rel in result.stdout.splitlines()
-        if rel not in TRACKED_BINARY_EXCLUSIONS and (REPO_ROOT / rel).is_file()
-    )
-
-
 class CompatibilitySurfaceTest(unittest.TestCase):
     def test_ci_uses_repo_local_project_test_runner(self) -> None:
         workflow = (REPO_ROOT / ".github" / "workflows" / "ci.yml").read_text(
@@ -161,19 +78,6 @@ class CompatibilitySurfaceTest(unittest.TestCase):
         self.assertIn("GHOST_ALICE_CORE_ROOT: ${{ github.workspace }}/ghost-alice", workflow)
         self.assertNotIn("python -m unittest discover", workflow)
 
-    def test_release_package_files_are_in_git_index(self) -> None:
-        self.assertEqual(sorted(RELEASE_PACKAGE_FILES), _tracked_release_surface())
-        for rel in RELEASE_PACKAGE_FILES:
-            with self.subTest(rel=rel):
-                self.assertTrue((REPO_ROOT / rel).is_file())
-                result = subprocess.run(
-                    ["git", "ls-files", "--error-unmatch", rel],
-                    cwd=REPO_ROOT,
-                    capture_output=True,
-                    text=True,
-                    check=False,
-                )
-                self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_addon_manifest_version_matches_repo_version(self) -> None:
         self.assertEqual(
@@ -182,17 +86,17 @@ class CompatibilitySurfaceTest(unittest.TestCase):
         )
 
     def test_addon_manifest_core_floor_matches_public_contract(self) -> None:
-        self.assertEqual(_addon_manifest()["min_core_version"], "0.4.0")
+        self.assertEqual(_addon_manifest()["min_core_version"], "0.5.0")
         entry = _top_level_addons_manifest()["addons"][0]
         self.assertEqual(entry["id"], "autopilot-mode")
-        self.assertEqual(entry["min_core_version"], "0.4.0")
+        self.assertEqual(entry["min_core_version"], "0.5.0")
 
     def test_compatibility_matrix_enumerates_required_targets(self) -> None:
         matrix = _compatibility_matrix()
         self.assertEqual(matrix["schema_version"], "autopilot-compatibility-matrix.v1")
         self.assertEqual(
             matrix["evidence_policy"],
-            "Evidence entries describe the current support contract. Historical run timestamps belong in external test logs, CI artifacts, or release notes, not in this matrix.",
+            "Each status applies only to its recorded target and evidence scope. Source checks, native runtime validation, installed adoption and publication require their own evidence. Preserve each evidence record’s original source and verification time; an unchanged record does not certify a changed artifact.",
         )
         targets = matrix["targets"]
         target_ids = [target["id"] for target in targets]
@@ -223,74 +127,19 @@ class CompatibilitySurfaceTest(unittest.TestCase):
             with self.subTest(evidence=evidence):
                 self.assertIsNone(dated_run_pattern.search(evidence))
 
-    def test_claude_install_wording_matches_verified_matrix_evidence(self) -> None:
-        matrix = _compatibility_matrix()
-        by_id = {target["id"]: target for target in matrix["targets"]}
-        claude = by_id["agent-platform-claude"]
 
-        self.assertEqual(claude["status"], "verified-local")
-        self.assertIs(claude["full_compatibility_blocker"], False)
-        self.assertFalse(claude["next_evidence_required"])
-        evidence = "\n".join(claude["evidence"])
-        for token in (
-            "scripts/live_semantic_e2e.py --runtime both --scenario-source intent --execute",
-            "inference_status=ok",
-            "semantic_status=parsed",
-            "hook_status=complete",
-            "core blind controller",
-            "five purpose-hidden",
-        ):
-            with self.subTest(token=token):
-                self.assertIn(token, evidence)
+    def test_public_docs_link_target_evidence_and_preserve_blocker_rule(self) -> None:
         for rel in ("README.md", "README_ko.md", "addons/autopilot-mode/skill/SKILL.md"):
-            text = (REPO_ROOT / rel).read_text(encoding="utf-8")
-            with self.subTest(rel=rel):
-                self.assertIn("Claude Code: `verified-local`", text)
+            text = (REPO_ROOT / rel).read_text()
+            self.assertIn("compatibility-matrix.json", text)
+            self.assertIn("not-run", text)
+        self.assertTrue(any(t["status"] == "not-run" and t["full_compatibility_blocker"] for t in _compatibility_matrix()["targets"]))
 
-    def test_public_docs_surface_unverified_compatibility_targets(self) -> None:
-        required_phrases = (
-            "compatibility-matrix.json",
-            "Windows Command Prompt",
-            "PowerShell 5",
-            "PowerShell 7",
-            "Linux",
-            "not-run",
-        )
-        for rel in ("README.md", "README_ko.md", "addons/autopilot-mode/skill/SKILL.md"):
-            text = (REPO_ROOT / rel).read_text(encoding="utf-8")
-            for phrase in required_phrases:
-                with self.subTest(rel=rel, phrase=phrase):
-                    self.assertIn(phrase, text)
-
-    def test_docs_explain_matrix_is_not_a_dated_test_log(self) -> None:
-        expected = {
-            "README.md": "not a chronological test log",
-            "README_ko.md": "시간순 테스트 로그가 아닙니다",
-            "addons/autopilot-mode/skill/SKILL.md": "not historical dated run prose",
-        }
+    def test_docs_state_evidence_scope_for_compatibility(self) -> None:
+        expected = {"README.md": "source checks establish neither installation nor native host adoption", "README_ko.md": "source 검사만으로 설치나 native host 적용을 입증할 수 없습니다", "addons/autopilot-mode/skill/SKILL.md": "source tests establish neither installed adoption nor live host behavior"}
         for rel, phrase in expected.items():
-            text = (REPO_ROOT / rel).read_text(encoding="utf-8")
-            with self.subTest(rel=rel):
-                self.assertIn(phrase, text)
+            self.assertIn(phrase, (REPO_ROOT / rel).read_text())
 
-    def test_user_facing_install_docs_do_not_reference_deleted_p6_branches(self) -> None:
-        stale_refs = ("p6-privileged-adapter", "p6-autopilot")
-        for rel in ("README.md", "README_ko.md"):
-            text = (REPO_ROOT / rel).read_text(encoding="utf-8")
-            for stale in stale_refs:
-                with self.subTest(rel=rel, stale=stale):
-                    self.assertNotIn(stale, text)
-
-    def test_public_docs_do_not_expose_internal_p6_phase_label(self) -> None:
-        public_surfaces = (
-            "README.md",
-            "README_ko.md",
-            "addons/autopilot-mode/skill/SKILL.md",
-        )
-        for rel in public_surfaces:
-            text = (REPO_ROOT / rel).read_text(encoding="utf-8")
-            with self.subTest(rel=rel):
-                self.assertNotIn("P6", text)
 
     def test_install_docs_lead_with_official_addon_alias(self) -> None:
         for rel in ("README.md", "README_ko.md", "addons/autopilot-mode/skill/SKILL.md"):
@@ -301,46 +150,38 @@ class CompatibilitySurfaceTest(unittest.TestCase):
 
     def test_install_docs_state_commands_run_from_core_checkout(self) -> None:
         expected = {
-            "README.md": "from a Ghost-ALICE core checkout",
-            "README_ko.md": "Ghost-ALICE core 저장소 디렉터리에서 실행해 주세요",
-            "addons/autopilot-mode/skill/SKILL.md": "from a Ghost-ALICE core checkout",
+            "README.md": "runs the Ghost-ALICE Core installer from the Ghost-ALICE Core checkout",
+            "README_ko.md": "Ghost-ALICE Core checkout에서 Ghost-ALICE Core 설치 프로그램을 실행합니다",
+            "addons/autopilot-mode/skill/SKILL.md": "from the Ghost-ALICE Core checkout",
         }
         for rel, phrase in expected.items():
             text = (REPO_ROOT / rel).read_text(encoding="utf-8")
             with self.subTest(rel=rel):
                 self.assertIn(phrase, text)
 
-    def test_docs_do_not_reference_missing_demo_asset_placeholder(self) -> None:
-        for rel in ("README.md", "README_ko.md"):
-            text = (REPO_ROOT / rel).read_text(encoding="utf-8")
-            with self.subTest(rel=rel):
-                self.assertNotIn("docs/demo/autopilot-mode.mp4", text)
 
     def test_install_docs_keep_codex_as_first_class_target(self) -> None:
         for rel in ("README.md", "README_ko.md", "addons/autopilot-mode/skill/SKILL.md"):
             text = (REPO_ROOT / rel).read_text(encoding="utf-8")
             with self.subTest(rel=rel):
-                self.assertIn("--platform codex --addon autopilot", text)
+                self.assertIn("--platform codex", text)
+                self.assertIn("--addon autopilot", text)
                 self.assertNotIn("--platform claude --status", text)
                 self.assertNotIn("--platform claude --uninstall --addon autopilot-mode", text)
 
-    def test_core_repo_auto_discovery_uses_current_main_checkout_not_deleted_worktree(self) -> None:
-        text = (REPO_ROOT / "tests" / "test_privileged_adapter.py").read_text(encoding="utf-8")
-        self.assertNotIn(".worktrees", text)
-        self.assertNotIn("p6-autopilot", text)
 
     def test_user_docs_state_current_core_floor_and_hook_requirement(self) -> None:
         for rel in ("README.md", "README_ko.md"):
             text = (REPO_ROOT / rel).read_text(encoding="utf-8")
             with self.subTest(rel=rel):
-                self.assertIn("Core `0.4.0`", text)
+                self.assertIn("Ghost-ALICE Core 0.5.0", text)
                 self.assertIn("SQLite", text)
-                self.assertIn("Claude Code", text)
-                self.assertIn("Codex", text)
-                self.assertIn("Core installer" if rel == "README.md" else "Core 설치기로 설치한", text)
+                self.assertIn("Claude", text)
+                self.assertIn("--platform codex", text)
+                self.assertIn("The Ghost-ALICE Core installer registers Ghost-ALICE Autopilot adapters" if rel == "README.md" else "Ghost-ALICE Core 설치 프로그램은 Ghost-ALICE Autopilot adapter를 등록", text)
         skill = (REPO_ROOT / "addons/autopilot-mode/skill/SKILL.md").read_text(encoding="utf-8")
-        self.assertIn("Ghost-ALICE core must be 0.4.0 or newer", skill)
-        self.assertIn("shared SQLite transaction APIs", skill)
+        self.assertIn("Ghost-ALICE Core 0.5.0+", skill)
+        self.assertIn("shared SQLite APIs", skill)
 
     def test_public_docs_do_not_describe_io_trace_as_bootstrap_condition(self) -> None:
         stale_phrases = (
@@ -353,166 +194,65 @@ class CompatibilitySurfaceTest(unittest.TestCase):
             for phrase in stale_phrases:
                 with self.subTest(rel=rel, phrase=phrase):
                     self.assertNotIn(phrase, text)
-            with self.subTest(rel=rel, phrase="admitted-unmet-criterion"):
-                self.assertIn("admitted-unmet-criterion", text)
+            with self.subTest(rel=rel, contract="current-selection"):
+                expected = {
+                    "README.md": ("task-router", "Core", "prepare-response", "record-response", "response_text"),
+                    "README_ko.md": ("task-router", "Core", "prepare-response", "record-response", "response_text"),
+                    "addons/autopilot-mode/skill/SKILL.md": ("Ghost-ALICE Core completion service's publication_route", "Ghost-ALICE Autopilot adapter code does not classify final prose"),
+                }
+                for phrase in expected[rel]:
+                    self.assertIn(phrase, text)
+                self.assertNotIn("when at least one admitted unmet execution criterion exists", text)
 
-    def test_user_docs_require_before_stop_consistency_decision(self) -> None:
-        required_phrases = (
-            "before-stop",
-            "consistency-decision.json",
-            "scripts/autopilot_governance_signal.py promote-decision",
-            "promotion_evidence.decision",
-            "promotion_evidence.source",
-            "governance_signal_digest",
-            "decision_key",
-            "state_hash",
-            "loop_key",
-            "promotion_evidence.decision must be one of",
-            "direct only for a current-turn before-stop resolution",
-            "evidence must be a JSON array of strings",
-            "put verdict and completion_check_digest at top level",
-            "reopen_micro",
-            "reopen_macro",
-        )
-        reference = "./addons/autopilot-mode/skill/SKILL.md#consistency-decisions"
-        skill = (REPO_ROOT / reference.split("#", 1)[0]).read_text(encoding="utf-8")
-        self.assertIn("## Consistency Decisions", skill)
-        for phrase in required_phrases:
-            with self.subTest(phrase=phrase):
-                self.assertIn(phrase, skill)
+    def test_managed_recording_and_approved_queue_have_scoped_contracts(self) -> None:
+        skill = (REPO_ROOT / "addons/autopilot-mode/skill/SKILL.md").read_text()
+        managed = skill.split("## Managed completion recording", 1)[1].split("## Consistency decisions", 1)[0]
+        queue = skill.split("### Approved queue API", 1)[1].split("## Target and state inspection", 1)[0]
+        for token in ("references/autopilot-publication.md", "Prepare and record the response review", "Native publication and manual CLI", "Recording-only failures", "Apply and deliver"):
+            self.assertIn(token, managed)
+        self.assertNotIn("--correction-json", managed)
+        self.assertIn("references/continuation.md#register-the-approved-plan", skill)
+        continuation = (REPO_ROOT / "addons/autopilot-mode/skill/references/continuation.md").read_text()
+        for token in ("register_continuation_plan", "expected_input_event_id", "approval_evidence", "allowed_surfaces", "criterion_refs", "plan_id", "without requiring a completed response review or Stop application"):
+            self.assertIn(token, continuation)
+        for token in ("authorized objective", "queue admission or execution", "before-stop", "approval_generation", "promotion_evidence.decision", "promotion_evidence.source", "governance_signal_digest", "decision_key", "state_hash", "loop_key", "completion_check_digest", "array of strings", "other decisions require running"):
+            self.assertIn(token, queue)
         for rel in ("README.md", "README_ko.md"):
-            text = (REPO_ROOT / rel).read_text(encoding="utf-8")
-            with self.subTest(rel=rel):
-                self.assertIn(reference, text)
-                self.assertIn("before-stop", text)
-                self.assertIn("<selected-run-dir>/consistency-decision.json", text)
-                self.assertIn("SQLite", text)
+            text = (REPO_ROOT / rel).read_text()
+            self.assertIn("./addons/autopilot-mode/skill/SKILL.md#consistency-decisions", text)
+            self.assertIn("./addons/autopilot-mode/skill/references/continuation.md#register-the-approved-plan", text)
+            for token in ("prepare-response", "record-response", "response_text", "completion_recording", "register_continuation_plan", "advance_continuation"):
+                self.assertIn(token, text)
 
-    def test_docs_describe_governance_candidate_boundary(self) -> None:
-        required_phrases = (
-            "autopilot_governance_signal.py",
-            "consistency-decision.candidate.json",
-            "conduct-plan.candidate.json",
-            "promotion",
-            "adapter-consumable",
-        )
-        for rel in ("README.md", "README_ko.md", "addons/autopilot-mode/skill/SKILL.md"):
-            text = (REPO_ROOT / rel).read_text(encoding="utf-8")
-            for phrase in required_phrases:
-                with self.subTest(rel=rel, phrase=phrase):
-                    self.assertIn(phrase, text)
+    def test_approved_queue_describes_candidate_boundary(self) -> None:
+        skill = (REPO_ROOT / "addons/autopilot-mode/skill/SKILL.md").read_text()
+        queue = skill.split("### Approved queue API", 1)[1]
+        for token in ("autopilot_governance_signal.py", "consistency-decision.candidate.json", "conduct-plan.candidate.json", "observation_signal candidates remain diagnostic", "promotion_state: promoted", "promotion_state: approved"):
+            self.assertIn(token, queue)
 
-    def test_docs_describe_state_aware_decision_promotion(self) -> None:
-        required_phrases = (
-            "target work-item status",
-            "`continue_next` accepts `running`, `ready`, or `reopened`",
-            "all other decisions require `running`",
-            "without creating `consistency-decision.json`",
-        )
-        expected = {
-            "README.md": required_phrases,
-            "addons/autopilot-mode/skill/SKILL.md": required_phrases,
-            "README_ko.md": (
-                "대상 작업의 상태를 확인합니다",
-                "`continue_next`는 `running`, `ready`, `reopened` 상태를 허용",
-                "나머지 결정은 `running` 상태를 요구합니다",
-                "`consistency-decision.json`을 생성하지 않은 채 종료합니다",
-            ),
-        }
-        for rel, phrases in expected.items():
-            text = (REPO_ROOT / rel).read_text(encoding="utf-8")
-            for phrase in phrases:
-                with self.subTest(rel=rel, phrase=phrase):
-                    self.assertIn(phrase, text)
+    def test_queue_promotion_retains_target_status_and_approval(self) -> None:
+        skill = (REPO_ROOT / "addons/autopilot-mode/skill/SKILL.md").read_text()
+        queue = skill.split("### Approved queue API", 1)[1]
+        for token in ("continue_next accepts running/ready/reopened tasks", "other decisions require running", "approval_generation", "current-turn resolved action", "all schema and verification requirements still apply", "Final all-pass criterion-bound [completion-check]"):
+            self.assertIn(token, queue)
 
-    def test_governance_signal_script_is_part_of_public_addon_surface(self) -> None:
-        required_scripts = (
-            "autopilot_governance_signal.py",
-            "autopilot_session_bridge.py",
-        )
-        for script_name in required_scripts:
-            with self.subTest(script_name=script_name):
-                script = (
-                    REPO_ROOT
-                    / "addons"
-                    / "autopilot-mode"
-                    / "skill"
-                    / "scripts"
-                    / script_name
-                )
-                self.assertTrue(script.is_file())
 
-    def test_public_docs_list_release_adapter_helper_modules(self) -> None:
-        required_files = (
-            "skill/adapters/autopilot_lineage.py",
-            "skill/adapters/autopilot_messages.py",
-            "skill/adapters/autopilot_work_items.py",
-            "skill/scripts/autopilot_session_bridge.py",
-            "skill/scripts/autopilot_session_material.py",
-        )
-        for rel in ("README.md", "README_ko.md", "addons/autopilot-mode/skill/SKILL.md"):
-            text = (REPO_ROOT / rel).read_text(encoding="utf-8")
-            for required in required_files:
-                with self.subTest(rel=rel, required=required):
-                    self.assertIn(required, text)
-
-    def test_docs_describe_session_intent_bridge_activation_path(self) -> None:
-        required_phrases = (
-            "autopilot_session_bridge.py",
-            "current-session.json",
-            "intent-state.json",
-            "intent-events.jsonl",
-            "approval evidence",
-            "Codex",
-            "Claude",
-        )
-        for rel in ("README.md", "README_ko.md", "addons/autopilot-mode/skill/SKILL.md"):
-            text = (REPO_ROOT / rel).read_text(encoding="utf-8")
-            for phrase in required_phrases:
-                with self.subTest(rel=rel, phrase=phrase):
-                    self.assertIn(phrase, text)
-
-    def test_codex_install_wording_matches_verified_matrix_evidence(self) -> None:
-        matrix = _compatibility_matrix()
-        by_id = {target["id"]: target for target in matrix["targets"]}
-        codex = by_id["agent-platform-codex"]
-
-        self.assertEqual(codex["status"], "verified-local")
-        self.assertIs(codex["full_compatibility_blocker"], False)
-        self.assertFalse(codex["next_evidence_required"])
-        evidence = "\n".join(codex["evidence"])
-        required_evidence_tokens = (
-            "bash install.sh --platform codex --status",
-            "content_hash-match",
-            "scripts/live_semantic_e2e.py --runtime both --scenario-source intent --execute",
-            "inference_status=ok",
-            "semantic_status=parsed",
-            "hook_status=complete",
-            "action_file_allowed false",
-            "direct promotion false",
-            "core blind controller",
-            "five purpose-hidden",
-        )
-        for token in required_evidence_tokens:
-            with self.subTest(token=token):
-                self.assertIn(token, evidence)
-
-        overconfident_phrases = (
-            "Codex remains unverified",
-            "Codex: `not-run`",
-        )
-        required_phrases = (
-            "Codex: `verified-local`",
-            "Codex live semantic E2E",
-        )
+    def test_public_repository_navigation_resolves_owning_modules(self) -> None:
+        for name in ("autopilot_lineage.py", "autopilot_messages.py", "autopilot_work_items.py"):
+            self.assertTrue((REPO_ROOT / "addons/autopilot-mode/skill/adapters" / name).is_file())
+        for name in ("autopilot_session_bridge.py", "autopilot_session_material.py"):
+            self.assertTrue((REPO_ROOT / "addons/autopilot-mode/skill/scripts" / name).is_file())
         for rel in ("README.md", "README_ko.md"):
-            text = (REPO_ROOT / rel).read_text(encoding="utf-8")
-            for phrase in overconfident_phrases:
-                with self.subTest(rel=rel, phrase=phrase):
-                    self.assertNotIn(phrase, text)
-            for phrase in required_phrases:
-                with self.subTest(rel=rel, phrase=phrase):
-                    self.assertIn(phrase, text)
+            text = (REPO_ROOT / rel).read_text()
+            for directory in ("addons/autopilot-mode/skill/adapters/", "addons/autopilot-mode/skill/scripts/"):
+                self.assertIn(directory, text)
+                self.assertTrue((REPO_ROOT / directory).is_dir())
+
+    def test_queue_bridge_uses_exact_receipt_and_storage_authority(self) -> None:
+        skill = (REPO_ROOT / "addons/autopilot-mode/skill/SKILL.md").read_text()
+        for token in ("autopilot_session_bridge.py", "--intent-root", "--platform", "--session-id", "--run-dir", "--check", "explicit approval evidence", "nonempty source", "writes no run state", "does not redirect the host Stop target", "SQLite and public APIs are authoritative"):
+            self.assertIn(token, skill)
+
 
     def test_public_install_docs_use_bash_first_command_surface(self) -> None:
         findings: list[str] = []

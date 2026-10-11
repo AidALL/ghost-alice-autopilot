@@ -1,4 +1,4 @@
-"""Transactional Autopilot authority; JSON files are migration sources or inboxes.
+"""Transactional Ghost-ALICE Autopilot authority; JSON files are validated import sources or inboxes.
 
 Bound runs share the Core ledger database and transaction. Standalone runs use
 an explicit authority.json and a separate database, never a discovered session.
@@ -17,8 +17,7 @@ import sqlite3
 import sys
 import tempfile
 import time
-from typing import Any, Mapping
-import uuid
+from typing import Mapping
 
 _ACTIVE = ContextVar("autopilot_storage", default=None)
 AUTHORITY_FILE = "authority.json"
@@ -27,6 +26,22 @@ INBOXES = {"consistency-decision.json", "conduct-plan.json"}
 MIGRATED_FILES = {"approved-run.json", "tasks.jsonl", "events.jsonl", "conduct-plan.json",
                   "conduct-plan.candidate.json", "consistency-decision.applied.json",
                   "conduct-plan.applied.json"}
+
+
+class TargetAcquisitionFailure(RuntimeError):
+    """Only selected target descriptor acquisition, never Core/processing I/O."""
+    def __init__(self, error):
+        super().__init__(str(error))
+        self.error = error
+
+
+def _target_io(operation, classify):
+    try:
+        return operation()
+    except OSError as exc:
+        if classify and (isinstance(exc,PermissionError) or exc.errno==errno.EROFS):
+            raise TargetAcquisitionFailure(exc) from exc
+        raise
 
 
 def _json(value):
@@ -42,7 +57,20 @@ def _raw(path):
         raise ValueError(f"invalid JSON in {path.name}: {exc}") from exc
 
 
+def _assert_core_location_write(path, source=None):
+    current = os.environ if source is None else source
+    if not current.get("GHOST_ALICE_OWNED_ROOT"):
+        return
+    from autopilot_work_items import _load_core_ledger_module
+    locator=Path(current.get("GHOST_ALICE_SESSION_INTENT_ROOT") or current["GHOST_ALICE_OWNED_ROOT"])/"intent-state.json"
+    core=_load_core_ledger_module(locator,current)
+    if core is None or not hasattr(core,"assert_mutation_path"):
+        raise ValueError("Core isolated location guard unavailable")
+    core.assert_mutation_path(path,env=current)
+
+
 def _atomic(path, value):
+    _assert_core_location_write(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, name = tempfile.mkstemp(prefix=".authority-", dir=path.parent)
     try:
@@ -79,9 +107,9 @@ def _descriptor(run_dir, proposed=None):
     if path.exists():
         authority = _raw(path)
         if not isinstance(authority, dict) or authority.get("schema_version") != "autopilot-authority.v1":
-            raise ValueError("invalid Autopilot authority descriptor")
+            raise ValueError("invalid Ghost-ALICE Autopilot authority descriptor")
         if proposed and any(authority.get(k) != v for k, v in proposed.items()):
-            raise ValueError("Autopilot authority differs from requested session")
+            raise ValueError("Ghost-ALICE Autopilot authority differs from requested session")
     else:
         authority = proposed
         if authority is None and (run_dir / "approved-run.json").is_file():
@@ -108,9 +136,9 @@ def _descriptor(run_dir, proposed=None):
         if not isinstance(sid, str) or not sid or Path(sid).name != sid or sid in {".", ".."} or "\\" in sid:
             raise ValueError("invalid bound authority session")
     else:
-        raise ValueError("unknown Autopilot authority kind")
+        raise ValueError("unknown Ghost-ALICE Autopilot authority kind")
     if authority.get("database_initialized") and not (root / DATABASE_FILE).is_file():
-        raise ValueError("Autopilot authority database is missing; legacy fallback is forbidden")
+        raise ValueError("Ghost-ALICE Autopilot authority database is missing; JSON fallback is forbidden")
     return dict(authority), root.resolve()
 
 
@@ -121,6 +149,10 @@ def _schema(conn):
     conn.execute("CREATE TABLE IF NOT EXISTS ap_receipts (run_key TEXT NOT NULL, generation TEXT NOT NULL, kind TEXT NOT NULL, receipt_id TEXT NOT NULL, digest TEXT NOT NULL, body_json TEXT NOT NULL, PRIMARY KEY(run_key,generation,kind,receipt_id))")
     conn.execute("CREATE TABLE IF NOT EXISTS ap_archives (run_key TEXT NOT NULL, generation TEXT NOT NULL, target TEXT NOT NULL, body BLOB NOT NULL, PRIMARY KEY(run_key,generation,target))")
     conn.execute("CREATE TABLE IF NOT EXISTS ap_migrations (run_key TEXT PRIMARY KEY, sources_json TEXT NOT NULL)")
+    conn.execute("CREATE TABLE IF NOT EXISTS ap_completion_v2_records (run_key TEXT NOT NULL, kind TEXT NOT NULL, identity TEXT NOT NULL, body_json TEXT NOT NULL, PRIMARY KEY(run_key,kind,identity))")
+    conn.execute("CREATE TABLE IF NOT EXISTS ap_completion_v2_units (run_key TEXT NOT NULL, work_unit_id TEXT NOT NULL, body_json TEXT NOT NULL, PRIMARY KEY(run_key,work_unit_id))")
+    conn.execute("CREATE TABLE IF NOT EXISTS ap_completion_v2_recovery_heads (run_key TEXT NOT NULL, work_unit_id TEXT NOT NULL, body_json TEXT NOT NULL, PRIMARY KEY(run_key,work_unit_id))")
+    conn.execute("CREATE TABLE IF NOT EXISTS ap_continuation_v2 (run_key TEXT PRIMARY KEY, body_json TEXT NOT NULL)")
 
 
 def _enable_wal(connection):
@@ -143,6 +175,7 @@ def _enable_wal(connection):
 
 @contextmanager
 def _standalone_transaction(root):
+    _assert_core_location_write(root / DATABASE_FILE)
     root.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(root / DATABASE_FILE, timeout=10, isolation_level=None)
     try:
@@ -166,6 +199,56 @@ class RunStore:
         self.authority, self.root = authority, root
         self.key = str(run_dir)
         self.inbox_bytes = {}
+
+    def continuation_plan(self):
+        row = self.connection.execute("SELECT body_json FROM ap_continuation_v2 WHERE run_key=?", (self.key,)).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def set_continuation_plan(self, value):
+        self.connection.execute("INSERT INTO ap_continuation_v2 VALUES(?,?) ON CONFLICT(run_key) DO UPDATE SET body_json=excluded.body_json",
+            (self.key, _json(value)))
+
+    def completion_read(self, kind, identity):
+        """Original v2 records survive ordinary input/run generation changes."""
+        row = self.connection.execute("SELECT body_json FROM ap_completion_v2_records WHERE run_key=? AND kind=? AND identity=?",
+            (self.key, kind, identity)).fetchone()
+        if row is None:
+            raise FileNotFoundError(identity)
+        value = json.loads(row[0])
+        from autopilot_completion_contract import digest
+        if digest(value) != identity:
+            raise ValueError("Immutable completion record was altered")
+        return value
+
+    def completion_put(self, kind, value):
+        from autopilot_completion_contract import digest
+        identity = digest(value)
+        try:
+            previous = self.completion_read(kind, identity)
+        except FileNotFoundError:
+            previous = None
+        if previous is not None and previous != value:
+            raise ValueError("Completion identity cannot be overwritten")
+        self.connection.execute("INSERT INTO ap_completion_v2_records VALUES(?,?,?,?) ON CONFLICT DO NOTHING",
+            (self.key, kind, identity, _json(value)))
+        return identity
+
+    def completion_unit(self, unit_id):
+        row = self.connection.execute("SELECT body_json FROM ap_completion_v2_units WHERE run_key=? AND work_unit_id=?",
+            (self.key, unit_id)).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def completion_set_unit(self, value):
+        self.connection.execute("INSERT INTO ap_completion_v2_units VALUES(?,?,?) ON CONFLICT(run_key,work_unit_id) DO UPDATE SET body_json=excluded.body_json",
+            (self.key, value['work_unit_id'], _json(value)))
+
+    def completion_recovery_head(self, unit_id):
+        row=self.connection.execute('SELECT body_json FROM ap_completion_v2_recovery_heads WHERE run_key=? AND work_unit_id=?',(self.key,unit_id)).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def completion_set_recovery_head(self, unit_id, value):
+        if self.completion_recovery_head(unit_id)!=value:
+            self.connection.execute('INSERT INTO ap_completion_v2_recovery_heads VALUES(?,?,?) ON CONFLICT(run_key,work_unit_id) DO UPDATE SET body_json=excluded.body_json',(self.key,unit_id,_json(value)))
 
     def run(self):
         row = self.connection.execute("SELECT authority_json,generation,run_json FROM ap_runs WHERE run_key=?", (self.key,)).fetchone()
@@ -271,13 +354,13 @@ class RunStore:
         if self.run() is not None:
             return
         if self.authority.get("migration_complete"):
-            raise ValueError("migrated run is missing from authority; legacy fallback is forbidden")
+            raise ValueError("selected run is missing from authority; JSON fallback is forbidden")
         approved = self.run_dir / "approved-run.json"
         if not approved.is_file():
             return
         sources = {name: hashlib.sha256((self.run_dir / name).read_bytes()).hexdigest() for name in MIGRATED_FILES if (self.run_dir / name).is_file()}
         value = _raw(approved)
-        # Validate legacy contracts before importing them as current authority.
+        # Validate import contracts before creating authoritative records.
         from autopilot_state import SESSION_MATERIAL
         from autopilot_work_items import validate_work_items
         value["approval_generation"] = SESSION_MATERIAL.approval_generation(value)
@@ -291,7 +374,7 @@ class RunStore:
             self.write(name, body)
         after = {name: hashlib.sha256((self.run_dir / name).read_bytes()).hexdigest() for name in sources}
         if after != sources:
-            raise ValueError("legacy run changed during migration; stop legacy writers and retry")
+            raise ValueError("source run changed during import; stop its writers and retry")
         self.connection.execute("INSERT INTO ap_migrations VALUES(?,?)", (self.key, _json(sources)))
 
     def archive_inboxes(self):
@@ -307,6 +390,7 @@ class RunStore:
             try:
                 if path.is_file() and path.read_bytes() == body:
                     continue
+                _assert_core_location_write(path)
                 path.parent.mkdir(parents=True, exist_ok=True)
                 fd, temporary = tempfile.mkstemp(prefix=".archive-", dir=path.parent)
                 try:
@@ -331,13 +415,16 @@ def core_transaction(root):
 
 
 @contextmanager
-def transaction(run_dir, source=None, *, authority=None):
+def transaction(run_dir, source=None, *, authority=None, preflight=None, migrate_legacy=True, classify_target_errors=False):
     run_dir = Path(run_dir).expanduser().resolve()
+    _assert_core_location_write(run_dir/AUTHORITY_FILE,source)
     existing = active(run_dir)
     if existing:
+        if preflight is not None:
+            preflight(existing.connection)
         yield existing
         return
-    descriptor, root = _descriptor(run_dir, authority)
+    descriptor, root = _target_io(lambda: _descriptor(run_dir, authority), classify_target_errors)
     if descriptor["kind"] == "session":
         from autopilot_work_items import _load_core_ledger_module
         core = _load_core_ledger_module(root / descriptor["platform"] / descriptor["session_id"] / "intent-state.json", source)
@@ -348,16 +435,19 @@ def transaction(run_dir, source=None, *, authority=None):
     else:
         manager = _standalone_transaction(root)
     with manager as conn:
+        if preflight is not None:
+            preflight(conn)
         _schema(conn)
-        # Write only routing metadata. DB existence is now mandatory even when
+        # Write only routing metadata. DB existence is mandatory even when
         # the first import rolls back, so deletion never selects stale JSON.
         descriptor["database_initialized"] = True
         if not (run_dir / AUTHORITY_FILE).exists() or _raw(run_dir / AUTHORITY_FILE) != descriptor:
-            _atomic(run_dir / AUTHORITY_FILE, descriptor)
+            _target_io(lambda: _atomic(run_dir / AUTHORITY_FILE, descriptor), classify_target_errors)
         store = RunStore(conn, run_dir, descriptor, root)
         token = _ACTIVE.set(store)
         try:
-            store.migrate()
+            if migrate_legacy:
+                store.migrate()
             yield store
             has_run = store.run() is not None
         finally:
@@ -388,7 +478,7 @@ def read(path):
         store = RunStore(conn, path.parent.resolve(), descriptor, root)
         if not table or store.run() is None:
             if descriptor.get("migration_complete"):
-                raise ValueError("migrated run is missing from authority; legacy fallback is forbidden")
+                raise ValueError("selected run is missing from authority; JSON fallback is forbidden")
             return _raw(path)
         return store.read(path.name)
     finally:
@@ -403,6 +493,66 @@ def exists(path):
         return False
 
 
+def read_continuation_plan(run_dir, authority):
+    """Read optional v2 scheduling state without acquiring/mutating a target."""
+    run_dir = Path(run_dir).resolve()
+    descriptor, root = _descriptor(run_dir, authority)
+    conn = sqlite3.connect((root / DATABASE_FILE).as_uri() + "?mode=ro", uri=True, timeout=10)
+    try:
+        conn.execute("BEGIN")
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ap_continuation_v2'").fetchone():
+            return None
+        return RunStore(conn, run_dir, descriptor, root).continuation_plan()
+    finally:
+        conn.close()
+
+
+def bound_completion_targets(source):
+    """Read immutable Ghost-ALICE Autopilot targets for only the exact current ledger/session.
+
+This is a routing lookup, never receipt reuse or admission. Missing routing
+metadata must not turn a previously captured origin into a new location.
+"""
+    locator = source.get("GHOST_ALICE_SESSION_INTENT_ROOT")
+    if not locator:
+        return []
+    root = Path(locator).expanduser()
+    if not root.is_absolute():
+        raise ValueError("bound completion target lookup requires an absolute authority root")
+    root = root.resolve()
+    database = root / DATABASE_FILE
+    if not database.is_file():
+        return []
+    existing = _ACTIVE.get()
+    conn = existing.connection if existing and existing.root == root else sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=10)
+    owned_connection = not (existing and conn is existing.connection)
+    try:
+        if owned_connection:
+            conn.execute("BEGIN")
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='ap_completion_v2_records'").fetchone():
+            return []
+        rows = conn.execute("SELECT run_key,identity,body_json FROM ap_completion_v2_records WHERE kind='receipt' "
+            "AND json_extract(body_json,'$.binding.platform')=? AND json_extract(body_json,'$.binding.session_id')=?",
+            (source.get("GHOST_ALICE_PLATFORM"), source.get("GHOST_ALICE_SESSION_ID"))).fetchall()
+        from autopilot_completion_contract import digest, validate_target
+        targets = {}
+        for run_key, identity, raw in rows:
+            receipt = json.loads(raw)
+            if digest(receipt) != identity:
+                raise ValueError("bound completion receipt integrity mismatch")
+            target = receipt["target"]
+            validate_target(target)
+            owner = dict(platform=source.get("GHOST_ALICE_PLATFORM"), session_id=source.get("GHOST_ALICE_SESSION_ID"))
+            if (receipt['binding'].get('intent_root') != str(root) or target['authority'] != str(root)
+                    or target['owner'] != owner or Path(target['path']).resolve() != Path(run_key)):
+                raise ValueError("bound completion target ownership mismatch")
+            targets[target['path']] = dict(target)
+        return list(targets.values())
+    finally:
+        if owned_connection:
+            conn.close()
+
+
 def write(path, value):
     path = Path(path)
     store = active(path.parent)
@@ -410,7 +560,7 @@ def write(path, value):
         store.write(path.name, value)
         return True
     if (path.parent / AUTHORITY_FILE).is_file():
-        descriptor, root = _descriptor(path.parent.resolve())
+        descriptor, _ = _descriptor(path.parent.resolve())
         if descriptor.get("database_initialized"):
             with transaction(path.parent) as store:
                 store.write(path.name, value)
@@ -505,10 +655,10 @@ def migrate_bound_session(store, source=None):
 
 
 @contextmanager
-def accessible_transaction(run_dir, source=None, *, authority=None, permission_denied_noop=False):
+def accessible_transaction(run_dir, source=None, *, authority=None, permission_denied_noop=False, preflight=None):
     """Only acquisition failure may become a no-op, never processing failure."""
     try:
-        manager = transaction(run_dir, source, authority=authority)
+        manager = transaction(run_dir, source, authority=authority, preflight=preflight)
         store = manager.__enter__()
     except OSError as exc:
         if not permission_denied_noop or not (isinstance(exc, PermissionError) or exc.errno == errno.EROFS):
@@ -522,3 +672,26 @@ def accessible_transaction(run_dir, source=None, *, authority=None, permission_d
             raise
     else:
         manager.__exit__(None, None, None)
+
+
+@contextmanager
+def completion_authority_transaction(run_dir, source, *, authority, preflight):
+    """Record Ghost-ALICE Autopilot diagnostics only in the already bound Core authority.
+
+    Never acquires or marks a target directory, creates queue runs/tasks, or
+    updates Core criteria. The supplied preflight callback validates current
+    native selection inside this transaction before Ghost-ALICE Autopilot table/record writes.
+    """
+    if authority.get('kind') != 'session' or preflight is None:
+        raise ValueError('Completion diagnostic requires current session preflight')
+    root = Path(authority['ledger_root']).resolve()
+    if not (root / DATABASE_FILE).is_file():
+        raise ValueError('Existing current authority required for completion diagnostic')
+    from autopilot_work_items import _load_core_ledger_module
+    core = _load_core_ledger_module(root / authority['platform'] / authority['session_id'] / 'intent-state.json', source)
+    if core is None:
+        raise ValueError('Current Core authority unavailable')
+    with core.storage_transaction(root) as connection:
+        preflight(connection)
+        _schema(connection)
+        yield RunStore(connection, Path(run_dir).expanduser().resolve(), authority, root)

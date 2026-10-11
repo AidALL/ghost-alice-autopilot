@@ -14,6 +14,7 @@ import unittest
 from unittest import mock
 
 import test_completion_publication as base
+from response_route_fixture import retained_publication_fixture
 
 
 class CompletionTimestampTest(unittest.TestCase):
@@ -57,10 +58,8 @@ class CompletionTimestampTest(unittest.TestCase):
         fixture = RETAINED[name]
         original = fixture['proof']
         self.assertEqual(hashlib.sha256(original.encode()).hexdigest(), fixture['proof_sha256'])
-        state = json.loads(self.state_path.read_text())
-        state['acceptance_criteria'] = [dict(id=i, summary='Retained ' + i,
-            source='user-explicit', admitted=True, status='unmet') for i in fixture['criteria']]
-        self.state_path.write_text(json.dumps(state))
+        retained_publication_fixture(self, [dict(id=i, summary='Retained ' + i,
+            source='user-explicit', admitted=True, status='unmet') for i in fixture['criteria']])
         verified = datetime.fromisoformat(fixture['verified_at'])
         class OriginalClock(datetime):
             @classmethod

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Shared session-intent material helpers for autopilot bridge and adapter.
+"""Shared session-intent material helpers for Ghost-ALICE Autopilot bridge and adapter.
 
 Dependencies: Python 3.11+ standard library only.
 """
@@ -11,9 +11,7 @@ import copy
 import hashlib
 import json
 import os
-import shutil
 import tempfile
-import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
@@ -21,7 +19,6 @@ from typing import Any, Mapping
 
 RUN_SCHEMA_VERSION = "autopilot-run.v1"
 DEFAULT_STOP_CONDITIONS = ["budget_exhausted", "user_stop"]
-APPROVAL_DECISIONS = {"go", "approve", "approved", "auto"}
 SAFE_EVENT_KEYS = (
     "event",
     "event_id",
@@ -95,26 +92,6 @@ def write_json_atomic(path: str | Path, value: Mapping[str, Any]) -> None:
                 pass
 
 
-def write_jsonl_atomic(path: str | Path, rows: list[Mapping[str, Any]]) -> None:
-    target = Path(path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=target.parent)
-    tmp_path = Path(tmp_name)
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8") as out:
-            for row in rows:
-                out.write(json.dumps(row, ensure_ascii=True, sort_keys=True, separators=(",", ":")))
-                out.write("\n")
-        os.replace(tmp_path, target)
-        tmp_path = None
-    finally:
-        if tmp_path is not None:
-            try:
-                tmp_path.unlink()
-            except FileNotFoundError:
-                pass
-
-
 def safe_id(value: str, fallback: str = "session-intent") -> str:
     safe = "".join(ch.lower() if ch.isalnum() else "-" for ch in value).strip("-")
     while "--" in safe:
@@ -142,7 +119,7 @@ def safe_recent_events(events: list[dict[str, Any]], limit: int = 20) -> list[di
 def session_evidence(material: Mapping[str, Any]) -> dict[str, Any]:
     """Capture the exact input and criterion definitions used to approve work."""
     events = material["events"]
-    return {
+    evidence = {
         "platform": material["platform"], "session_id": material["session_id"],
         "state_path": str(material["state_path"]), "events_path": str(material["events_path"]),
         "event_count": len(events), "latest_event": compact_event(events[-1] if events else None),
@@ -152,6 +129,10 @@ def session_evidence(material: Mapping[str, Any]) -> dict[str, Any]:
         "recent_events": safe_recent_events(events),
         "acceptance_criteria": copy.deepcopy(material["intent_state"].get("acceptance_criteria", [])),
     }
+    for key in ("selected_work_units", "selected_criteria"):
+        if key in material:
+            evidence[key] = copy.deepcopy(material[key])
+    return evidence
 
 
 def run_summary(intent_state: Mapping[str, Any]) -> str:
@@ -159,7 +140,7 @@ def run_summary(intent_state: Mapping[str, Any]) -> str:
         value = intent_state.get(key)
         if isinstance(value, str) and value.strip():
             return value.strip()
-    return "Autopilot run bootstrapped from session-intent ledger."
+    return "Ghost-ALICE Autopilot run bootstrapped from session-intent ledger."
 
 
 def _criterion_context(raw: Any) -> str | None:
@@ -307,9 +288,10 @@ def approval_generation(run: Mapping[str, Any]) -> str | None:
     approval = run.get("approval_evidence")
     binding = approval.get("session_intent") if isinstance(approval, Mapping) else None
     if not isinstance(binding, Mapping):
-        return None  # Legacy standalone task-only contract.
+        return None  # Standalone task-only contract.
     criteria = binding.get("acceptance_criteria")
-    definitions = [{key: row.get(key) for key in ("id", "summary", "source", "admitted")}
+    definitions = [dict({key: row.get(key) for key in ("id", "summary", "source", "admitted")},
+                        **{key: row[key] for key in ("work_unit_id", "contract_revision") if key in row})
                    for row in criteria if isinstance(row, Mapping)] if isinstance(criteria, list) else None
     if definitions is not None:
         definitions.sort(key=lambda row: str(row.get("id")))
@@ -321,6 +303,8 @@ def approval_generation(run: Mapping[str, Any]) -> str | None:
         "acceptance_criteria": definitions, "scope": run.get("scope"),
         "allowed_surfaces": run.get("allowed_surfaces"), "stop_conditions": run.get("stop_conditions"),
     }
+    if "selected_work_units" in binding:
+        contract["selected_work_units"] = binding["selected_work_units"]
     return "sha256:" + hashlib.sha256(json.dumps(contract, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
 
 
@@ -328,23 +312,6 @@ def validate_approval_generation(run: Mapping[str, Any], artifact: Mapping[str, 
     expected = approval_generation(run)
     if expected and artifact.get("approval_generation") != expected:
         raise SessionMaterialError("artifact approval generation differs from the approved run")
-
-
-def archive_superseded_run(run_dir: Path, old_generation: str | None) -> Path:
-    """Preserve one run generation before replacing it, under the caller's lock."""
-    history = run_dir / ".approval-history" / f"{(old_generation or 'legacy').removeprefix('sha256:')}-{uuid.uuid4().hex}"
-    history.mkdir(parents=True)
-    paths = {run_dir / name for name in ("approved-run.json", "tasks.jsonl", "events.jsonl")}
-    paths.update(run_dir.glob("consistency-decision*.json"))
-    paths.update(run_dir.glob("conduct-plan*.json"))
-    paths = sorted(path for path in paths if path.is_file())
-    for path in paths:
-        shutil.copyfile(path, history / path.name)
-    # Remove actionable old-generation files only after every copy exists.
-    # OFF is intentionally outside this set: reapproval cannot remove a pause.
-    for path in paths:
-        path.unlink()
-    return history
 
 
 def load_governance_signal_module(*, required: bool = False):

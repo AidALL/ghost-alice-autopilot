@@ -1,5 +1,5 @@
 {
-  "addon_version": "0.4.1",
+  "addon_version": "0.5.0",
   "addon_id": "autopilot-mode",
   "skills": [
     {
@@ -12,7 +12,7 @@
     "claude",
     "codex"
   ],
-  "min_core_version": "0.4.0",
+  "min_core_version": "0.5.0",
   "depends_on_core": [
     "session-intent-analyzer",
     "task-router",

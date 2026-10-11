@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run evaluator-visible live semantic E2E diagnostics for Ghost-ALICE autopilot; hidden-purpose release acceptance remains owned by the Ghost-ALICE core blind controller, and authentication status remains separate from inference evidence."""
+"""Run evaluator-visible live semantic E2E diagnostics for Ghost-ALICE Autopilot; hidden-purpose release acceptance remains owned by the Ghost-ALICE core blind controller, and authentication status remains separate from inference evidence."""
 
 from __future__ import annotations
 
@@ -34,7 +34,7 @@ OBSERVATION_MODE = "evaluator-visible-diagnostic"
 HIDDEN_PURPOSE_RELEASE_OWNER = "ghost-alice-core-blind-controller"
 DEFAULT_INTENT_SCENARIO_LIMIT = 12
 DEFAULT_CLAUDE_MAX_BUDGET_USD = 1.00
-SEMANTIC_RESPONSE_FORMAT_INSTRUCTION = "Return exactly one fenced `json` object containing keys: verdict, mismatch_detected, focus_layer, next_action, loop_guard."
+SEMANTIC_RESPONSE_FORMAT_INSTRUCTION = "The evaluator returns exactly one fenced `json` object containing keys: verdict, mismatch_detected, focus_layer, next_action, loop_guard."
 RAW_INTENT_FIELDS = {"raw_prompt", "transcript", "message_log", "conversation"}
 
 
@@ -201,9 +201,9 @@ def _scenario_prompt_from_intent(
     feedback: Mapping[str, Any] | None = None,
 ) -> str:
     lines = [
-        "You are evaluating a compressed Ghost-ALICE intent artifact.",
-        "Do not use tools. Do not browse. Do not execute shell commands. Do not read or write files.",
-        "Judge only what the autopilot controller should do from the compressed artifact below.",
+        "The evaluator assesses the controller decision supported by the compressed Ghost-ALICE intent artifact below.",
+        "For the diagnostic scenario evaluation only, the evaluator uses the supplied artifact without tools, browsing, shell commands or file access.",
+        "The evaluator proposes a controller action from the supplied artifact; the diagnostic verdict grants no task execution authority.",
         "",
         "Compressed intent source:",
         f"Source platform: {platform}",
@@ -235,8 +235,8 @@ def _scenario_prompt_from_intent(
     lines.extend(
         [
             "",
-            "Evaluate how an autopilot controller should respond to this compressed intent artifact.",
-            "Classify whether it should continue, reopen focus, update a plan or skill, request verification, or ask the user.",
+            "The evaluator identifies the next controller action supported by the displayed goal, constraints and evidence.",
+            "The evaluator selects continuation, focus reassessment, plan or skill correction, verification, or a human-owned decision, and names the affected task or artifact.",
             SEMANTIC_RESPONSE_FORMAT_INSTRUCTION,
         ]
     )
@@ -334,9 +334,9 @@ def _static_live_scenarios() -> list[LiveScenario]:
             LiveScenario(
                 id=item["id"],
                 prompt=(
-                    "You are evaluating a hypothetical Ghost-ALICE autopilot behavior scenario. "
-                    "Do not execute repository, install, auth, shell, or file actions described in the scenario. "
-                    "Evaluate the scenario text and classify the intended agent behavior only.\n\n"
+                    "The evaluator assesses the hypothetical Ghost-ALICE Autopilot scenario below. "
+                    "For the diagnostic evaluation only, the evaluator must not execute the repository, installation, authentication, shell or file actions in the scenario. "
+                    "The evaluator classifies the intended agent behavior from the scenario text; the verdict grants no execution authority.\n\n"
                     f"Scenario text:\n{source_prompt}\n\n"
                     + SEMANTIC_RESPONSE_FORMAT_INSTRUCTION
                 ),

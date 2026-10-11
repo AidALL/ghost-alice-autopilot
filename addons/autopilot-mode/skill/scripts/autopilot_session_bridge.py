@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
-"""Bootstrap autopilot run state from a session-intent ledger.
+"""Inspect or admit an explicitly approved queue from exact current session intent.
 
-This bridge is deliberately approval-gated. It can read session-intent state
-and event metadata, but it writes adapter-consumable autopilot state only when
-explicit approval evidence is supplied by the caller.
+The current-session assistant requests this CLI through the native host shell
+tool with receipt-bound --intent-root, --platform, --session-id and the selected
+--run-dir. --check returns latest_input_event and automatic_target without
+writing run state. A requested directory does not configure the host Stop target.
+Admission additionally requires the approval receipt --input-event-id, task
+--current-work-item-id, approved --plan-path and actual --approval-evidence-json;
+budget, allowed surfaces and stop conditions retain the user's authorization.
+The result reports mode, writes_state, approval_generation and automatic_target.
+The bridge validates and records supplied authority; it does not obtain user
+approval, execute the task or guarantee that a future host hook selects this run.
 
 Dependencies: Python 3.11+ standard library plus sibling skill scripts.
 """
@@ -57,19 +64,8 @@ def _write_json_atomic(path: str | Path, value: Mapping[str, Any]) -> None:
     SESSION_MATERIAL.write_json_atomic(path, value)
 
 
-def _load_governance_signal_module():
-    try:
-        return SESSION_MATERIAL.load_governance_signal_module(required=True)
-    except ValueError as exc:
-        raise BridgeError(str(exc)) from exc
-
-
 def _safe_id(value: str) -> str:
     return SESSION_MATERIAL.safe_id(value)
-
-
-def _write_jsonl_atomic(path: str | Path, rows: list[Mapping[str, Any]]) -> None:
-    SESSION_MATERIAL.write_jsonl_atomic(path, rows)
 
 
 def _approval_evidence(value: str) -> dict[str, Any]:
@@ -162,8 +158,25 @@ def bridge_session_intent_to_run_state(
 ) -> dict[str, Any]:
     if not input_event_id:
         raise BridgeError("--input-event-id is required; submit the receipt used to approve this work")
-    source = os.environ if source is None else source
+    source = dict(os.environ if source is None else source)
     material = _session_material(intent_root, platform, session_id, input_event_id, source=source)
+    explicit = {"GHOST_ALICE_SESSION_INTENT_ROOT": str(intent_root.expanduser().resolve()),
+                "GHOST_ALICE_PLATFORM": platform, "GHOST_ALICE_SESSION_ID": material["session_id"]}
+    for key, value in explicit.items():
+        observed = source.get(key)
+        if observed and key == "GHOST_ALICE_SESSION_INTENT_ROOT":
+            observed = str(Path(observed).expanduser().resolve())
+        if observed and observed != value:
+            raise BridgeError("bridge coordinate disagrees with current " + key)
+        source[key] = value
+    if platform == "codex" and source.get("CODEX_THREAD_ID") not in (None, "", material["session_id"]):
+        raise BridgeError("bridge session disagrees with current native session")
+    from autopilot_intent_recovery import project_session_material, admission_preflight
+    material, selection = project_session_material(material, source, run_dir)
+    if selection["status"] != "selected":
+        if selection["reason"] == "run-owner-mismatch":
+            raise BridgeError("refusing to replace a run without the same session, platform and authority binding")
+        return dict(selection, writes_state=False, mode="skipped", run_dir=str(run_dir))
     state_path, events_path = material["state_path"], material["events_path"]
     intent_state, events = material["intent_state"], material["events"]
     resolved_session_id = material["session_id"]
@@ -180,12 +193,8 @@ def bridge_session_intent_to_run_state(
     allowed = allowed_surfaces or [plan_path]
     stops = stop_conditions or list(DEFAULT_STOP_CONDITIONS)
 
-    governance_signal = _load_governance_signal_module()
-
-
     _require_compatible_existing_run(run_dir, platform, resolved_session_id)
     automatic_target = _automatic_target(run_dir, platform, resolved_session_id, source)
-    run_dir.mkdir(parents=True, exist_ok=True)
     approved_run = SESSION_MATERIAL.build_approved_run(
         intent_state=intent_state,
         approval_evidence=merged_approval,
@@ -204,23 +213,14 @@ def bridge_session_intent_to_run_state(
         approved_run["scope"]["publication_mode"] = "session-intent-task"
         approved_run["scope"]["latest_scope"] = copy.deepcopy(intent_state.get("latest_scope", {}))
         approved_run["approval_generation"] = SESSION_MATERIAL.approval_generation(approved_run)
-    # Explicit publication preserves the admitted business criteria. Advisory
-    # conduct feedback cannot replace them with a separate multi-item plan.
-    # The scope marker gives this route its own immutable approval generation.
-    candidate = None if bind_completion_contract else governance_signal.conduct_plan_candidate_from_governance(
-        intent_state=intent_state, current_work_item_id=current_work_item_id,
-        plan_path=plan_path, approval_generation=approved_run["approval_generation"],
-    )
-    mode = "session-intent-task"
-    conduct_plan_path: str | None = None
-    conduct_plan_candidate_path: str | None = None
-    conduct_plan_candidate_id: str | None = None
-    tasks_path: str | None = None
-    task_id: str | None = None
     _, adapter = _adapter_modules()
-    with adapter.storage.transaction(run_dir, source, authority=adapter.storage.bound_authority(approved_run)) as store:
+    with adapter.storage.transaction(run_dir, source, authority=adapter.storage.bound_authority(approved_run),
+            preflight=admission_preflight(material, source, run_dir)) as store:
         _require_compatible_existing_run(run_dir, platform, resolved_session_id)
         current = _session_material(intent_root, platform, resolved_session_id, latest_input_event["event_id"], source=source)
+        current, selection = project_session_material(current, source, run_dir)
+        if selection["status"] != "selected":
+            raise BridgeError("current response route changed during admission")
         if current["intent_state"] != intent_state:
             raise BridgeError("intent state changed during admission; inspect current input before retrying")
         existing_path = run_dir / "approved-run.json"
@@ -235,33 +235,19 @@ def bridge_session_intent_to_run_state(
             # Prior generation remains immutable in SQLite; inbox generations are checked.
         adapter.storage.migrate_bound_session(store, source)
         store.put_run(approved_run)
-        if candidate is not None:
-            approved_plan = governance_signal.promote_conduct_plan_candidate(
-                candidate,
-                approval_evidence=merged_approval,
-            )
-            if approved_plan is None:
-                raise BridgeError("conduct-plan candidate was not promotable with supplied approval evidence")
-            store.write("conduct-plan.candidate.json", candidate)
-            store.write("conduct-plan.json", approved_plan)
-            mode = "conduct-plan"
-            conduct_plan_path = str(run_dir / "conduct-plan.json")
-            conduct_plan_candidate_path = str(run_dir / "conduct-plan.candidate.json")
-            conduct_plan_candidate_id = candidate.get("candidate_id") if isinstance(candidate.get("candidate_id"), str) else None
-        else:
-            task = SESSION_MATERIAL.session_intent_task(
-                intent_state=intent_state,
-                session_id=resolved_session_id,
-                allowed_surfaces=allowed,
-                source_locator=f"{state_path}#intent-state",
-            )
-            store.write("tasks.jsonl", [task])
-            tasks_path = str(run_dir / "tasks.jsonl")
-            task_id = task["id"]
+        # Generic run approval covers the admitted business task. A conduct
+        # proposal requires its own explicit approval before queue import.
+        task = SESSION_MATERIAL.session_intent_task(
+            intent_state=intent_state,
+            session_id=resolved_session_id,
+            allowed_surfaces=allowed,
+            source_locator=f"{state_path}#intent-state",
+        )
+        store.write("tasks.jsonl", [task])
         store.put_run(approved_run)
 
     return {
-        "mode": mode,
+        "mode": "session-intent-task",
         "authority_database": str(intent_root.resolve() / "ghost-state.sqlite3"),
         "run_dir": str(run_dir),
         "state_path": str(state_path),
@@ -271,11 +257,11 @@ def bridge_session_intent_to_run_state(
         "latest_input_event": latest_input_event,
         "latest_intent_update_event": latest_intent_update_event,
         "approved_run_path": str(run_dir / "approved-run.json"),
-        "conduct_plan_path": conduct_plan_path,
-        "conduct_plan_candidate_path": conduct_plan_candidate_path,
-        "conduct_plan_candidate_id": conduct_plan_candidate_id,
-        "tasks_path": tasks_path,
-        "task_id": task_id,
+        "conduct_plan_path": None,
+        "conduct_plan_candidate_path": None,
+        "conduct_plan_candidate_id": None,
+        "tasks_path": str(run_dir / "tasks.jsonl"),
+        "task_id": task["id"],
         "run_id": run_id,
         "approval_generation": approved_run["approval_generation"],
         "automatic_target": automatic_target,

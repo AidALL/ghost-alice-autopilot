@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Durable Stop adapter orchestration for Ghost-ALICE autopilot mode.
+"""Durable Stop adapter orchestration for Ghost-ALICE Autopilot.
 
 Dependencies: Python 3.11+ standard library plus sibling adapter modules.
 """
@@ -7,31 +7,27 @@ Dependencies: Python 3.11+ standard library plus sibling adapter modules.
 from __future__ import annotations
 
 import copy
-import errno
 import hashlib
 import autopilot_storage as storage
-from autopilot_provenance import bind_origin, reapproval_payload, default_intent_root
-from contextlib import contextmanager
+from autopilot_provenance import bind_origin, reapproval_payload
 import importlib.util
 import json
 import os
 import tempfile
-import time
 from pathlib import Path
 from typing import Any, Mapping
 
 from autopilot_messages import (
     build_continuation_message,
     build_meta_intervention_message,
-    build_semantic_delta_starvation_message,
-    compact_governance_candidate,
 )
 from autopilot_intent_recovery import (
-    open_conduct_feedback_evidence,
     semantic_delta_starvation_event,
-    unmet_admitted_criteria_evidence,
+    project_queue_session_material as project_session_material,
+    admission_preflight,
 )
 from autopilot_runtime_context import (
+    SessionAuthorityError,
     project_cwd_from_env as _project_cwd_from_env,
     read_session_material,
     resolve_run_target,
@@ -44,9 +40,7 @@ from autopilot_lineage import (
     continuation_context_error,
     current_session_context,
     session_binding_mismatch_event,
-    stale_continuation_event,
     stale_continuation_missing_intent_event,
-    stale_continuation_source_intent_event,
 )
 from autopilot_work_items import (
     APPROVAL_DECISIONS,
@@ -56,6 +50,7 @@ from autopilot_work_items import (
     _has_explicit_approval_evidence,
     _require_string,
     _validate_string_list,
+    _with_core_policy_source,
     apply_conduct_plan_proposals,
     apply_consistency_decision,
     derive_ready_queue,
@@ -75,17 +70,13 @@ DECISION_FILE = "consistency-decision.json"
 APPLIED_DECISION_FILE = "consistency-decision.applied.json"
 REJECTED_DECISION_FILE = "consistency-decision.rejected.json"
 EVENTS_FILE = "events.jsonl"
-OFF_FILE = "OFF"
-LOCK_DIR = ".advance.lock"
-LOCK_TIMEOUT_SECONDS = 10.0
-LOCK_POLL_SECONDS = 0.02
-# Ceiling on io-trace-backed resumes of a decision-less running item; past it, escalate to ask_user_meta even while io-trace remains (else it re-fires forever). Platform-neutral.
+# Ceiling on io-trace-backed resumes of a decision-less running item; past it,
+# park recording without inventing a human decision or stopping the business task.
 IOTRACE_RESUME_LIMIT_DEFAULT = 3
 IOTRACE_RESUME_LIMIT_ENV = "GHOST_ALICE_AUTOPILOT_IOTRACE_RESUME_LIMIT"
 NOOP_PAYLOAD = {"continue": True, "systemMessage": ""}
 CONSISTENCY_DECISION_SCHEMA = "autopilot-consistency-decision.v1"
 CONSISTENCY_DECISION_CANDIDATE_SCHEMA = "autopilot-consistency-decision-candidate.v1"
-OBSERVATION_SIGNAL_SCHEMA = "autopilot-observation-signal.v1"
 AUTO_APPROVAL_ENV = "GHOST_ALICE_AUTOPILOT_APPROVAL_EVIDENCE_JSON"
 IO_TRACE_FILE_ENV = "GHOST_ALICE_IO_TRACE_FILE"
 AUTOPILOT_APPROVAL_DECISION_IDS = frozenset({"autopilot-run-approval", "autopilot-approval"})
@@ -111,12 +102,6 @@ def _noop_payload() -> dict[str, Any]:
 
 
 def _has_non_empty_scope(value: Any) -> bool:
-    if isinstance(value, str):
-        return bool(value.strip())
-    return isinstance(value, dict) and bool(value)
-
-
-def _has_non_empty_approval_evidence(value: Any) -> bool:
     if isinstance(value, str):
         return bool(value.strip())
     return isinstance(value, dict) and bool(value)
@@ -159,13 +144,6 @@ def _read_json_object(path: Path) -> dict[str, Any]:
     if not isinstance(value, dict):
         raise AutopilotStateError(f"{path}: expected JSON object")
     return value
-
-
-def _try_read_json_object(path: Path) -> dict[str, Any]:
-    try:
-        return _read_json_object(path)
-    except (OSError, json.JSONDecodeError, AutopilotStateError):
-        return {}
 
 
 def _read_jsonl_objects(path: Path) -> list[dict[str, Any]]:
@@ -214,18 +192,6 @@ def _safe_id(value: str) -> str:
     return SESSION_MATERIAL.safe_id(value)
 
 
-def _compact_event(event: Mapping[str, Any] | None) -> dict[str, Any]:
-    return SESSION_MATERIAL.compact_event(event)
-
-
-def _latest_event_of(events: list[dict[str, Any]], event_name: str) -> dict[str, Any]:
-    return SESSION_MATERIAL.latest_event_of(events, event_name)
-
-
-def _safe_recent_events(events: list[dict[str, Any]], limit: int = 20) -> list[dict[str, Any]]:
-    return SESSION_MATERIAL.safe_recent_events(events, limit=limit)
-
-
 def _io_trace_path(source: Mapping[str, str]) -> Path:
     configured = str(source.get(IO_TRACE_FILE_ENV) or "").strip()
     if configured:
@@ -268,65 +234,6 @@ def _read_io_trace_rows(
         if len(selected) >= limit:
             break
     return list(reversed(selected))
-
-
-def _io_trace_observation_signal(
-    *,
-    work_item_id: str,
-    focus_layer: str,
-    run_id: str,
-    session_id: str | None,
-    rows: list[dict[str, Any]],
-) -> dict[str, Any] | None:
-    if not rows:
-        return None
-    last = rows[-1]
-    signal_id_parts = ["iotrace", run_id, work_item_id]
-    if session_id:
-        signal_id_parts.append(session_id)
-    return {
-        "schema_version": OBSERVATION_SIGNAL_SCHEMA,
-        "source": "autopilot_state.io_trace",
-        "signal_id": _safe_id("-".join(signal_id_parts)),
-        "runtime": "stop-adapter",
-        "scenario_id": "stop-iotrace-continuation",
-        "classification": "semantic-observation",
-        "inference_status": "ok",
-        "semantic_status": "parsed",
-        "hook_status": "io-trace-present",
-        "agent_activity": str(last.get("tool") or "tool-using"),
-        "mismatch_detected": True,
-        "focus_layer": focus_layer or "macro",
-        "verdict": "reopen_focus",
-        "next_action": "continue from latest io-trace",
-        "loop_guard": "do not stop while io-trace material remains unresolved",
-    }
-
-
-def _governance_candidate_from_iotrace(
-    *,
-    work_item_id: str,
-    focus_layer: str,
-    run_id: str,
-    session_id: str | None,
-    rows: list[dict[str, Any]],
-) -> dict[str, Any] | None:
-    governance_signal = _load_governance_signal_module()
-    if governance_signal is None:
-        return None
-    observation_signal = _io_trace_observation_signal(
-        work_item_id=work_item_id,
-        focus_layer=focus_layer,
-        run_id=run_id,
-        session_id=session_id,
-        rows=rows,
-    )
-    if observation_signal is None:
-        return None
-    return governance_signal.decision_candidate_from_governance(
-        work_item_id=work_item_id,
-        governance_signal=observation_signal,
-    )
 
 
 def _valid_approval_evidence(value: Any) -> dict[str, Any] | None:
@@ -424,14 +331,17 @@ def _bootstrap_from_session_intent_if_approved(
     resolved = None
     approval = None
     for candidate in _iter_current_session_intents(source, project_cwd, hook_input=hook_input):
+        from autopilot_runtime_context import selected_session_context
+        source = selected_session_context(candidate, source, hook_input=hook_input)
+        candidate, selection = project_session_material(candidate, source, run_dir)
+        if selection["status"] != "selected":
+            continue
         intent_state = candidate["intent_state"]
         if not isinstance(intent_state, Mapping):
             continue
         candidate_approval = (
             _approval_from_env(source)
             or _approval_from_session_decisions(intent_state)
-            or unmet_admitted_criteria_evidence(intent_state)
-            or open_conduct_feedback_evidence(intent_state)
         )
         if candidate_approval is None:
             continue
@@ -441,15 +351,13 @@ def _bootstrap_from_session_intent_if_approved(
     if resolved is None:
         return False
     if expected_input_event is not None and resolved.get("latest_input_event") != expected_input_event:
-        raise AutopilotStateError("input changed before completion admission; original caller receipt is stale")
+        raise AutopilotStateError("input changed before completion admission; expected_input_event no longer matches current intake")
     intent_state = resolved["intent_state"]
     if not isinstance(intent_state, Mapping):
         return False
     if approval is None:
         return False
 
-    events_path = resolved["events_path"]
-    events = resolved["events"]
     session_evidence = SESSION_MATERIAL.session_evidence(resolved)
     io_trace_rows = _read_io_trace_rows(source, session_id=str(resolved["session_id"]), limit=8)
     if io_trace_rows:
@@ -464,7 +372,6 @@ def _bootstrap_from_session_intent_if_approved(
     allowed_surfaces = [plan_path]
     intent_events_path = resolved.get("events_path")
     initial_watermark = _intent_events_count(Path(intent_events_path)) if intent_events_path else 0
-    run_dir.mkdir(parents=True, exist_ok=True)
     approved_run = SESSION_MATERIAL.build_approved_run(
         intent_state=intent_state, approval_evidence=merged_approval,
         run_id=f"session-intent-{resolved['platform']}-{_safe_id(str(resolved['session_id']))}",
@@ -479,13 +386,17 @@ def _bootstrap_from_session_intent_if_approved(
         "state_path": str(resolved["state_path"]),
     }
     with storage.accessible_transaction(run_dir, source, authority=storage.bound_authority(approved_run),
-                                       permission_denied_noop=permission_denied_noop) as store:
+                                       permission_denied_noop=permission_denied_noop,
+                                       preflight=admission_preflight(resolved, source, run_dir, queue=True)) as store:
         if store is None or store.run() is not None:
             return False
         current = read_session_material(resolved["state_path"].parent.parent.parent,
             resolved["platform"], resolved["session_id"], source=source)
+        current, selection = project_session_material(current, source, run_dir)
+        if selection["status"] != "selected":
+            raise AutopilotStateError("current response route changed during bootstrap")
         if expected_input_event is not None and current.get("latest_input_event") != expected_input_event:
-            raise AutopilotStateError("input changed during completion admission; original caller receipt is stale")
+            raise AutopilotStateError("input changed during completion admission; expected_input_event no longer matches current intake")
         if current["intent_state"] != intent_state:
             raise AutopilotStateError("intent state changed during bootstrap; retry against current approval")
         storage.migrate_bound_session(store, source)
@@ -501,25 +412,6 @@ def _bootstrap_from_session_intent_if_approved(
                 "approval_source": merged_approval.get("source"),
             },
         )
-
-        governance_signal = _load_governance_signal_module()
-        candidate = None
-        if governance_signal is not None:
-            candidate = governance_signal.conduct_plan_candidate_from_governance(
-                intent_state=intent_state,
-                current_work_item_id=str(source.get("GHOST_ALICE_AUTOPILOT_CURRENT_WORK_ITEM_ID") or "current"),
-                plan_path=plan_path,
-                approval_generation=approved_run["approval_generation"],
-            )
-        if candidate is not None and governance_signal is not None:
-            approved_plan = governance_signal.promote_conduct_plan_candidate(
-                candidate,
-                approval_evidence=merged_approval,
-            )
-            if approved_plan is not None:
-                _write_json_atomic(run_dir / "conduct-plan.candidate.json", candidate)
-                _write_json_atomic(run_dir / CONDUCT_PLAN_FILE, approved_plan)
-                return True
 
         write_work_items(
             run_dir / TASKS_FILE,
@@ -586,13 +478,12 @@ def _validate_promoted_decision_file(decision: Mapping[str, Any]) -> None:
 
 
 def _quarantine_rejected_decision(run_dir: Path, decision: Mapping[str, Any], reason: str) -> None:
-    """Move an unconsumable consistency-decision file aside and record why.
+    """Consume a rejected decision's receipt and archive its captured bytes.
 
-    The strict validation still rejects (raises); this only stops the rejected
-    file from re-raising on every subsequent Stop (a permanent stall). The file
-    is renamed (preserved as evidence), never deleted, and the rejection is
-    appended to the audit log. Best-effort: any IO error here must not mask the
-    original validation error that the caller re-raises.
+    The caller rolls back work changes before recording rejection in a separate
+    transaction. The consumed receipt prevents replay; after commit, storage
+    archives the captured snapshot while leaving the producer's inbox intact.
+    The caller preserves the original validation error if this recording fails.
     """
     rejected_path = run_dir / REJECTED_DECISION_FILE
     if rejected_path.exists():
@@ -639,10 +530,7 @@ def _apply_pending_decision(
             except FileNotFoundError:
                 publication = None
             if publication is not None and (publication.get("receipt") or {}).get("work_item_id") == item_id:
-                path = Path(__file__).resolve().parents[1] / "scripts" / "autopilot_completion.py"
-                spec = importlib.util.spec_from_file_location("autopilot_completion_validation", path)
-                helper = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(helper)
+                import autopilot_completion_service as helper
                 try:
                     helper.validate_publication_decision(publication, run or {}, decision, source or {})
                 except ValueError as exc:
@@ -660,12 +548,13 @@ def _apply_pending_decision(
         approval = (run or {}).get("approval_evidence")
         if (decision_value == "continue_next" and isinstance(approval, Mapping)
                 and isinstance(approval.get("session_intent"), Mapping)):
-            # Validate and record proof under core's identity/input/criterion
-            # lock before promoting the AP task. A rejection cannot leave the
-            # task completed; an AP write failure leaves replayable core proof.
+            # Core proof and Ghost-ALICE Autopilot task completion share one transaction under
+            # the current identity/input/criterion lock. A rejection or later
+            # Ghost-ALICE Autopilot write failure rolls back both.
             materialize_met_criteria_from_continue_next(run, decision, source, require_success=True)
     except AutopilotStateError as exc:
-        # Reject (raise) an unconsumable decision -- fail-closed; the agent is not root and must not apply unverified state. But quarantine the offending file first so it does not re-raise on every subsequent Stop (a permanent stall): the rename preserves it as evidence, the event records the rejection, and the entrypoint still degrades to a non-blocking no-op. Fallback is correction before the next forward step; the audit log is never reduced.
+        # The outer caller rolls back this transaction before consuming the
+        # rejected receipt and recording its diagnostic in a separate one.
         raise
     write_work_items(run_dir / TASKS_FILE, updated)
     storage.consume(decision_path, decision, run_dir / APPLIED_DECISION_FILE)
@@ -772,7 +661,9 @@ def _iotrace_resume_limit(source: Mapping[str, str] | None) -> int:
 
 
 # --- intent-driven resume budget --------------------------------------------
-# The resume ceiling is not a dead static count: it is replenished whenever the session-intent ledger advances (a new user input, or new work the agent routed through session-intent-analyzer -> new intent-events lines). Each advance resets the allowance to the base limit (reset-N); with no new intent the ceiling holds and the run escalates to ask_user_meta instead of re-firing forever. Platform-neutral.
+# Standalone queues retain their supplied event watermark. Bound queues keep
+# retries within the immutable approval generation; Core audit events cannot
+# replenish it. Explicit reapproval creates a generation with its own history.
 def _intent_events_count(events_path: Path) -> int:
     try:
         text = events_path.read_text(encoding="utf-8")
@@ -805,18 +696,13 @@ def _last_intent_watermark(run_dir: Path, run: Mapping[str, Any], work_item_id: 
     return base if isinstance(base, int) and not isinstance(base, bool) else 0
 
 
-def _maybe_replenish_resume_budget(run_dir: Path, run: Mapping[str, Any], work_item_id: str,
-                                   current_intent: Mapping[str, Any] | None = None) -> bool:
+def _maybe_replenish_resume_budget(run_dir: Path, run: Mapping[str, Any], work_item_id: str) -> bool:
+    if (run.get("approval_evidence") or {}).get("session_intent"):
+        return False
     events_path = _run_intent_events_path(run)
     if events_path is None:
         return False
-    binding = (run.get("approval_evidence") or {}).get("session_intent")
-    if binding:
-        if current_intent is None or not isinstance(current_intent.get("events"), list):
-            return False
-        current = len(current_intent["events"])
-    else:
-        current = _intent_events_count(events_path)  # Legacy standalone runs have no session binding.
+    current = _intent_events_count(events_path)
     if current <= _last_intent_watermark(run_dir, run, work_item_id):
         return False
     _append_event(
@@ -867,30 +753,6 @@ def _current_intent_for_source(
     return None
 
 
-def _io_trace_candidate_for_item(
-    run: Mapping[str, Any],
-    item: Mapping[str, Any],
-    source: Mapping[str, str] | None,
-    io_trace_rows: list[dict[str, Any]],
-) -> dict[str, Any] | None:
-    publication = run.get("completion_publication")
-    if (isinstance(publication, Mapping) and publication.get("status") == "prepared"
-            and (publication.get("receipt") or {}).get("work_item_id") == item.get("id")):
-        return None
-    if run.get("completion_origin_gap") or not io_trace_rows:
-        return None
-    work_item_id = str(item.get("id") or "current")
-    focus_layer = str(item.get("focus_layer") or "macro")
-    run_id = str(run.get("run_id") or "unknown")
-    return _governance_candidate_from_iotrace(
-        work_item_id=work_item_id,
-        focus_layer=focus_layer,
-        run_id=run_id,
-        session_id=_session_id_from_run(run, source),
-        rows=io_trace_rows,
-    )
-
-
 def _select_ready_item(items: list[dict[str, Any]], item_id: str) -> dict[str, Any]:
     updated = validate_work_items(copy.deepcopy(items))
     item = _find_item(updated, item_id)
@@ -902,32 +764,14 @@ def _append_iotrace_resume_event(
     root: Path,
     run: Mapping[str, Any],
     item: Mapping[str, Any],
-    governance_candidate: Mapping[str, Any] | None,
 ) -> None:
-    compact_candidate = compact_governance_candidate(governance_candidate)
     event = {
         "schema_version": "autopilot-event.v1",
         "event": "resume_running_item_from_iotrace",
         "run_id": run.get("run_id"),
         "work_item_id": item.get("id"),
     }
-    if compact_candidate:
-        event.update(_governance_candidate_event_fields(compact_candidate))
     _append_event(root, event)
-
-
-def _governance_candidate_event_fields(governance_candidate: Mapping[str, Any] | None) -> dict[str, Any]:
-    compact_candidate = compact_governance_candidate(governance_candidate)
-    if not compact_candidate:
-        return {}
-    fields = {
-        "governance_candidate_id": compact_candidate.get("candidate_id"),
-        "governance_candidate_source": compact_candidate.get("source"),
-        "governance_candidate_decision": compact_candidate.get("decision"),
-        "governance_source_signal_id": compact_candidate.get("source_signal_id"),
-        "governance_candidate_evidence": compact_candidate.get("evidence"),
-    }
-    return {key: value for key, value in fields.items() if value not in (None, "", [])}
 
 
 def _advance_approved_run_locked(
@@ -938,7 +782,6 @@ def _advance_approved_run_locked(
     tasks_path = root / TASKS_FILE
     if run_is_paused(root):
         return _noop_payload()
-    conduct_plan_path = root / CONDUCT_PLAN_FILE
     if not _run_state_available(root):
         return _noop_payload()
 
@@ -969,10 +812,6 @@ def _advance_approved_run_locked(
     starvation_event = semantic_delta_starvation_event(current_intent)
     if starvation_event is not None:
         _append_event(root, starvation_event)
-        return {
-            "continue": True,
-            "systemMessage": build_semantic_delta_starvation_message(starvation_event),
-        }
     binding_event = session_binding_mismatch_event(run, items, current_intent, source)
     if binding_event is not None:
         _append_event(root, binding_event)
@@ -987,10 +826,6 @@ def _advance_approved_run_locked(
             return _noop_payload()
     if recovery := reapproval_payload(root, run, source or {}):
         return recovery
-    parked_event = stale_continuation_event(run, items, current_intent)
-    if parked_event is not None:
-        _append_event(root, parked_event)
-        return _noop_payload()
     run.update(bind_origin(root, run, items, source or {}))
     items, applied_decision = _apply_pending_decision(root, items, run, source)
     store = storage.active(root)
@@ -1014,23 +849,13 @@ def _advance_approved_run_locked(
     if not ready_queue:
         running_items = [item for item in items if item["status"] == "running"]
         if running_items:
-            parked_event = stale_continuation_source_intent_event(
-                run,
-                items,
-                current_intent,
-                str((source or {}).get("GHOST_ALICE_SESSION_ID") or ""),
-            )
-            if parked_event is not None:
-                _append_event(root, parked_event)
-                return _noop_payload()
             running_item = running_items[0]
             if _work_item_within_run_surfaces(run, running_item):
-                governance_candidate = _io_trace_candidate_for_item(run, running_item, source, io_trace_rows)
                 if _missing_decision_resume_count(root, running_item["id"]) >= 1:
-                    _maybe_replenish_resume_budget(root, run, running_item["id"], current_intent)
+                    _maybe_replenish_resume_budget(root, run, running_item["id"])
                     resume_limit = _iotrace_resume_limit(source)
                     if io_trace_rows and _iotrace_resumes_since_last_replenish(root, running_item["id"]) < resume_limit:
-                        _append_iotrace_resume_event(root, run, running_item, governance_candidate)
+                        _append_iotrace_resume_event(root, run, running_item)
                         return {
                             "continue": True,
                             "systemMessage": build_continuation_message(
@@ -1038,9 +863,9 @@ def _advance_approved_run_locked(
                                 running_item,
                                 pending_decision=True,
                                 io_trace_rows=io_trace_rows,
-                                governance_candidate=governance_candidate,
                                 base_path=signal_base,
                                 home_path=signal_home,
+                                host_input=hook_input, source=source,
                             ),
                         }
                     evidence = (
@@ -1048,30 +873,26 @@ def _advance_approved_run_locked(
                         if io_trace_rows
                         else ["loop-guard: repeated missing decision"]
                     )
-                    updated = apply_consistency_decision(
-                        items,
-                        running_item["id"],
-                        "ask_user_meta",
-                        evidence=evidence,
-                    )
-                    write_work_items(tasks_path, updated)
-                    _append_event(
-                        root,
-                        {
-                            "schema_version": "autopilot-event.v1",
-                            "event": "missing_decision_escalated",
-                            "run_id": run.get("run_id"),
-                            "work_item_id": running_item["id"],
-                        },
-                    )
+                    diagnostic = {
+                        "schema_version": "autopilot-event.v1",
+                        "event": "missing_decision_parked",
+                        "run_id": run.get("run_id"),
+                        "work_item_id": running_item["id"],
+                        "approval_generation": run["approval_generation"],
+                        "evidence": evidence,
+                    }
+                    history = _read_jsonl_objects(root / EVENTS_FILE)
+                    if not history or any(history[-1].get(key) != value for key, value in diagnostic.items()):
+                        _append_event(root, diagnostic)
                     return {
                         "continue": True,
-                        "systemMessage": build_meta_intervention_message(
-                            run,
-                            work_item_id=running_item["id"],
-                            evidence=evidence,
-                            pending_decision_state="repeated-missing-decision",
-                        ),
+                        "systemMessage": "[autopilot]\npending-decision: repeated-missing-decision\n"
+                            + "\n".join(evidence)
+                            + "\nRecording is parked until an authorized queue decision is available. "
+                            "The original task and evidence remain unchanged.",
+                        "completion_recording": {"status": "parked", "reason": "missing-decision",
+                            "work_item_id": running_item["id"]},
+                        "recovery": {"status": "parked", "claims_changed": False},
                     }
                 _append_event(
                     root,
@@ -1089,9 +910,9 @@ def _advance_approved_run_locked(
                         running_item,
                         pending_decision=True,
                         io_trace_rows=io_trace_rows,
-                        governance_candidate=governance_candidate,
                         base_path=signal_base,
                         home_path=signal_home,
+                        host_input=hook_input, source=source,
                     ),
                 }
         _append_event(
@@ -1120,7 +941,6 @@ def _advance_approved_run_locked(
     selected = _select_ready_item(items, next_item["id"])
     selected_item = selected["item"]
     write_work_items(tasks_path, selected["items"])
-    governance_candidate = _io_trace_candidate_for_item(run, selected_item, source, io_trace_rows)
     event = {
         "schema_version": "autopilot-event.v1",
         "event": "continue_next_item",
@@ -1128,7 +948,6 @@ def _advance_approved_run_locked(
         "work_item_id": selected_item["id"],
         "focus_layer": selected_item["focus_layer"],
     }
-    event.update(_governance_candidate_event_fields(governance_candidate))
     _append_event(root, event)
     return {
         "continue": True,
@@ -1136,13 +955,14 @@ def _advance_approved_run_locked(
             run,
             selected_item,
             io_trace_rows=io_trace_rows,
-            governance_candidate=governance_candidate,
             base_path=signal_base,
             home_path=signal_home,
+            host_input=hook_input, source=source,
         ),
     }
 
 
+@_with_core_policy_source
 def advance_approved_run(
     run_dir: str | Path, env: Mapping[str, str] | None = None, *, hook_input: Mapping[str, Any] | None = None,
     permission_denied_noop: bool = False,
@@ -1157,11 +977,33 @@ def advance_approved_run(
     run = _read_json_object(approved_run_path)
     if not _approved_run_allows_continue(run):
         return _noop_payload()
+    binding = (run.get("approval_evidence") or {}).get("session_intent")
+    if error := continuation_context_error(binding, source):
+        return dict(_noop_payload(), completion_recording={"status": "recording-unavailable", "reason": "authority-mismatch", "detail": error})
+    if isinstance(binding, Mapping) and binding.get("platform") in {"codex", "claude", "agent-runtime"}:
+        current = current_session_context(source, run_platform=binding["platform"], hook_input=hook_input)
+        try:
+            material = read_session_material(Path(binding["state_path"]).parent.parent.parent,
+                binding["platform"], current.get("GHOST_ALICE_SESSION_ID") or None, source=current, require_input=True, recover_audit=False)
+            from autopilot_runtime_context import selected_session_context
+            current = selected_session_context(material, current, hook_input=hook_input, allow_discovered_identity=True)
+            _, selection = project_session_material(material, current, root)
+        except (ValueError, OSError) as exc:
+            return dict(_noop_payload(), completion_recording={"status": "recording-unavailable", "reason": "authority-unavailable", "detail": str(exc)})
+        if selection["status"] != "selected":
+            return dict(_noop_payload(), completion_recording=selection)
+        source = current
+        if binding.get("selected_work_units") != selection["selected_work_units"]:
+            if binding.get("selected_work_units"):
+                with storage.accessible_transaction(root, source, permission_denied_noop=permission_denied_noop) as store:
+                    if store is not None and (recovery := reapproval_payload(root, run, current)):
+                        return recovery
+            return dict(_noop_payload(), completion_recording={"status": "recording-unavailable", "reason": "unbound-work-unit"})
     if not (root / storage.AUTHORITY_FILE).exists():
         try:
             storage.bound_authority(run)
         except ValueError as exc:
-            # Invalid legacy binding has no authority to migrate. Preserve an
+            # Invalid source binding has no authority to import. Preserve an
             # audit-only diagnostic without changing approval/tasks/Core state.
             with (root / EVENTS_FILE).open("a", encoding="utf-8") as out:
                 out.write(json.dumps({"event": "stale_continuation_parked", "reason": str(exc),
@@ -1169,7 +1011,7 @@ def advance_approved_run(
             return _noop_payload()
     try:
         with storage.accessible_transaction(root, source, permission_denied_noop=permission_denied_noop) as store:
-            return _noop_payload() if store is None else _advance_approved_run_locked(root, env, hook_input=hook_input)
+            return _noop_payload() if store is None else _advance_approved_run_locked(root, source, hook_input=hook_input)
     except AutopilotStateError as exc:
         # First roll back every Core/task mutation. Rejection is a separate
         # durable audit transaction and cannot accidentally commit partial proof.
@@ -1196,16 +1038,18 @@ def _bootstrap_then_advance(
 ) -> dict[str, Any]:
     if run_is_paused(root):
         return _noop_payload()
-    try:
-        root.mkdir(parents=True, exist_ok=True)
-    except OSError as exc:
-        # Only access failure in a derived path is best-effort. Keep the chosen
-        # project boundary and surface unexpected storage errors.
-        if derived_run_dir and (isinstance(exc, PermissionError) or exc.errno == errno.EROFS):
-            return _noop_payload()
-        raise
     if not _run_state_available(root):
-        _bootstrap_from_session_intent_if_approved(root, current_session_context(source, hook_input=hook_input),
+        current = current_session_context(source, hook_input=hook_input)
+        selection = {"status": "recording-unavailable", "reason": "authority-unavailable"}
+        for material in _iter_current_session_intents(current, project_cwd, hook_input=hook_input):
+            from autopilot_runtime_context import selected_session_context
+            current = selected_session_context(material, current, hook_input=hook_input)
+            _, selection = project_session_material(material, current, root)
+            break
+        if selection["status"] != "selected":
+            return dict(_noop_payload(), completion_recording=selection)
+        source = current
+        _bootstrap_from_session_intent_if_approved(root, current,
             project_cwd, hook_input=hook_input, permission_denied_noop=derived_run_dir)
     return advance_approved_run(root, source, hook_input=hook_input, permission_denied_noop=derived_run_dir)
 
@@ -1217,7 +1061,19 @@ def adapter_payload_from_env(
     if env is not None and not source:
         return _noop_payload()
     source = current_session_context(source, hook_input=hook_input) or source
-    selected = resolve_run_target(source if hook_input is not None else env)
+    from autopilot_lineage import completion_protocol
+    if completion_protocol(source) == "autopilot-completion-receipt.v2":
+        import autopilot_completion_service as helper
+        try:
+            from autopilot_continuation import advance_continuation
+            applied = helper.apply_completion_v2(source, hook_input=hook_input)
+            return advance_continuation(source, applied, hook_input=hook_input)
+        except (ValueError, OSError) as exc:
+            return helper.recording_failure_payload(source, hook_input, exc)
+    try:
+        selected = resolve_run_target(source if hook_input is not None else env)
+    except SessionAuthorityError as exc:
+        return dict(_noop_payload(), completion_recording={"status": "recording-unavailable", "reason": "authority-unavailable", "detail": str(exc)})
     source = selected["source"]
     if not selected["bootstrap"]:
         return advance_approved_run(selected["run_dir"], source, hook_input=hook_input)

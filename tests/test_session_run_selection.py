@@ -10,6 +10,7 @@ import unittest
 
 import test_completion_publication as fixtures
 from autopilot_runtime_context import resolve_run_target
+from response_route_fixture import register_route
 
 
 class SessionRunSelectionTest(unittest.TestCase):
@@ -33,6 +34,7 @@ class SessionRunSelectionTest(unittest.TestCase):
             raw_user_input="Verify the requested report", intent_delta={
                 "current_goal": "Write and verify the requested report.",
                 "acceptance_criteria": self.read_state()["acceptance_criteria"]})
+        register_route(self.core, self.root / "intent", platform, session)
         return dict(self.source, GHOST_ALICE_PLATFORM=platform, GHOST_ALICE_SESSION_ID=session)
 
     def legacy_run(self):
@@ -105,6 +107,7 @@ class SessionRunSelectionTest(unittest.TestCase):
             raw_user_input="Verify the requested report", intent_delta={
                 "current_goal": "Write and verify the requested report.",
                 "acceptance_criteria": self.read_state()["acceptance_criteria"]})
+        register_route(self.core, other_root)
         source = dict(self.source, GHOST_ALICE_SESSION_INTENT_ROOT=str(other_root))
         receipt = self.prepare_from_hook(source)
         self.assertEqual(Path(receipt["run_dir"]), self.legacy / "sessions/codex/session-1")
@@ -117,10 +120,11 @@ class SessionRunSelectionTest(unittest.TestCase):
             raw_user_input="Verify the requested report", intent_delta={
                 "current_goal": "Write and verify the requested report.",
                 "acceptance_criteria": self.read_state()["acceptance_criteria"]})
+        register_route(self.core, other_root)
         source = dict(self.source, GHOST_ALICE_SESSION_INTENT_ROOT=str(other_root),
                       GHOST_ALICE_AUTOPILOT_RUN_DIR=str(self.legacy))
         context = self.hook(source).get("hookSpecificOutput", {}).get("additionalContext", "")
-        self.assertIn("ownership-conflict", context)
+        self.assertIn("recording-reason: run-owner-mismatch", context)
         self.assertFalse(any(line.startswith("env ") for line in context.splitlines()))
 
     def test_process_cwd_selection_does_not_open_foreign_database(self):
@@ -148,6 +152,7 @@ class SessionRunSelectionTest(unittest.TestCase):
             raw_user_input="Verify the requested report", intent_delta={
                 "current_goal": "Write and verify the requested report.",
                 "acceptance_criteria": self.read_state()["acceptance_criteria"]})
+        register_route(self.core, current_root)
         source = dict(self.source)
         source.pop("GHOST_ALICE_SESSION_INTENT_ROOT")
         receipt = self.prepare_from_hook(source)
@@ -179,13 +184,14 @@ class SessionRunSelectionTest(unittest.TestCase):
         context = output.get("hookSpecificOutput", {}).get("additionalContext", "")
         self.assertIs(output.get("continue"), True)
         self.assertNotIn("permissionDecision", output.get("hookSpecificOutput", {}))
-        self.assertIn("ownership-conflict", context)
+        self.assertIn("recording-reason: run-owner-mismatch", context)
         self.assertFalse(any(line.startswith("env ") for line in context.splitlines()))
         state = self.core.read_session_state(root=self.root / "intent", platform="codex", session_id="session-2")
-        with self.assertRaisesRegex(ValueError, "same session|different session|ownership"):
-            self.helper.prepare_completion(intent_root=self.root / "intent", platform="codex",
-                session_id="session-2", input_event_id=state["latest_input_event_id"], source=source,
-                reapprove_current_input=True)
+        recording = self.helper.prepare_completion(intent_root=self.root / "intent", platform="codex",
+            session_id="session-2", input_event_id=state["latest_input_event_id"], source=source,
+            reapprove_current_input=True)
+        self.assertEqual(recording["status"], "recording-unavailable")
+        self.assertEqual(recording["reason"], "run-owner-mismatch")
         self.assertEqual(self.snapshot(self.legacy), original)
 
     def test_project_off_pauses_namespaced_pretool_prepare_and_stop(self):
@@ -195,7 +201,8 @@ class SessionRunSelectionTest(unittest.TestCase):
         selected = Path(receipt["run_dir"])
         original = self.snapshot(selected)
         (self.legacy / "OFF").touch()
-        self.assertEqual(self.hook(source), {"continue": True})
+        self.assertEqual(self.hook(source), {"continue": True,
+            "completion_recording": {"status": "skipped", "reason": "autopilot-off"}})
         explicit = dict(source, GHOST_ALICE_AUTOPILOT_RUN_DIR=str(selected))
         with self.assertRaisesRegex(ValueError, "OFF"):
             self.helper.prepare_completion(intent_root=self.root / "intent", platform="codex",
@@ -207,7 +214,8 @@ class SessionRunSelectionTest(unittest.TestCase):
     def test_project_off_prevents_first_session_directory_creation(self):
         self.legacy.mkdir(); (self.legacy / "OFF").touch()
         source = self.source_for("session-2")
-        self.assertEqual(self.hook(source), {"continue": True})
+        self.assertEqual(self.hook(source), {"continue": True,
+            "completion_recording": {"status": "skipped", "reason": "autopilot-off"}})
         self.assertEqual(self.hook(source, "Stop").get("systemMessage"), "")
         self.assertFalse((self.legacy / "sessions").exists())
 
@@ -216,7 +224,8 @@ class SessionRunSelectionTest(unittest.TestCase):
         (self.legacy / "OFF").touch()
         (self.legacy / "authority.json").write_text('{"schema_version":"invalid"}')
         source = self.source_for("session-2")
-        self.assertEqual(self.hook(source), {"continue": True})
+        self.assertEqual(self.hook(source), {"continue": True,
+            "completion_recording": {"status": "skipped", "reason": "autopilot-off"}})
         self.assertEqual(self.hook(source, "Stop").get("systemMessage"), "")
         self.assertFalse((self.legacy / "sessions").exists())
 

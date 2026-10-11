@@ -1,13 +1,17 @@
 #!/usr/bin/env python3
-"""Work-item validation and transition helpers for autopilot mode.
+"""Work-item validation and transition helpers for Ghost-ALICE Autopilot.
 
-Dependencies: Python 3.11+ standard library only.
+Dependencies: Python 3.11+, sibling storage helpers and Core's proof/ledger APIs.
 """
 
 from __future__ import annotations
 
 import copy
+from contextlib import contextmanager
+from contextvars import ContextVar
+from functools import wraps
 import importlib.util
+import inspect
 import json
 import os
 import re
@@ -34,20 +38,19 @@ ALLOWED_DECISIONS = frozenset({
     "reopen_micro",
     "reopen_meso",
     "reopen_macro",
+    "reopen_meta",
+    "park",
     "ask_user_meta",
     "stop",
 })
 CONDUCT_PLAN_SCHEMA = "autopilot-conduct-plan.v2"
 COMPLETION_CHECK_DIGEST_PATTERN = re.compile(r"^sha256:[0-9a-f]{64}$")
-TOP_LEVEL_FIELD_RE = re.compile(r"^-\s*[A-Za-z0-9_-]+\s*:")
-ACCEPTANCE_ID_RE = re.compile(r"^\s*-\s*([A-Za-z0-9_.=-]+)\s*:")
-CLAIM_RE = re.compile(r"^\s*-\s*claim\s*:\s*(.*?)\s*$", re.I)
-ENTRY_FIELD_RE = re.compile(r"^\s*(criterion|evidence|verdict)\s*:\s*(.*?)\s*$", re.I)
-APPROVAL_DECISIONS = frozenset({"go", "approve", "approved", "auto"})
+APPROVAL_DECISIONS = frozenset({"go", "approve", "approved"})
+_CORE_POLICY_SOURCE = ContextVar('autopilot_core_policy_source', default=None)
 
 
 class AutopilotStateError(ValueError):
-    """Raised when autopilot work-item state is invalid."""
+    """Raised when Ghost-ALICE Autopilot work-item state is invalid."""
 
 
 def _require_string(value: Any, field: str) -> str:
@@ -62,112 +65,75 @@ def _validate_string_list(value: Any, field: str) -> list[str]:
     return list(value)
 
 
+@contextmanager
+def _bind_core_policy_source(source):
+    """Keep delegated Core policy on the caller's trusted source for this call."""
+    if source is None:
+        yield  # Legacy standalone calls retain ambient lookup; nested calls inherit.
+        return
+    token = _CORE_POLICY_SOURCE.set(dict(source))
+    try:
+        yield
+    finally:
+        _CORE_POLICY_SOURCE.reset(token)
+
+
+def _with_core_policy_source(function):
+    """Bind a source-taking service entrypoint without changing its signature."""
+    signature = inspect.signature(function)
+    source_parameter = 'source' if 'source' in signature.parameters else 'env'
+
+    @wraps(function)
+    def bound(*args, **kwargs):
+        source = signature.bind(*args, **kwargs).arguments.get(source_parameter)
+        with _bind_core_policy_source(source):
+            return function(*args, **kwargs)
+    return bound
+
+
+def _load_core_policy_module(filename: str, module_name: str):
+    """Resolve a Core policy module through the existing managed Core lookup."""
+    source = _CORE_POLICY_SOURCE.get()
+    if source is not None:
+        # Match Core native_completion's explicit module authority. A bound
+        # call must never substitute the process environment or discover a
+        # different Core installation when its selected source is unavailable.
+        root = source.get('GHOST_ALICE_CORE_ROOT') or source.get('GHOST_ALICE_SKILLS_DIR')
+        if not isinstance(root, str) or not Path(root).is_absolute():
+            return None
+        source = dict(source, GHOST_ALICE_CORE_ROOT=root)
+    core = _load_core_ledger_module(Path(__file__), source)
+    if core is None:
+        return None
+    path = Path(core.__file__).resolve().parents[2] / '_shared' / filename
+    try:
+        spec = importlib.util.spec_from_file_location(module_name, path)
+        if spec is None or spec.loader is None:
+            return None
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+    except (OSError, ImportError):
+        return None
+
+
+def _parse_completion_evidence(evidence_text: str, *, allow_partial: bool = False) -> dict[str, Any]:
+    """Delegate supported proof coverage to the selected managed Core owner."""
+    parser = _load_core_policy_module('completion_check_validator.py', 'ghost_alice_original_completion_parser')
+    if parser is None:
+        raise AutopilotStateError("Core original-evidence parser is unavailable")
+    try:
+        return parser.parse_original_completion_evidence(evidence_text, allow_partial=allow_partial)
+    except (AttributeError, ValueError) as exc:
+        raise AutopilotStateError(str(exc)) from exc
+
+
 def _extract_top_level_section(text: str, field_name: str) -> str:
-    """Preserve inline and nested values, matching Core's evidence contract."""
-    lines = re.split(r"\r?\n", text)
-    field_pattern = re.compile(r"^-\s*" + re.escape(field_name) + r"\s*:", re.I)
-    for index, line in enumerate(lines):
-        if not field_pattern.search(line):
-            continue
-        inline = field_pattern.sub("", line, count=1).strip()
-        kept = [inline] if inline else []
-        for body in lines[index + 1:]:
-            if TOP_LEVEL_FIELD_RE.search(body) or (body.strip() and body == body.lstrip()):
-                break
-            kept.append(body)
-        return "\n".join(kept).strip()
-    return ""
-
-
-def _split_entry_fields(line: str) -> list[str]:
-    """Split only explicit, unquoted semicolon fields; commands stay evidence."""
-    parts: list[str] = []
-    start = 0
-    quote = None
-    escaped = False
-    for index, char in enumerate(line):
-        if escaped:
-            escaped = False
-            continue
-        if char == "\\" and quote:
-            escaped = True
-            continue
-        if quote:
-            if char == quote:
-                quote = None
-            continue
-        if char in ('"', "'", "`"):
-            if char != "'" or index == 0 or not line[index - 1].isalnum():
-                quote = char
-            continue
-        if char == ";" and re.match(r"\s*(?:criterion|evidence|verdict)\s*:", line[index + 1:], re.I):
-            parts.append(line[start:index])
-            start = index + 1
-    parts.append(line[start:])
-    return parts
-
-
-def _parse_completion_evidence(evidence_text: str) -> dict[str, Any]:
-    """Return one validated interpretation for AP transition and Core met writes.
-
-    Syntax/evidence semantics match Core. AP additionally requires known criterion
-    bindings and all-pass outcomes. This parser is packaged with standalone AP.
-    """
-    for name in ("acceptance-criteria", "claim-evidence-map", "unverified"):
-        headers = re.findall(r"^-\s*" + re.escape(name) + r"\s*:", evidence_text, re.I | re.M)
-        if len(headers) > 1:
-            raise AutopilotStateError(f"continue_next evidence must not contain duplicate {name} sections")
-    acceptance_ids = {
-        match.group(1)
-        for line in _extract_top_level_section(evidence_text, "acceptance-criteria").splitlines()
-        if (match := ACCEPTANCE_ID_RE.match(line)) and "<" not in match.group(1)
-    }
-    if not acceptance_ids:
-        raise AutopilotStateError(
-            "continue_next evidence must include acceptance-criteria criterion ids for completion-check claims"
-        )
-    entries: list[dict[str, str]] = []
-    current = None
-    for raw_line in re.split(r"\r?\n", _extract_top_level_section(evidence_text, "claim-evidence-map")):
-        for line in _split_entry_fields(raw_line):
-            claim = CLAIM_RE.match(line)
-            if claim:
-                current = {"claim": claim.group(1).strip()}
-                entries.append(current)
-                continue
-            if re.match(r"^\s*-\s*\S", line):
-                raise AutopilotStateError("Every claim-evidence-map entry must begin with an explicit claim")
-            field = ENTRY_FIELD_RE.match(line)
-            if field and current is not None:
-                key = field.group(1).lower()
-                if key in current:
-                    raise AutopilotStateError("claim-evidence-map entries must not contain duplicate fields")
-                current[key] = field.group(2).strip()
-    if not entries:
-        raise AutopilotStateError("continue_next evidence must include claim-evidence-map entries")
-    criterion_ids: list[str] = []
-    for entry in entries:
-        if not entry.get("claim"):
-            raise AutopilotStateError("claim-evidence-map entries must include a non-empty claim")
-        bound_ids = [token for token in re.split(r"[,;\s]+", entry.get("criterion", "")) if token]
-        if not bound_ids or any(token not in acceptance_ids for token in bound_ids):
-            raise AutopilotStateError(
-                "continue_next evidence claim-evidence-map entries must reference acceptance-criteria criterion ids"
-            )
-        if not entry.get("evidence"):
-            raise AutopilotStateError("claim-evidence-map entries must include evidence")
-        if entry.get("verdict", "").lower() != "pass":
-            raise AutopilotStateError("continue_next evidence claim-evidence-map verdicts must all be pass")
-        for criterion_id in bound_ids:
-            if criterion_id not in criterion_ids:
-                criterion_ids.append(criterion_id)
-    unverified = _extract_top_level_section(evidence_text, "unverified")
-    meaningful = [line.strip() for line in re.split(r"\r?\n", unverified) if line.strip()]
-    if not meaningful:
-        raise AutopilotStateError("continue_next evidence must include unverified: none")
-    if any(not re.fullmatch(r"(?:-\s*)?none\s*", line, re.I) for line in meaningful):
-        raise AutopilotStateError("continue_next evidence unverified items must be none")
-    return {"claims": entries, "criterion_ids": criterion_ids}
+    """Keep existing archive callers on Core's canonical field extraction."""
+    parser = _load_core_policy_module('completion_check_validator.py', 'ghost_alice_original_completion_parser')
+    if parser is None:
+        raise AutopilotStateError("Core original-evidence parser is unavailable")
+    return parser.extract_top_level_field_section(text, field_name)
 
 
 def _validate_completion(value: Any, item_id: str) -> dict[str, Any]:
@@ -194,6 +160,7 @@ def _validate_completion(value: Any, item_id: str) -> dict[str, Any]:
 def _validate_continue_next_evidence(
     completion_check_digest: str | None,
     evidence: list[str] | None,
+    *, allow_partial: bool = False,
 ) -> list[str]:
     if not isinstance(completion_check_digest, str) or not COMPLETION_CHECK_DIGEST_PATTERN.fullmatch(
         completion_check_digest
@@ -201,9 +168,10 @@ def _validate_continue_next_evidence(
         raise AutopilotStateError("continue_next requires a sha256 completion-check digest")
     validated = _validate_string_list(evidence, "continue_next evidence")
     evidence_text = "\n".join(validated)
-    if "[completion-check]" not in evidence_text or "claim-evidence-map" not in evidence_text:
+    marker = "[partial-check]" if allow_partial and "[partial-check]" in evidence_text else "[completion-check]"
+    if marker not in evidence_text or "claim-evidence-map" not in evidence_text:
         raise AutopilotStateError("continue_next evidence must include a [completion-check] claim-evidence-map")
-    _parse_completion_evidence(evidence_text)
+    _parse_completion_evidence(evidence_text, allow_partial=allow_partial)
     return validated
 
 
@@ -257,20 +225,6 @@ def validate_work_items(items: Iterable[dict[str, Any]]) -> list[dict[str, Any]]
 def read_work_items(path: str | Path) -> list[dict[str, Any]]:
     from autopilot_storage import read
     return validate_work_items(read(Path(path)))
-
-
-def _read_legacy_work_items(path):
-    state_path = Path(path)
-    items: list[dict[str, Any]] = []
-    for lineno, line in enumerate(state_path.read_text(encoding="utf-8").splitlines(), start=1):
-        if not line.strip():
-            continue
-        try:
-            value = json.loads(line)
-        except json.JSONDecodeError as exc:
-            raise AutopilotStateError(f"{state_path}:{lineno}: invalid JSON: {exc}") from exc
-        items.append(value)
-    return validate_work_items(items)
 
 
 def write_work_items(path: str | Path, items: Iterable[dict[str, Any]]) -> None:
@@ -384,6 +338,14 @@ def apply_consistency_decision(
             "completion_check_digest": completion_check_digest,
             "reopen_target": target,
         })
+    elif decision == "park":
+        validated_evidence = _validate_non_continuation_evidence(decision, evidence)
+        item["status"] = "blocked"
+        # Suspension changes eligibility, not the prior business observation.
+        item["completion"].update({
+            "state": "parked",
+            "evidence": list(dict.fromkeys([*item["completion"]["evidence"], *validated_evidence])),
+        })
     elif decision in {"ask_user_meta", "stop"}:
         validated_evidence = _validate_non_continuation_evidence(decision, evidence)
         item["status"] = "stopped"
@@ -398,25 +360,25 @@ def apply_consistency_decision(
 
 
 def _load_core_ledger_module(state_path: Path, source: Mapping[str, str] | None = None):
-    """Resolve and import the core session-intent ledger by path (B.3 hybrid).
+    """Resolve the Core ledger provider from the selected source.
 
-    Tries an explicit core root from the environment, then walks up from the
-    ledger state file to find a core repo checkout. Returns None when no core
-    source is reachable (e.g. a data-only installed layout) so the caller can
-    skip the met-flip gracefully instead of crashing.
+    An explicit source or inherited environment root selects one provider.
+    Discovery applies only when neither is supplied. Return None when the
+    selected source is unavailable so callers report that gap.
     """
     candidates: list[Path] = []
     if source is None:
         source = os.environ
-    if source is not None:
-        core_root = str(source.get("GHOST_ALICE_CORE_ROOT") or os.environ.get("GHOST_ALICE_CORE_ROOT") or "").strip()
-        if core_root:
-            candidates.append(
-                Path(core_root) / "session-intent-analyzer" / "scripts" / "session_intent_ledger.py"
-            )
-    candidates.append(Path(__file__).resolve().parents[2] / "session-intent-analyzer" / "scripts" / "session_intent_ledger.py")
-    for parent in Path(state_path).resolve().parents:
-        candidates.append(parent / "session-intent-analyzer" / "scripts" / "session_intent_ledger.py")
+    selected = str(source.get("GHOST_ALICE_CORE_ROOT") or os.environ.get("GHOST_ALICE_CORE_ROOT") or "")
+    explicit = selected.strip()
+    if selected:
+        if not explicit or not Path(explicit).is_absolute():
+            return None
+        candidates.append(Path(explicit) / "session-intent-analyzer" / "scripts" / "session_intent_ledger.py")
+    else:
+        candidates.append(Path(__file__).resolve().parents[2] / "session-intent-analyzer" / "scripts" / "session_intent_ledger.py")
+        for parent in Path(state_path).resolve().parents:
+            candidates.append(parent / "session-intent-analyzer" / "scripts" / "session_intent_ledger.py")
     for candidate in candidates:
         try:
             if not candidate.is_file():
@@ -442,9 +404,9 @@ def materialize_met_criteria_from_continue_next(
 ) -> list[str]:
     """Flip the satisfied admitted criteria to "met" after a validated continue_next.
 
-    Hybrid B.3: the core ledger owns the write-only "met" invariant; the adapter
-    only calls it, using the same validated completion-check digest that
-    continue_next already required. A session-bound adapter uses require_success
+    The Core ledger owns the write-only "met" invariant; the adapter
+    only calls it, using the same validated completion-check digest required by
+    continue_next. A session-bound adapter uses require_success
     before committing task completion. Diagnostic callers may request a skipped
     result; neither path rebinds old proof to a new input or criterion.
     """
@@ -503,7 +465,7 @@ def materialize_met_criteria_from_continue_next(
     from autopilot_storage import core_transaction
     connection = core_transaction(intent_root)
     if require_success and connection is None:
-        return reject("bound completion requires the shared Autopilot transaction")
+        return reject("bound completion requires the shared Ghost-ALICE Autopilot transaction")
     flipped: list[str] = []
     for criterion_id in criterion_ids:
         if criterion_id not in snapshots:
@@ -617,3 +579,37 @@ def apply_conduct_plan_proposals(
         known_ids.add(item_id)
 
     return validate_work_items([*updated, *new_items])
+
+
+def materialize_met_criteria_v2(request, records, source, connection):
+    """Apply only exact current-owner snapshots after v2 publication validation."""
+    from autopilot_completion_contract import criterion_key
+    binding = request['binding']
+    root = Path(binding['intent_root'])
+    if connection is None or any(source.get('GHOST_ALICE_'+k.upper()) != binding[k] for k in ('platform','session_id')):
+        raise AutopilotStateError('v2 met writer requires current owner and shared authority transaction')
+    authority = source.get('GHOST_ALICE_SESSION_INTENT_ROOT')
+    from autopilot_storage import active
+    store = active(request['target']['path'])
+    if (not isinstance(authority,str) or not Path(authority).is_absolute() or Path(authority).resolve()!=root.resolve()
+            or store is None or store.connection is not connection or store.root!=root.resolve()):
+        raise AutopilotStateError('v2 met writer requires the exact current Ghost-ALICE Autopilot/Core authority transaction')
+    ledger = _load_core_ledger_module(root / binding['platform'] / binding['session_id'] / 'intent-state.json',source)
+    if ledger is None or not callable(getattr(ledger,'mark_acceptance_criterion_met',None)):
+        raise AutopilotStateError('compatible Core met writer is unavailable')
+    live = ledger.read_session_state(root=root,platform=binding['platform'],session_id=binding['session_id'],transaction=connection)
+    snapshots = {criterion_key(c):c for c in request['contract']['criteria']}
+    # The session retains other work and legacy rows; only this contract can be applied here.
+    met = {criterion_key(c) for c in live['acceptance_criteria'] if c.get('status')=='met'
+           and (c.get('work_unit_id'), c.get('contract_revision'), c.get('id')) in snapshots}
+    for selected in request['selected_criteria']:
+        key = (selected['work_unit_id'],selected['contract_revision'],selected['criterion_id'])
+        snapshot = snapshots.get(key)
+        if snapshot is None:
+            raise AutopilotStateError('exact owned approved criterion snapshot is missing')
+        if key in met:
+            continue
+        record = records[selected['evidence_reference']]
+        ledger.mark_acceptance_criterion_met(root=root,platform=binding['platform'],session_id=binding['session_id'],
+            criterion_id=selected['criterion_id'],completion_check_digest=record['proof_digest'].removeprefix('sha256:'),
+            expected_input_event_id=binding['input_event_id'],expected_criterion=dict(snapshot),transaction=connection)

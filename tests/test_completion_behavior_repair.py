@@ -117,13 +117,15 @@ class CompletionFormatParityTest(unittest.TestCase):
             text = VALID.replace("evidence: readback compared the exact bytes", f"evidence: {quote}echo ; verdict: fail{quote}")
             self.assertEqual(complete(text)[0]["status"], "completed")
 
-    def test_standalone_transition_does_not_require_core(self):
-        # The completion path itself uses no core runtime; only this test's parity oracle does.
+    def test_standalone_transition_requires_selected_core_provider(self):
+        # An unbound isolated parser cannot borrow another Core installation.
         env = dict(os.environ)
         env.pop("GHOST_ALICE_CORE_ROOT", None)
+        env.pop("GHOST_ALICE_SKILLS_DIR", None)
         code = "import sys; sys.path.insert(0, sys.argv[1]); import autopilot_work_items as w; w._validate_continue_next_evidence(sys.argv[2], [sys.argv[3]])"
         result = subprocess.run([sys.executable, "-I", "-B", "-c", code, str(SKILL / "adapters"), DIGEST, VALID.replace("- unverified:\n  - none", "- unverified: none")], env=env, capture_output=True, text=True)
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Core original-evidence parser is unavailable", result.stderr)
 
 
     def test_additional_invalid_sections_and_empty_values_reject(self):
@@ -143,19 +145,6 @@ class CompletionFormatParityTest(unittest.TestCase):
         with self.assertRaises(work_items.AutopilotStateError):
             complete(text)
 
-    def test_standalone_negative_matrix_matches_transition_validation(self):
-        cases = [
-            VALID.replace("    evidence: readback compared the exact bytes\n", ""),
-            VALID.replace("    verdict: pass", "    verdict: fail\n    verdict: pass"),
-            VALID.replace("- unverified:", "- unverified: pending check"),
-            VALID + "- unverified: pending check\n",
-        ]
-        env = dict(os.environ)
-        env.pop("GHOST_ALICE_CORE_ROOT", None)
-        code = "import sys,json; sys.path.insert(0,sys.argv[1]); import autopilot_work_items as w\nfor text in json.loads(sys.stdin.read()):\n try: w._validate_continue_next_evidence(sys.argv[2],[text])\n except w.AutopilotStateError: continue\n raise SystemExit('invalid standalone proof accepted')"
-        result = subprocess.run([sys.executable, "-I", "-B", "-c", code, str(SKILL / "adapters"), DIGEST], input=json.dumps(cases), env=env, capture_output=True, text=True)
-        self.assertEqual(result.returncode, 0, result.stderr)
-
 
 class BoundCompletionConsumerTest(unittest.TestCase):
     def submit(self, text, *, accepted):
@@ -165,13 +154,15 @@ class BoundCompletionConsumerTest(unittest.TestCase):
         helper = fixtures.BridgeAdmissionBoundaryTest()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            state_path = helper.setup_ledger(root)
-            state = json.loads(state_path.read_text())
-            state["acceptance_criteria"] = [
-                {"id": value, "summary": value, "source": "user-explicit", "admitted": True, "status": "unmet"}
+            from response_route_fixture import native_ledger
+            state_path = root / "intent/codex/session-1/intent-state.json"
+            core = work_items._load_core_ledger_module(state_path, os.environ)
+            criteria = [
+                {"id": value, "summary": value, "source": "user-explicit", "admitted": True,
+                 "status": "unmet", "work_unit_id": "report-unit", "contract_revision": 1}
                 for value in ("report", "backup")
             ]
-            state_path.write_text(json.dumps(state))
+            native_ledger(root / "intent", core, criteria=criteria)
             bridge = helper.invoke(root)
             self.assertEqual(bridge.returncode, 0, bridge.stderr)
             run_dir = root / "external-run"
@@ -251,7 +242,7 @@ class IntentProjectionTest(unittest.TestCase):
         self.assertIn("Explicit current exception permits publishing", rendered)
         self.assertNotIn("Edit personal only", rendered)
         self.assertIn("newer explicit decisions", rendered)
-        self.assertIn("do not revive superseded scope", rendered)
+        self.assertIn("superseded scope remains inactive", rendered)
         self.assertEqual(state, original)
 
     def test_no_admitted_criteria_does_not_invent_completion_obligation(self):
@@ -268,22 +259,24 @@ class IntentProjectionTest(unittest.TestCase):
 
 
 class ContinuationRecoveryTest(unittest.TestCase):
+    def test_ap_record_repair_does_not_request_a_second_answer_or_control_block(self):
+        text = messages.completion_recovery_guidance(
+            {'last_assistant_message': 'Saved the report.\n' + VALID,
+             'host_context': {'delivery_surface': 'visible_transcript'}},
+            {'GHOST_ALICE_CORE_ROOT': os.environ['GHOST_ALICE_CORE_ROOT'], 'GHOST_ALICE_PLATFORM': 'codex'})
+        self.assertIn('delivery-route: preserve_answer_and_patch_metadata', text)
+        self.assertIn('without repeating that answer', text)
+        self.assertIn('no new completion controls', text)
+        self.assertNotIn('Reply with only the missing or corrected control blocks', text)
+        self.assertNotIn('deliver a corrected complete answer', text)
+
     def assert_recovery_proof_handoff(self, text):
         # Contract placement only: these assertions do not measure model compliance.
-        obligations = (
-            "If this replacement final asserts business completion",
-            "include the supported [completion-check] in the final answer as well as in runtime action evidence",
-            "criteria, artifacts, and evidence remain unchanged and valid",
-            "original source and verification time",
-            "do not describe an earlier check as freshly run",
-            "runtime records or final formatting",
-            "Verify changed runtime records separately",
-            "do not refresh business proof",
-            "do not copy a prior turn's skill-call as a current-turn load",
-            "reopen only the affected verification",
-            "without a finalized [completion-check]",
-        )
-        self.assertEqual([obligation for obligation in obligations if obligation not in text], [])
+        self.assertIn("repair-target: runtime_records", text)
+        self.assertIn("delivery-route:", text)
+        self.assertIn("no new completion controls", text)
+        self.assertNotIn("claim-evidence-map", text)
+        self.assertNotIn("Keep internal recovery subordinate", text)
 
     def test_continuation_places_conditional_proof_handoff_in_recovery_section(self):
         text = messages.build_continuation_message({"run_id": "r"}, item())
@@ -294,16 +287,17 @@ class ContinuationRecoveryTest(unittest.TestCase):
         candidate = {"schema_version": "autopilot-consistency-decision-candidate.v1", "promotion_state": "candidate", "action_file_allowed": False, "candidate_id": "seen", "source": "observation_signal", "work_item_id": "report", "decision": "reopen_micro", "evidence": ["readback observed"]}
         self.assertIsNone(governance.promote_candidate_to_action(candidate, work_item_status="running"))
         text = messages.build_continuation_message({"run_id": "r"}, item(), governance_candidate=candidate)
-        self.assertIn("observation_signal candidates are diagnostic", text)
-        self.assertIn("do not promote", text)
+        self.assertIn("Approved queue API", text)
+        owner = (SKILL / "SKILL.md").read_text()
+        self.assertIn("observation_signal", owner)
+        self.assertIn("observation_signal candidates remain diagnostic", owner)
         self.assertNotIn("promote-decision when a candidate exists", text)
 
     def test_continuation_preserves_substantive_result_and_runtime_provenance(self):
         text = messages.build_continuation_message({"run_id": "r"}, item())
-        self.assertIn("complete standalone final answer", text)
-        self.assertIn("Preserve the substantive answer", text)
-        self.assertIn("runtime/tool", text)
-        self.assertIn("not new user authorization", text)
+        self.assertIn("repair-target: runtime_records", text)
+        self.assertIn("no new completion controls", text)
+        self.assertIn("Core verification-before-completion owns claim review", text)
 
     def test_real_adapter_error_preserves_original_goal_and_answer(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -313,15 +307,12 @@ class ContinuationRecoveryTest(unittest.TestCase):
             result = subprocess.run([sys.executable, str(SKILL / "adapters/autopilot_mode.py")], input=json.dumps({"hook_event_name": "Stop"}), env=env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         payload = json.loads(result.stdout)
-        self.assertEqual(payload["decision"], "block")
-        text = payload["reason"]
-        self.assertIn("autopilot-mode adapter error", text)
-        self.assertIn("original user goal", text)
-        self.assertIn("complete standalone final answer", text)
-        self.assertIn("Preserve the substantive answer", text)
-        self.assertIn("runtime/tool", text)
-        self.assertIn("not new user authorization", text)
-        self.assert_recovery_proof_handoff(text)
+        self.assertNotIn("decision", payload)
+        self.assertEqual(payload['recovery']['status'],'parked')
+        text = payload['systemMessage']
+        self.assertIn('adapter error',text)
+        self.assertIn('original supported answer/source/time',text)
+        self.assertIn('does not justify another business check',text)
 
 
 class RecoveryFinalGrammarTest(unittest.TestCase):
@@ -363,7 +354,7 @@ class RecoveryFinalGrammarTest(unittest.TestCase):
             entries = validator.extract_claim_evidence_entries(validator.extract_control_block(final, "completion-check"))
             self.assertEqual(entries[0]["evidence"], old_evidence)
             self.assertEqual(entries[1]["evidence"], runtime_evidence)
-            self.assertIsNotNone(validator.validate_completion_text(final.replace(trace, ""), require_completion_check=True))
+            self.assertIsNone(validator.validate_completion_text(final.replace(trace, ""), require_completion_check=True))
 
     def test_unsupported_business_proof_remains_partial_despite_record_evidence(self):
         unsupported = VALID.replace("verdict: pass", "verdict: unverified").replace(
@@ -384,9 +375,25 @@ class RecoveryFinalGrammarTest(unittest.TestCase):
             "The runtime record readback does not establish the report result. "
             "The affected business check remains open."
         )
-        self.assertIsNone(core_validator().validate_completion_text(partial, require_completion_check=True))
-
+        self.assertIsNotNone(core_validator().validate_completion_text(partial, require_completion_check=True))
+        self.assertIsNone(core_validator().validate_completion_text(partial, require_completion_check=False))
 
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NativeRecordingDeliveryRepairTest(unittest.TestCase):
+    def test_actual_prepared_publication_branch_uses_core_host_delivery(self):
+        receipt=dict(contract=dict(intent_root='/intent',platform='codex',session_id='s'),run_dir='/target',work_item_id='item',prepared_at='old',criterion_ids=['report'])
+        run=dict(run_id='run',completion_publication=dict(status='prepared',receipt=receipt,receipt_token='token'))
+        task=dict(id='item')
+        for surface, changed, phrase in [('visible_transcript',False,'without repeating that answer'),('final_only',False,'one final response'),('unknown',False,'determines answer visibility from supplied conversation'),('visible_transcript',True,'complete answer with the changed claim')]:
+            with self.subTest(surface=surface,changed=changed):
+                text=messages.build_continuation_message(run,task,host_input=dict(host_context=dict(delivery_surface=surface),prior_answer_ref='host-ref',claims_changed=changed))
+                self.assertIn(phrase,text)
+
+    def test_parked_stop_diagnostic_is_not_promoted_to_block(self):
+        import autopilot_mode
+        value=autopilot_mode._format_payload_for_hook(dict(continue_=True,systemMessage='parked',recovery=dict(status='parked')),dict(hook_event_name='Stop'))
+        self.assertNotIn('decision',value)

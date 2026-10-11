@@ -1,4 +1,4 @@
-"""Tests for platform-neutral continuation-signal rendering (A2 + B)."""
+"""Tests for platform-neutral continuation-signal rendering."""
 
 from __future__ import annotations
 
@@ -115,6 +115,36 @@ class BuildContinuationMessageNeutralityTest(unittest.TestCase):
                 self.assertNotIn("approval-generation:", msg)
                 self.assertNotIn("approval-generation-source:", msg)
                 self.assertNotIn("approval-generation-origin:", msg)
+
+
+class InstructionOwnershipTest(unittest.TestCase):
+    def test_publication_instruction_names_core_selection_and_agent_operation(self):
+        text = msgs.completion_publication_scope_guidance()
+        self.assertIn("when the Ghost-ALICE Core completion service requires publication for the candidate response", text)
+        self.assertIn("section Explicit v1 callers", text)
+        self.assertIn("verification-before-completion/references/autopilot-publication.md", text)
+
+    def test_queue_instruction_identifies_selected_run_record_and_recording_limit(self):
+        from unittest.mock import patch
+        item = {"id": "task-7", "focus_layer": "micro", "allowed_surface": ["src"],
+                "acceptance_criteria": ["ac-7"], "prompt": "Implement approved task-7."}
+        with patch.object(msgs, "completion_recovery_guidance", return_value="CORE_DELIVERY_GUIDANCE"):
+            text = msgs.build_continuation_message({"run_id": "run-3"}, item)
+        self.assertIn("consistency-decision.json in the selected run directory", text)
+        self.assertIn("tool-trace presence supplies no semantic mismatch or focus decision", text)
+        self.assertIn("recovery-and-final-answer:\nCORE_DELIVERY_GUIDANCE", text)
+        self.assertNotIn(".autopilot/consistency-decision.json", text)
+        self.assertNotIn("without tools", text)
+
+    def test_preflight_preserves_recording_and_verification_boundaries(self):
+        origin = {"origin_token": "origin-4", "captured_at": "2026-10-10T10:00:00Z",
+                  "contract": {"intent_root": "/intent", "run_dir": "/run",
+                  "platform": "codex", "session_id": "s", "input_event_id": "i", "criterion_ids": ["ac"]}}
+        text = msgs.completion_preflight_guidance(origin)
+        self.assertIn("section Explicit v1 callers", text)
+        self.assertIn("publication status is separate from Core response acceptance", text)
+        self.assertIn("original verification time", text)
+        self.assertIn("--input-event-id i", text)
 
 
 if __name__ == "__main__":

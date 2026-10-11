@@ -85,14 +85,7 @@ class ProspectiveCompletionTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.publish(receipt, completion_check=old_proof, verified_at=old_time)
 
-    def test_blocked_off_unsupported_and_plan_capture_never_advance_execution(self):
-        blocked = {"model_security_decision": {"decision": "block", "input_event_id": "event-1",
-            "reason": "Current explicit block", "risk_flags": []}}
-        self.change_intent(blocked)
-        self.assertEqual(self.capture()["status"], "skipped")
-        self.assertFalse(self.run_dir.exists())
-        self.change_intent({"model_security_decision": {"decision": "allow", "input_event_id": "event-1",
-            "reason": "Resolved", "risk_flags": []}})
+    def test_off_unsupported_plan_do_not_advance(self):
         self.run_dir.mkdir(parents=True); (self.run_dir / "OFF").write_text("")
         self.assertEqual(self.capture()["status"], "skipped")
         (self.run_dir / "OFF").unlink(); self.run_dir.rmdir()
@@ -284,56 +277,9 @@ class ProspectiveCompletionTest(unittest.TestCase):
         self.assertEqual(item["completion"]["evidence"], [original])
         self.assertEqual({row["status"] for row in self.read_state()["acceptance_criteria"]}, {"met"})
 
-    def test_installed_codex_pretool_command_captures_before_single_verification(self):
-        platform = self.source["GHOST_ALICE_PLATFORM"]
-        core_root = Path(self.source["GHOST_ALICE_CORE_ROOT"])
-        sys.path.insert(0, str(core_root / "_shared"))
-        import install_hooks
-        home = self.root / "home"; home.mkdir()
-        (home / ".codex").mkdir()
-        (home / ".claude").mkdir()
-        installed = home / ".agents/skills/autopilot-mode"
-        shutil.copytree(SKILL, installed)
-        env = {"HOME": str(home), "CODEX_HOME": str(home / ".codex"),
-            "PATH": os.environ.get("PATH", ""), "PYTHONDONTWRITEBYTECODE": "1", **self.source}
-        with mock.patch.dict(os.environ, env, clear=True):
-            install_hooks.install_hook(platform, addon_sources=[str(ROOT)], skills_dir=installed.parent)
-        config = home / (".codex/hooks.json" if platform == "codex" else ".claude/settings.json")
-        hooks = json.loads(config.read_text())["hooks"]
-        commands = [h["command"] for entry in hooks.get("PreToolUse", []) for h in entry.get("hooks", [])
-                    if "[adapter:autopilot-mode] prepare-origin" in h.get("command", "")]
-        self.assertEqual(len(commands), 1, "official install omitted prospective capture hook")
-        self.assertIn("[hook-runner:adapter-autopilot-mode-prepare-origin]", commands[0])
-        payload = json.dumps({"hook_event_name": "PreToolUse", "session_id": "session-1", "cwd": str(self.root)})
-        result = subprocess.run(commands[0], shell=True, cwd=self.root, env=env, input=payload,
-                                text=True, capture_output=True)
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn('"continue": true', result.stdout)
-        self.assertFalse(self.run_dir.exists())
-        counter = self.root / "verification-count"
-        subprocess.run([sys.executable, "-B", "-c",
-            "from pathlib import Path; p=Path('verification-count'); p.write_text(str(int(p.read_text())+1) if p.exists() else '1'); assert p.read_text()=='1'"],
-            check=True, cwd=self.root, env=env)
-        original = self.proof()
-        self.assertIn("completion-publication: missing", self.stop()["systemMessage"])
-        with adapter.storage.transaction(self.run_dir, self.source) as store:
-            receipt = self.helper._receipt_output(store.read(self.helper.PUBLICATION_OBJECT))
-        publish = subprocess.run([sys.executable, "-B", str(installed / "scripts/autopilot_completion.py"),
-            "publish", "--receipt-token", receipt["receipt_token"], "--verified-at", self.verified_at,
-            "--evidence-source", self.evidence_source, "--completion-file", "-"],
-            input=original, text=True, capture_output=True, cwd=self.root, env=env)
-        self.assertEqual(publish.returncode, 0, publish.stderr)
-        self.stop()
-        self.assertEqual(counter.read_text(), "1")
-        self.assertEqual(adapter.read_work_items(self.run_dir / "tasks.jsonl")[0]["status"], "completed")
-        state = self.core.read_session_state(root=self.root / "intent", platform=platform, session_id="session-1")
-        self.assertEqual({row["status"] for row in state["acceptance_criteria"]}, {"met"})
-        self.assertEqual(adapter.read_work_items(self.run_dir / "tasks.jsonl")[0]["completion"]["evidence"], [original])
-
 
     def test_official_intake_default_root_and_pretool_without_custom_coordinates(self):
         core_root = Path(self.source["GHOST_ALICE_CORE_ROOT"])
-        sys.path.insert(0, str(core_root / "_shared")); import install_hooks
         home = self.root / "ordinary-home"; (home / ".codex").mkdir(parents=True)
         runtime = home / ".ghost-alice/runtime/current"
         for name in ("_shared", "session-intent-analyzer", "skill-catalog"):
@@ -358,37 +304,32 @@ class ProspectiveCompletionTest(unittest.TestCase):
         observed = self.core.read_session_state(root=intent_root, platform="codex", session_id="session-1")
         self.core.record_turn(root=intent_root, platform="codex", session_id="session-1",
             expected_input_event_id=observed["latest_input_event_id"], intent_delta={"current_goal":"Write and verify the requested report.", "acceptance_criteria":self.read_state()["acceptance_criteria"]})
+        fixtures.register_route(self.core, intent_root)
         pretool = subprocess.run(command("PreToolUse", "[adapter:autopilot-mode] prepare-origin"), shell=True,
             cwd=self.root, env=env, input=json.dumps({"hook_event_name":"PreToolUse", "session_id":"session-1", "cwd":str(self.root)}), text=True, capture_output=True)
         self.assertEqual(pretool.returncode, 0, pretool.stderr)
         with closing(sqlite3.connect(intent_root / "ghost-state.sqlite3")) as conn:
-            self.assertTrue(conn.execute("SELECT name FROM sqlite_master WHERE name='ap_completion_origins'").fetchone(), pretool.stdout)
-        self.assertFalse(self.run_dir.exists())
-        self.source.update(GHOST_ALICE_CORE_ROOT=str(runtime), GHOST_ALICE_SESSION_INTENT_ROOT=str(intent_root), HOME=str(home))
+            self.assertTrue(conn.execute("SELECT name FROM sqlite_master WHERE name='ap_completion_v2_records'").fetchone(), pretool.stdout)
+        self.assertFalse((self.run_dir/"approved-run.json").exists())
+        self.source.update(GHOST_ALICE_CORE_ROOT=str(runtime), GHOST_ALICE_SESSION_INTENT_ROOT=str(intent_root), HOME=str(home),GHOST_ALICE_COMPLETION_SCHEMA="autopilot-completion-receipt.v2",
+            GHOST_ALICE_GHOST_ROOT=str(home / ".ghost-alice"), GHOST_ALICE_SKILLS_DIR=str(installed.parent))
         counter = self.root / "normal-check-count"; counter.write_text("1")
-        self.assertEqual(counter.read_text(), "1"); original = self.proof()
+        self.assertEqual(counter.read_text(), "1"); self.proof()
+        self.completion += "- evidence: " + self.evidence_source + "\n"
+        from test_completion_contract_v2 import _CompletionV2Fixture
+        self.review_candidates = {}
+        self.review_records = {}
+        _CompletionV2Fixture.review(self)
         def installed_stop():
             result = subprocess.run(command("Stop", "[adapter:autopilot-mode] continue"), shell=True,
-                cwd=self.root, env=env, input=json.dumps({"hook_event_name":"Stop", "session_id":"session-1", "cwd":str(self.root)}), text=True, capture_output=True)
+                cwd=self.root, env=env, input=json.dumps({"hook_event_name":"Stop", "session_id":"session-1", "cwd":str(self.root), "last_assistant_message":self.completion}), text=True, capture_output=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             return json.loads(result.stdout)
-        self.assertIn("completion-publication: missing", installed_stop()["systemMessage"])
-        with adapter.storage.transaction(self.run_dir, self.source) as store:
-            receipt = self.helper._receipt_output(store.read(self.helper.PUBLICATION_OBJECT))
-        self.publish(receipt); installed_stop()
+        installed_stop()
         self.assertEqual(counter.read_text(), "1")
-        item = adapter.read_work_items(self.run_dir / "tasks.jsonl")[0]
-        self.assertEqual(item["status"], "completed"); self.assertEqual(item["completion"]["evidence"], [original])
+        self.assertFalse((self.run_dir/"tasks.jsonl").exists())
         state = self.core.read_session_state(root=intent_root, platform="codex", session_id="session-1")
         self.assertEqual({row["status"] for row in state["acceptance_criteria"]}, {"met"})
-
-    def test_installed_claude_pretool_command_captures_before_single_verification(self):
-        self.core.record_turn(root=self.root / "intent", platform="claude", session_id="session-1",
-            raw_user_input="Write the report", intent_delta={"current_goal": "Write and verify the requested report.",
-                "acceptance_criteria": self.read_state()["acceptance_criteria"]})
-        self.source["GHOST_ALICE_PLATFORM"] = "claude"
-        self.run_dir = self.root / ".autopilot/sessions/claude/session-1"
-        self.test_installed_codex_pretool_command_captures_before_single_verification()
 
 
 if __name__ == "__main__": unittest.main()

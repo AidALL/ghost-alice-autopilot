@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Objective-lineage checks for autopilot continuation.
+"""Objective-lineage checks for Ghost-ALICE Autopilot continuation.
 
 Dependencies: Python 3.11+ standard library only.
 """
@@ -47,12 +47,15 @@ def current_session_context(
         if isinstance(value := payload.get(key), str) and value.strip()
     ), "")
     platform = str(context.get("GHOST_ALICE_PLATFORM") or "").strip().lower() or run_platform
+    if platform:
+        context["GHOST_ALICE_PLATFORM"] = platform
     native_session = str(context.get("CODEX_THREAD_ID") or "").strip() if platform == "codex" else ""
     if session_id := payload_session or native_session:
         context["GHOST_ALICE_SESSION_ID"] = session_id
-    if payload_session and platform == "codex":
-        # A trusted firing hook is authoritative through later normalization.
-        context["CODEX_THREAD_ID"] = payload_session
+    if platform == "codex":
+        # Every consumer receives the same normalized native identity.
+        # A trusted firing hook supplies the native session when present.
+        context["CODEX_THREAD_ID"] = payload_session or native_session
     return context
 
 
@@ -68,45 +71,6 @@ def continuation_context_error(binding: Any, source: Mapping[str, str]) -> str:
     if "agent-runtime" in (run_platform, firing_platform) and not agent_runtime_context_is_explicit(source):
         return "agent-runtime requires an explicit platform, session id, and absolute current intent root"
     return ""
-
-
-STOPWORDS = frozenset({
-    "about",
-    "after",
-    "again",
-    "and",
-    "before",
-    "current",
-    "deeper",
-    "from",
-    "into",
-    "local",
-    "more",
-    "same",
-    "that",
-    "the",
-    "this",
-    "with",
-    "work",
-})
-
-META_AUDIT_MARKERS = (
-    "accountability",
-    "answer whether",
-    "assess whether",
-    "determine whether",
-    "did you",
-    "explain why",
-    "over-execut",
-    "overexecut",
-    "previous autopilot",
-    "prior autopilot",
-    "side effect",
-    "unnecessary",
-    "오토파일럿 때문에",
-    "필요없는",
-    "불필요",
-)
 
 
 def _summary_text(value: Any) -> str:
@@ -151,25 +115,6 @@ def _current_summary(intent_state: Mapping[str, Any]) -> str:
         if isinstance(value, str) and value.strip():
             return value.strip()
     return ""
-
-
-def _tokens(text: str) -> set[str]:
-    normalized = "".join(ch.lower() if ch.isalnum() else " " for ch in text)
-    return {part for part in normalized.split() if len(part) >= 3 and part not in STOPWORDS}
-
-
-def _same_objective(left: str, right: str) -> bool:
-    left_tokens = _tokens(left)
-    right_tokens = _tokens(right)
-    if not left_tokens or not right_tokens:
-        return False
-    overlap = left_tokens & right_tokens
-    return len(overlap) >= 3 or len(overlap) / min(len(left_tokens), len(right_tokens)) >= 0.5
-
-
-def _is_meta_audit_intent(text: str) -> bool:
-    normalized = " ".join(text.lower().split())
-    return any(marker in normalized for marker in META_AUDIT_MARKERS)
 
 
 def _first_open_item_id(items: list[dict[str, Any]]) -> str:
@@ -224,23 +169,6 @@ def stale_continuation_missing_intent_event(
     )
 
 
-def _run_source_state_paths(run: Mapping[str, Any]) -> set[str]:
-    paths: set[str] = set()
-    intent_source = run.get("intent_source")
-    if isinstance(intent_source, Mapping):
-        state_path = intent_source.get("state_path")
-        if isinstance(state_path, str) and state_path.strip():
-            paths.add(str(Path(state_path).expanduser().resolve()))
-    approval = run.get("approval_evidence")
-    if isinstance(approval, Mapping):
-        session_intent = approval.get("session_intent")
-        if isinstance(session_intent, Mapping):
-            state_path = session_intent.get("state_path")
-            if isinstance(state_path, str) and state_path.strip():
-                paths.add(str(Path(state_path).expanduser().resolve()))
-    return paths
-
-
 def session_binding_mismatch_event(
     run: Mapping[str, Any],
     items: list[dict[str, Any]],
@@ -287,72 +215,15 @@ def session_binding_mismatch_event(
     return event
 
 
-def stale_continuation_source_intent_event(
-    run: Mapping[str, Any],
-    items: list[dict[str, Any]],
-    current_intent: Mapping[str, Any] | None,
-    current_session_id: str | None,
-) -> dict[str, Any] | None:
-    if not current_intent:
-        return None
-    explicit_session = str(current_session_id or "").strip()
-    run_session = _run_session_id(run)
-    if not explicit_session or not run_session or explicit_session != run_session:
-        return None
-    intent_state = current_intent.get("intent_state")
-    if not isinstance(intent_state, Mapping):
-        return None
-    state_path = current_intent.get("state_path")
-    if not state_path:
-        return None
-    current_state_path = str(Path(state_path).expanduser().resolve())
-    if current_state_path not in _run_source_state_paths(run):
-        return None
-    return _stale_continuation_event(
-        run,
-        items,
-        current_session=explicit_session,
-        current_summary=_current_summary(intent_state),
-        current_state_path=state_path,
-        reason="explicit current session only exposes the approved run source intent, not current-turn lineage evidence",
-    )
-
-
-def stale_continuation_event(
-    run: Mapping[str, Any],
-    items: list[dict[str, Any]],
-    current_intent: Mapping[str, Any] | None,
-) -> dict[str, Any] | None:
-    if not current_intent:
-        return None
-    intent_state = current_intent.get("intent_state")
-    if not isinstance(intent_state, Mapping):
-        return None
-    run_session = _run_session_id(run)
-    current_session = str(current_intent.get("session_id") or intent_state.get("session_id") or "").strip()
-    run_summary = _run_summary(run)
-    current_summary = _current_summary(intent_state)
-    state_path = current_intent.get("state_path")
-    if not current_summary:
-        if run_session and current_session:
-            return _stale_continuation_event(
-                run,
-                items,
-                current_session=current_session,
-                current_summary="",
-                current_state_path=state_path,
-                reason="current session has no semantic intent summary that proves continuation remains inside the approved autopilot objective",
-            )
-        return None
-    if not run_summary:
-        return None
-    if not _is_meta_audit_intent(current_summary) and _same_objective(run_summary, current_summary):
-        return None
-    return _stale_continuation_event(
-        run,
-        items,
-        current_session=current_session,
-        current_summary=current_summary,
-        current_state_path=state_path,
-        reason="current session intent is outside the approved autopilot objective lineage",
-    )
+def completion_protocol(source, requested=None):
+    """Protocol dispatch is not approval, provenance or execution authority."""
+    aliases = {"v1": "autopilot-completion-receipt.v1", "v2": "autopilot-completion-receipt.v2"}
+    observed = source.get("GHOST_ALICE_COMPLETION_SCHEMA")
+    observed = aliases.get(observed, observed)
+    requested = aliases.get(requested, requested)
+    supported = {"autopilot-completion-receipt.v1", "autopilot-completion-receipt.v2"}
+    if any(value is not None and value not in supported for value in (observed, requested)):
+        raise ValueError("Unsupported completion publication protocol")
+    if observed is not None and requested is not None and observed != requested:
+        raise ValueError("Conflicting explicit completion publication protocols")
+    return requested or observed or "autopilot-completion-receipt.v1"

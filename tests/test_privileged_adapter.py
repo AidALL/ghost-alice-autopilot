@@ -1,4 +1,4 @@
-"""TDD for Phase P6: official autopilot privileged-adapter addon.
+"""Official Autopilot adapter registration and native Stop behavior.
 
 Run: GHOST_ALICE_CORE_REPO=/path/to/ghost-alice /opt/homebrew/bin/python3 -m pytest tests/test_privileged_adapter.py -q
 """
@@ -180,25 +180,6 @@ def _conduct_plan() -> dict:
 
 
 class OfficialAutopilotAddonTest(unittest.TestCase):
-    def test_official_autopilot_addon_resolves_privileged_adapter_from_core_data(self):
-        ai, _install_hooks = _load_core_modules()
-        targets = ai.load_addon_targets([AUTOPILOT_SOURCE], platform="claude")
-
-        self.assertEqual(len(targets), 1)
-        target = targets[0]
-        self.assertEqual(target.addon_id, "autopilot-mode")
-        self.assertEqual(target.name, "autopilot-mode")
-        self.assertEqual(target.privileged_adapters, ("autopilot-mode",))
-
-        specs = ai.iter_privileged_adapter_hook_specs(targets)
-        self.assertEqual(len(specs), 2)
-        by_event = {spec["event"]: spec for spec in specs}
-        self.assertEqual(set(by_event), {"pre_tool_use", "on_agent_stop"})
-        self.assertEqual(by_event["on_agent_stop"]["marker"], "[adapter:autopilot-mode] continue")
-        self.assertEqual(by_event["on_agent_stop"]["runner_id"], "adapter-autopilot-mode-continue")
-        self.assertEqual(by_event["pre_tool_use"]["marker"], "[adapter:autopilot-mode] prepare-origin")
-        for spec in specs:
-            self.assertTrue(Path(spec["script"]).is_file())
 
     def test_official_autopilot_adapter_hook_installs_and_full_uninstall_removes_it(self):
         _ai, install_hooks = _load_core_modules()

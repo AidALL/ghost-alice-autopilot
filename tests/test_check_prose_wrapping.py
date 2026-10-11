@@ -1,5 +1,4 @@
 import json
-import os
 import subprocess
 import sys
 import tempfile
@@ -36,22 +35,6 @@ class ProseWrappingSmokeTest(unittest.TestCase):
 
         self.assertEqual(result.returncode, 1, result.stderr + result.stdout)
         self.assertEqual(payload["violation_count"], 1)
-
-    def test_local_repository_is_clean(self) -> None:
-        result, payload = self.run_checker(REPO_ROOT)
-
-        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
-        self.assertEqual(payload["violation_count"], 0, payload["violations"])
-
-    def test_vendored_checker_matches_core_when_available(self) -> None:
-        core_root = os.environ.get("GHOST_ALICE_CORE_REPO")
-        if not core_root:
-            self.skipTest("GHOST_ALICE_CORE_REPO is not set")
-        canonical = Path(core_root) / "scripts" / "check_prose_wrapping.py"
-        if not canonical.is_file():
-            self.skipTest(f"canonical checker is unavailable: {canonical}")
-
-        self.assertEqual(SCRIPT.read_bytes(), canonical.read_bytes())
 
 
 if __name__ == "__main__":

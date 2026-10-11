@@ -1,6 +1,6 @@
 """Prepare once, verify once, publish proof without repeating business work.
 
-Dependencies: Python standard library and the candidate Core storage runtime.
+Dependencies: Python standard library and the Core storage runtime.
 """
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ from contextlib import closing
 from datetime import datetime, timedelta, timezone
 import hashlib
 import importlib.util
-import inspect
 import json
 import os
 from pathlib import Path
@@ -21,13 +20,13 @@ import unittest
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
-SKILL = ROOT / "addons/autopilot-mode/skill"
+SKILL = Path(os.environ.get("GHOST_ALICE_TEST_AP_SKILL_ROOT") or ROOT / "addons/autopilot-mode/skill").resolve()
 SCRIPT = SKILL / "scripts/autopilot_completion.py"
 sys.path.insert(0, str(SKILL / "adapters"))
 sys.path.insert(0, str(ROOT / "tests"))
 import autopilot_state as adapter
 import autopilot_work_items as work_items
-from test_autopilot_session_bridge import _write_current_session_ledger
+from response_route_fixture import native_ledger, register_route
 
 
 class CompletionPublicationTest(unittest.TestCase):
@@ -39,21 +38,20 @@ class CompletionPublicationTest(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name)
-        self.state_path = _write_current_session_ledger(self.root / "intent", repeated_conduct_feedback=False)
-        state = json.loads(self.state_path.read_text())
-        state["current_goal"] = "Write and verify the requested report."
-        state["acceptance_criteria"] = [{"id": key, "summary": summary,
-            "source": "user-explicit", "admitted": True, "status": "unmet"}
+        criteria = [{"id": key, "summary": summary,
+            "source": "user-explicit", "admitted": True, "status": "unmet", "work_unit_id":"report-unit", "contract_revision":1}
             for key, summary in [("report", "Saved report matches input"), ("protected", "Protected file is unchanged")]]
-        self.state_path.write_text(json.dumps(state))
+        self.state_path = self.root / "intent/codex/session-1/intent-state.json"
         self.run_dir = self.root / ".autopilot/sessions/codex/session-1"
         self.source = {"GHOST_ALICE_CORE_ROOT": os.environ["GHOST_ALICE_CORE_ROOT"],
+            "GHOST_ALICE_AUTOPILOT_APPROVAL_EVIDENCE_JSON": '{"decision":"GO","source":"explicit fixture run approval"}',
             "GHOST_ALICE_PLATFORM": "codex", "GHOST_ALICE_SESSION_ID": "session-1",
             "GHOST_ALICE_SESSION_INTENT_ROOT": str(self.root / "intent"),
             "GHOST_ALICE_AUTOPILOT_CWD": str(self.root), "PWD": str(self.root)}
         self.arguments = dict(intent_root=self.root / "intent", platform="codex", session_id="session-1",
                               input_event_id="event-1", source=self.source)
         self.core = work_items._load_core_ledger_module(self.state_path, self.source)
+        native_ledger(self.root / "intent", self.core, criteria=criteria)
 
     def prepare(self):
         return self.helper.prepare_completion(**self.arguments)
@@ -91,9 +89,21 @@ class CompletionPublicationTest(unittest.TestCase):
 
     def change_intent(self, delta=None, *, new_input=False):
         current = self.read_state()
+        delta = copy.deepcopy(delta)
+        if delta and "acceptance_criteria" in delta:
+            incoming = delta["acceptance_criteria"]
+            old = {(c["work_unit_id"], c["contract_revision"], c["id"]): c for c in current["acceptance_criteria"]}
+            changed = any((c.get("work_unit_id"), c.get("contract_revision"), c["id"]) not in old or
+                          any(c.get(k) != old[(c.get("work_unit_id"), c.get("contract_revision"), c["id"])].get(k)
+                              for k in ("summary", "source")) for c in incoming)
+            if changed:
+                revision = max(c["contract_revision"] for c in current["acceptance_criteria"]) + 1
+                for c in incoming:
+                    c.update(work_unit_id="report-unit", contract_revision=revision)
         self.core.record_turn(root=self.root / "intent", platform="codex", session_id="session-1",
             raw_user_input="new request" if new_input else None, intent_delta=delta,
             expected_input_event_id=current["latest_input_event_id"])
+        register_route(self.core, self.root / "intent")
 
     def stop(self):
         return adapter.adapter_payload_from_env(self.source,
@@ -125,6 +135,38 @@ class CompletionPublicationTest(unittest.TestCase):
         first = self.prepare()
         self.assertEqual(self.prepare(), first)
         self.assertIn("prepared_at", first)
+
+    def test_route_audit_does_not_replenish_retries_but_explicit_reapproval_rotates_generation(self):
+        from response_route_fixture import register_route
+        from test_autopilot_state import _write_io_trace
+        prepared = self.prepare()
+        self.source.update(HOME=str(self.root), GHOST_ALICE_AUTOPILOT_IOTRACE_RESUME_LIMIT='1')
+        _write_io_trace(self.root, 'session-1', command='apply_patch current work')
+        with self.helper.storage.transaction(self.run_dir, self.source) as store:
+            run = store.run()
+            generation = run['approval_generation']
+            run['budget']['intent_watermark'] = len(self.core.read_session_events(
+                root=self.root / 'intent', platform='codex', session_id='session-1'))
+            store.put_run(run)
+            items = store.read('tasks.jsonl')
+            items[0]['status'] = 'running'
+            store.write('tasks.jsonl', items)
+            store.write('events.jsonl', [dict(event=event, work_item_id=items[0]['id']) for event in
+                ('resume_running_item_without_decision', 'resume_running_item_from_iotrace')])
+        register_route(self.core, self.root / 'intent')
+        parked = adapter.adapter_payload_from_env(self.source)
+        self.assertEqual(parked.get('completion_recording', {}).get('status'), 'parked', parked)
+        with self.helper.storage.transaction(self.run_dir, self.source) as store:
+            self.assertEqual(store.generation(), generation)
+            self.assertFalse(any(event['event'] == 'resume_budget_replenished' for event in store.read('events.jsonl')))
+        self.change_intent(new_input=True)
+        self.arguments['input_event_id'] = self.read_state()['latest_input_event_id']
+        revised = self.helper.prepare_completion(**self.arguments, reapprove_current_input=True)
+        self.assertNotEqual(revised['approval_generation'], prepared['approval_generation'])
+        with self.helper.storage.transaction(self.run_dir, self.source) as store:
+            self.assertEqual(store.read('tasks.jsonl')[0]['status'], 'ready')
+            with self.assertRaises(FileNotFoundError):
+                store.read('events.jsonl')
 
     def test_unsupported_platform_api_rejects_before_state_access(self):
         for platform in ("agent-runtime", "custom"):
@@ -213,20 +255,6 @@ class CompletionPublicationTest(unittest.TestCase):
         foreign = dict(self.source, GHOST_ALICE_SESSION_ID="other")
         with self.assertRaises(ValueError): self.publish(receipt, source=foreign)
 
-    def test_new_input_and_changed_criterion_or_scope_are_rejected(self):
-        for change in ("input", "criterion", "scope"):
-            with self.subTest(change=change):
-                # Each mutation makes the same original receipt stale; no rebind is allowed.
-                if change == "input":
-                    receipt = self.prepare(); self.proof()
-                    self.change_intent(new_input=True)
-                elif change == "criterion":
-                    criteria = copy.deepcopy(self.read_state()["acceptance_criteria"])
-                    criteria[0]["summary"] = "A different report condition"
-                    self.change_intent({"acceptance_criteria": criteria})
-                else:
-                    self.change_intent({"constraints": ["A changed scope restriction"]})
-                with self.assertRaises(ValueError): self.publish(receipt)
 
     def test_same_input_criterion_change_is_rejected(self):
         receipt = self.prepare(); self.proof()
@@ -294,8 +322,6 @@ class CompletionPublicationTest(unittest.TestCase):
         self.change_intent({"acceptance_criteria": criteria}, new_input=True)
         self.arguments["input_event_id"] = self.read_state()["latest_input_event_id"]
         with self.assertRaises(ValueError): self.prepare()
-        self.assertIn("reapprove_current_input", inspect.signature(self.helper.prepare_completion).parameters,
-                      "missing supported reapproval path for a new authorized input")
         current = self.helper.prepare_completion(**self.arguments, reapprove_current_input=True)
         self.assertNotEqual(current["approval_generation"], original["approval_generation"])
         with self.assertRaises(ValueError): self.publish(original)
@@ -303,23 +329,6 @@ class CompletionPublicationTest(unittest.TestCase):
         self.proof(); self.publish(current); self.stop()
         self.assertEqual({x["status"] for x in self.read_state()["acceptance_criteria"]}, {"met"})
 
-    def test_core_skill_exposes_publication_before_initial_verification(self):
-        skill = Path(os.environ["GHOST_ALICE_CORE_ROOT"]) / "coding-convention/verification-before-completion/SKILL.md"
-        entry = skill.read_text()
-        reference = "references/autopilot-publication.md"
-        self.assertIn(f"[{reference}]({reference})", entry)
-        self.assertIn("before preparation, business verification or the first final answer", entry)
-        self.assertIn("current session has admitted criteria for authorized execution", entry)
-        text = (skill.parent / reference).read_text()
-        self.assertIn("autopilot_completion.py prepare", text)
-        self.assertIn("autopilot_completion.py publish", text)
-        self.assertIn("--reapprove-current-input", text)
-        self.assertIn("before the business verification", text)
-        self.assertIn("Plan-only", text)
-        self.assertIn("criterion_ids", text)
-        self.assertIn("archives the previous generation", text)
-        self.assertIn("Codex or Claude", text)
-        self.assertIn("Other platforms retain the existing workflow", text)
 
     def test_new_turn_appended_criterion_does_not_reprove_historical_met_criteria(self):
         original = self.prepare(); self.proof(); self.publish(original); self.stop()

@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 import os
 from pathlib import Path
 import subprocess
@@ -34,16 +33,22 @@ def read_authority(path):
     return aps_storage.read(path)
 
 
-def update_criteria(path, criteria):
+def update_criteria(path, criteria, *, reroute=False):
     import autopilot_work_items
     core = autopilot_work_items._load_core_ledger_module(path, os.environ)
     state = read_authority(path)
+    if reroute:
+        revision = max(c["contract_revision"] for c in state["acceptance_criteria"]) + 1
+        criteria = [dict(c, contract_revision=revision) for c in criteria]
     core.record_turn(root=path.parent.parent.parent, platform=path.parent.parent.name,
         session_id=path.parent.name, intent_delta={"acceptance_criteria": criteria},
         expected_input_event_id=state["latest_input_event_id"])
+    if reroute:
+        register_route(core, path.parent.parent.parent, path.parent.parent.name, path.parent.name)
 
 from autopilot_intent_recovery import semantic_delta_starvation_event  # noqa: E402
 from test_autopilot_state import _decision_action, VALID_COMPLETION_EVIDENCE  # noqa: E402
+from response_route_fixture import native_ledger, register_route
 
 
 class BridgeAdmissionBoundaryTest(unittest.TestCase):
@@ -66,18 +71,52 @@ class BridgeAdmissionBoundaryTest(unittest.TestCase):
                 args += ["--input-event-id", input_token]
         return subprocess.run(args + list(extra), cwd=root, env=source, capture_output=True, text=True)
 
-    def setup_ledger(self, root):
-        return _write_current_session_ledger(root / "intent", repeated_conduct_feedback=False)
+    def setup_ledger(self, root, *, legacy=False):
+        if legacy:
+            return _write_current_session_ledger(root / "intent", repeated_conduct_feedback=False)
+        locator = root / "intent/codex/session-1/intent-state.json"
+        core = work_items._load_core_ledger_module(locator, os.environ)
+        return native_ledger(root / "intent", core)
 
     def assert_rejected_without_run(self, root, result):
         self.assertNotEqual(result.returncode, 0, result.stdout)
         self.assertFalse(aps_storage.exists(root / "external-run" / "approved-run.json"))
 
+    def test_bridge_rechecks_current_route_before_creating_any_run_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); path = self.setup_ledger(root)
+            core = work_items._load_core_ledger_module(path, os.environ)
+            sys.path.insert(0, str(BRIDGE_SCRIPT.parent.parent / "addons/autopilot-mode/skill/scripts"))
+            from autopilot_session_bridge import bridge_session_intent_to_run_state
+            original = aps_storage.transaction
+            def stale_before_lock(*args, **kwargs):
+                core.record_turn(root=root / "intent", platform="codex", session_id="session-1", raw_user_input="Route changed before admission lock")
+                return original(*args, **kwargs)
+            source = {"GHOST_ALICE_CORE_ROOT":os.environ["GHOST_ALICE_CORE_ROOT"], "PWD":str(root)}
+            with mock.patch.object(aps_storage, "transaction", side_effect=stale_before_lock):
+                with self.assertRaisesRegex(ValueError, "route|input"):
+                    bridge_session_intent_to_run_state(intent_root=root / "intent", platform="codex", session_id="session-1",
+                        input_event_id="event-1", run_dir=root / "external-run", current_work_item_id="current", plan_path="plan.md",
+                        approval_evidence={"decision":"GO", "source":"current-user"}, source=source)
+            self.assertFalse((root / "external-run").exists())
+
+    def test_nonexecution_route_skips_explicit_admission_without_state(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp); path = self.setup_ledger(root)
+            core = work_items._load_core_ledger_module(path, os.environ)
+            register_route(core, root / "intent", selected=[], mode="direct-response")
+            before = read_authority(path)
+            result = self.invoke(root)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(json.loads(result.stdout)["status"], "skipped")
+            self.assertFalse((root / "external-run").exists())
+            self.assertEqual(read_authority(path), before)
+
     def test_rejects_state_identity_and_schema_mismatch_before_approval_write(self):
         for field, wrong in [("session_id", "other"), ("platform", "claude"),
                              ("schema_version", "wrong")]:
             with self.subTest(field=field), tempfile.TemporaryDirectory() as tmp:
-                root = Path(tmp); state = self.setup_ledger(root)
+                root = Path(tmp); state = self.setup_ledger(root, legacy=True)
                 data = read_authority(state); data[field] = wrong
                 state.write_text(json.dumps(data))
                 self.assert_rejected_without_run(root, self.invoke(root))
@@ -85,7 +124,7 @@ class BridgeAdmissionBoundaryTest(unittest.TestCase):
     def test_rejects_foreign_latest_input_in_current_session_log(self):
         for field, wrong in [("session_id", "other"), ("platform", "claude")]:
             with self.subTest(field=field), tempfile.TemporaryDirectory() as tmp:
-                root = Path(tmp); state = self.setup_ledger(root)
+                root = Path(tmp); state = self.setup_ledger(root, legacy=True)
                 events = state.parent / "intent-events.jsonl"
                 rows = [json.loads(s) for s in events.read_text().splitlines()]
                 rows[0][field] = wrong
@@ -94,7 +133,7 @@ class BridgeAdmissionBoundaryTest(unittest.TestCase):
 
     def test_rejects_pointer_identity_disagreement(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp); self.setup_ledger(root)
+            root = Path(tmp); self.setup_ledger(root, legacy=True)
             pointer = root / "intent/codex/current-session.json"
             data = json.loads(pointer.read_text()); data["session_id"] = "other"
             pointer.write_text(json.dumps(data))
@@ -106,7 +145,8 @@ class BridgeAdmissionBoundaryTest(unittest.TestCase):
             root = Path(tmp); self.setup_ledger(root)
             first = self.invoke(root); self.assertEqual(first.returncode, 0, first.stderr)
             run = root / "external-run/approved-run.json"; before = read_authority(run)
-            _write_current_session_ledger(root / "intent", session_id="other", repeated_conduct_feedback=False)
+            core = work_items._load_core_ledger_module(root / "intent/codex/other/intent-state.json", os.environ)
+            native_ledger(root / "intent", core, session="other")
             second = self.invoke(root, session="other")
             self.assertNotEqual(second.returncode, 0)
             self.assertEqual(read_authority(run), before)
@@ -160,17 +200,21 @@ class BridgeAdmissionBoundaryTest(unittest.TestCase):
     def test_authoritative_state_anchor_is_not_replaced_by_lagging_audit(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp); state = self.setup_ledger(root)
+            core = work_items._load_core_ledger_module(state, os.environ)
+            raw = "New canonical approval receipt"
+            observation = core.build_input_observation(platform="codex", session_id="session-1", raw_user_input=raw)
+            observation["input_event_id"] = "committed-input"
+            core.record_turn(root=root / "intent", platform="codex", session_id="session-1", raw_user_input=raw, observation=observation)
+            register_route(core, root / "intent")
             data = read_authority(state)
-            data.update(ledger_revision=7, latest_input_event_id="committed-input",
-                        latest_input_digest="3" * 64, latest_input_char_count=91)
-            state.write_text(json.dumps(data))
+            (state.parent / "intent-events.jsonl").write_text(json.dumps({"event":"user-input-observed", "event_id":"event-1"}) + "\n")
             result = self.invoke(root, extra=["--input-event-id", "committed-input"])
             self.assertEqual(result.returncode, 0, result.stderr)
             run = read_authority(root / "external-run/approved-run.json")
             receipt = run["approval_evidence"]["session_intent"]
             self.assertEqual(receipt["latest_input_event"]["event_id"], "committed-input")
-            self.assertEqual(receipt["latest_input_event"]["input_digest"], "3" * 64)
-            self.assertEqual(receipt["ledger_revision"], 7)
+            self.assertEqual(receipt["latest_input_event"]["input_digest"], data["latest_input_digest"])
+            self.assertEqual(receipt["ledger_revision"], data["ledger_revision"])
             stale = self.invoke(root, check=True, extra=["--input-event-id", "event-1"])
             self.assertNotEqual(stale.returncode, 0)
 
@@ -179,7 +223,7 @@ class BridgeAdmissionBoundaryTest(unittest.TestCase):
         if not core_root:
             self.skipTest("candidate core root required for cross-repository integration")
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp); state = self.setup_ledger(root)
+            root = Path(tmp); state = self.setup_ledger(root, legacy=True)
             data = read_authority(state)
             data.update(ledger_revision=1, latest_input_event_id="event-1",
                         latest_input_digest="1" * 64, latest_input_char_count=20, pending_audit_event={"pending": True})
@@ -200,7 +244,7 @@ class BridgeAdmissionBoundaryTest(unittest.TestCase):
             self.assertIsNone(semantic_delta_starvation_event(current))
             run = {"approval_evidence": {"session_intent": {"session_id": "session-1", "platform": "codex"}},
                    "intent_source": {"events_path": str(events)}, "budget": {"intent_watermark": 0}}
-            self.assertFalse(state_adapter._maybe_replenish_resume_budget(root / "run", run, "task", current))
+            self.assertFalse(state_adapter._maybe_replenish_resume_budget(root / "run", run, "task"))
 
     def test_admission_cannot_write_through_active_database_transaction(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -222,14 +266,10 @@ class BridgeAdmissionBoundaryTest(unittest.TestCase):
     def test_stop_bootstrap_and_continuation_reject_foreign_input_identity(self):
         for existing in (False, True):
             with self.subTest(existing=existing), tempfile.TemporaryDirectory() as tmp:
-                root = Path(tmp); state = self.setup_ledger(root)
+                root = Path(tmp); self.setup_ledger(root)
                 if existing:
                     created = self.invoke(root)
                     self.assertEqual(created.returncode, 0, created.stderr)
-                events = state.parent / "intent-events.jsonl"
-                rows = [json.loads(s) for s in events.read_text().splitlines()]
-                rows[0]["session_id"] = "other"
-                events.write_text("\n".join(json.dumps(x) for x in rows) + "\n")
                 source = {k: v for k, v in os.environ.items() if not k.startswith("GHOST_ALICE_") or k == "GHOST_ALICE_CORE_ROOT"}
                 source.pop("CODEX_THREAD_ID", None)
                 source.update({"PYTHONDONTWRITEBYTECODE": "1", "GHOST_ALICE_PLATFORM": "codex",
@@ -237,13 +277,13 @@ class BridgeAdmissionBoundaryTest(unittest.TestCase):
                     "GHOST_ALICE_AUTOPILOT_RUN_DIR": str(root / "external-run"),
                     "GHOST_ALICE_AUTOPILOT_APPROVAL_EVIDENCE_JSON": '{"decision":"GO","source":"current-user"}'})
                 stopped = subprocess.run([sys.executable, str(ADAPTER_SCRIPT)], cwd=root, env=source,
-                    input=json.dumps({"hook_event_name": "Stop", "session_id": "session-1", "cwd": str(root)}),
+                    input=json.dumps({"hook_event_name": "Stop", "session_id": "other", "cwd": str(root)}),
                     capture_output=True, text=True)
                 self.assertEqual(stopped.returncode, 0, stopped.stderr)
                 if existing:
-                    self.assertTrue(json.loads(stopped.stdout)["systemMessage"])
+                    self.assertEqual(json.loads(stopped.stdout)["systemMessage"], "")
                     task = state_adapter.read_work_items(root / "external-run/tasks.jsonl")[0]
-                    self.assertEqual(task["status"], "running")
+                    self.assertEqual(task["status"], "ready")
                 else:
                     self.assertFalse(aps_storage.exists(root / "external-run/approved-run.json"))
 
@@ -266,6 +306,7 @@ class BridgeAdmissionBoundaryTest(unittest.TestCase):
                     "evidence": [text.replace("AC-TEST", "AC-ONE") for text in VALID_COMPLETION_EVIDENCE]}
         decision["approval_generation"] = state_adapter.SESSION_MATERIAL.approval_generation(run)
         ledger = mock.Mock()
+        ledger.__file__ = str(Path(os.environ["GHOST_ALICE_CORE_ROOT"]) / "session-intent-analyzer/scripts/session_intent_ledger.py")
         with mock.patch.object(work_items, "_load_core_ledger_module", return_value=ledger):
             self.assertEqual(work_items.materialize_met_criteria_from_continue_next(run, decision), ["AC-ONE"])
         call = ledger.mark_acceptance_criterion_met.call_args.kwargs
@@ -280,6 +321,7 @@ class BridgeAdmissionBoundaryTest(unittest.TestCase):
                     "evidence": [text.replace("AC-TEST", "AC-ONE") for text in VALID_COMPLETION_EVIDENCE]}
         decision["approval_generation"] = state_adapter.SESSION_MATERIAL.approval_generation(run)
         ledger = mock.Mock()
+        ledger.__file__ = str(Path(os.environ["GHOST_ALICE_CORE_ROOT"]) / "session-intent-analyzer/scripts/session_intent_ledger.py")
         with mock.patch.object(work_items, "_load_core_ledger_module", return_value=ledger):
             self.assertEqual(work_items.materialize_met_criteria_from_continue_next(run, decision), [])
         ledger.mark_acceptance_criterion_met.assert_not_called()
@@ -294,6 +336,7 @@ class BridgeAdmissionBoundaryTest(unittest.TestCase):
                     "evidence": [text.replace("AC-TEST", "AC-ONE") for text in VALID_COMPLETION_EVIDENCE]}
         decision["approval_generation"] = state_adapter.SESSION_MATERIAL.approval_generation(run)
         ledger = mock.Mock()
+        ledger.__file__ = str(Path(os.environ["GHOST_ALICE_CORE_ROOT"]) / "session-intent-analyzer/scripts/session_intent_ledger.py")
         with mock.patch.object(work_items, "_load_core_ledger_module", return_value=ledger):
             self.assertEqual(work_items.materialize_met_criteria_from_continue_next(run, decision), [])
         ledger.mark_acceptance_criterion_met.assert_not_called()
@@ -307,7 +350,6 @@ class BridgeAdmissionBoundaryTest(unittest.TestCase):
                 root = Path(tmp); state_path = self.setup_ledger(root)
                 state = read_authority(state_path)
                 state["acceptance_criteria"][0].update(admitted=True, status="unmet")
-                state_path.write_text(json.dumps(state))
                 created = self.invoke(root, env={"GHOST_ALICE_CORE_ROOT": core_root})
                 self.assertEqual(created.returncode, 0, created.stderr)
                 run = read_authority(root / "external-run/approved-run.json")
@@ -340,7 +382,6 @@ class BridgeAdmissionBoundaryTest(unittest.TestCase):
                 root = Path(tmp); state_path = self.setup_ledger(root)
                 state = read_authority(state_path)
                 state["acceptance_criteria"][0].update(admitted=True, status="unmet")
-                state_path.write_text(json.dumps(state))
                 created = self.invoke(root, env={"GHOST_ALICE_CORE_ROOT": core_root})
                 self.assertEqual(created.returncode, 0, created.stderr)
                 run_dir = root / "external-run"
@@ -360,6 +401,7 @@ class BridgeAdmissionBoundaryTest(unittest.TestCase):
                     approval_generation=read_authority(run_dir / "approved-run.json")["approval_generation"])
                 (run_dir / "consistency-decision.json").write_text(json.dumps(decision))
                 failed_core = mock.Mock(wraps=ledger)
+                failed_core.__file__ = ledger.__file__
                 failed_core.mark_acceptance_criterion_met.side_effect = OSError("injected core write failure")
                 fault = mock.patch.object(work_items, "_load_core_ledger_module", return_value=failed_core) if change == "core-write-failure" else nullcontext()
                 if change == "ap-write-failure":
@@ -371,7 +413,7 @@ class BridgeAdmissionBoundaryTest(unittest.TestCase):
                 error = None
                 with fault:
                     try:
-                        state_adapter.advance_approved_run(run_dir, environment)
+                        result = state_adapter.advance_approved_run(run_dir, environment)
                     except (state_adapter.AutopilotStateError, OSError) as exc:
                         error = str(exc)
                 final_task = state_adapter.read_work_items(run_dir / "tasks.jsonl")[0]
@@ -379,7 +421,10 @@ class BridgeAdmissionBoundaryTest(unittest.TestCase):
                     self.assertIsNone(error)
                     self.assertEqual(final_task["status"], "completed")
                 else:
-                    self.assertIsNotNone(error)
+                    if change in {"input", "summary"}:
+                        self.assertEqual(result["completion_recording"]["status"], "skipped" if change == "input" else "recording-unavailable")
+                    else:
+                        self.assertIsNotNone(error)
                     self.assertEqual(final_task["status"], "running")
                     self.assertFalse((run_dir / "consistency-decision.applied.json").exists())
                 if change == "ap-write-failure":
@@ -396,7 +441,6 @@ class BridgeAdmissionBoundaryTest(unittest.TestCase):
             with self.subTest(change=change), tempfile.TemporaryDirectory() as tmp:
                 root = Path(tmp); state_path = self.setup_ledger(root)
                 state = read_authority(state_path); state["acceptance_criteria"][0].update(admitted=True, status="unmet")
-                state_path.write_text(json.dumps(state))
                 self.assertEqual(self.invoke(root).returncode, 0)
                 run_dir = root / "external-run"; run_path = run_dir / "approved-run.json"
                 old_run = read_authority(run_path); item = state_adapter.read_work_items(run_dir / "tasks.jsonl")[0]
@@ -413,7 +457,7 @@ class BridgeAdmissionBoundaryTest(unittest.TestCase):
                     extra = ["--allowed-surface", "revised-plan.md"]
                 if change != "scope":
                     state["acceptance_criteria"][0]["summary"] = "new required revision"
-                    update_criteria(state_path, state["acceptance_criteria"])
+                    update_criteria(state_path, state["acceptance_criteria"], reroute=True)
                 admitted = self.invoke(root, input_token=token, extra=extra)
                 self.assertEqual(admitted.returncode, 0, admitted.stderr)
                 self.assertFalse(aps_storage.pending(decision_path), "old pending proof must not survive as an active action")

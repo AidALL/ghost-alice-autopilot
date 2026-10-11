@@ -14,6 +14,10 @@ from autopilot_lineage import current_session_context, intent_identity_matches
 from autopilot_work_items import _load_core_ledger_module
 
 
+class SessionAuthorityError(ValueError):
+    """The selected native authority cannot supply valid current material."""
+
+
 def _object(path: Path) -> dict[str, Any]:
     value = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(value, dict):
@@ -26,10 +30,10 @@ def read_session_material(
     *, require_input: bool = False, expected_input_event_id: str | None = None,
     source: Mapping[str, str] | None = None, recover_audit: bool = True,
 ) -> dict[str, Any]:
-    """One reader for bridge admission, automatic bootstrap and continuation.
+    """Read exact current identity for bridge admission and continuation.
 
-    Legacy continuation may have no recorded input event. New explicit
-    admission requires one; any present event must match the firing identity.
+    Queue continuation can have no recorded input event. Explicit admission
+    requires one; any present event must match the firing identity.
     """
     if platform not in {"codex", "claude", "agent-runtime"}:
         raise ValueError("unsupported session platform")
@@ -54,7 +58,7 @@ def read_session_material(
     if not intent_identity_matches(state, platform, session_id):
         raise ValueError(f"{state_path}: ledger schema, platform, or session identity mismatch")
     if not recover_audit and state.get("pending_audit_event"):
-        raise ValueError("ledger audit is pending; migration is required before admission")
+        raise ValueError("ledger audit is pending; validated import is required before admission")
     if recover_audit and state.get("pending_audit_event"):
         state = core.migrate_session(root=root, platform=platform, session_id=session_id,
                                      transaction=connection)
@@ -91,6 +95,20 @@ def read_session_material(
     return {"platform": platform, "session_id": session_id, "state_path": state_path,
             "events_path": events_path, "intent_state": state, "events": events,
             "latest_input_event": latest_input}
+
+
+def selected_session_context(material, source, *, hook_input=None, allow_discovered_identity=False):
+    """Bind only missing coordinates from the exact public reader selection.
+
+    Explicit/native firing identities retain precedence. The current Core route
+    still determines admission; discovery is never borrowed from an old run.
+    """
+    current=current_session_context(source,run_platform=material['platform'],hook_input=hook_input) or {}
+    coordinates=dict(GHOST_ALICE_PLATFORM=material['platform'],
+        GHOST_ALICE_SESSION_INTENT_ROOT=str(Path(material['state_path']).parents[2]))
+    if allow_discovered_identity:
+        coordinates['GHOST_ALICE_SESSION_ID']=material['session_id']
+    return {**coordinates,**current}
 
 
 def project_cwd_from_env(source: Mapping[str, str]) -> Path:
@@ -149,6 +167,8 @@ def with_discovered_session_root(source: Mapping[str, str], project: Path) -> di
                                   require_input=True, recover_audit=False)
         except FileNotFoundError:
             continue
+        except ValueError as exc:
+            raise SessionAuthorityError(str(exc)) from exc
         current["GHOST_ALICE_SESSION_INTENT_ROOT"] = str(root.resolve())
         break
     return current
@@ -209,7 +229,7 @@ def run_is_paused(run_dir: Path) -> bool:
         return True
     if (run_dir.parent.name in {"codex", "claude", "agent-runtime"}
             and run_dir.parent.parent.name == "sessions"
-            and run_dir.parent.parent.parent.name == ".autopilot"):
+            and run_dir.parent.parent.parent.name in {".autopilot", "autopilot"}):
         return (run_dir.parent.parent.parent / "OFF").exists()
     return False
 
@@ -239,6 +259,11 @@ def resolve_run_target(env: Mapping[str, str] | None = None) -> dict[str, Any]:
 
     if run_dir := source.get("GHOST_ALICE_AUTOPILOT_RUN_DIR"):
         return target(Path(run_dir).expanduser(), project_cwd, "explicit-run-dir")
+    from autopilot_lineage import completion_protocol
+    if source.get("GHOST_ALICE_GHOST_ROOT") and completion_protocol(source) == "autopilot-completion-receipt.v2":
+        managed = _managed_session_target(source, project_cwd)
+        if managed is not None:
+            return managed
     if explicit_cwd := source.get("GHOST_ALICE_AUTOPILOT_CWD"):
         if not (explicit_project := Path(explicit_cwd)).is_absolute():
             raise ValueError("GHOST_ALICE_AUTOPILOT_CWD must be an absolute path")
@@ -252,3 +277,92 @@ def resolve_run_target(env: Mapping[str, str] | None = None) -> dict[str, Any]:
     if _run_descriptor_available(cwd_run_dir):
         return target(cwd_run_dir, project_cwd, "existing-cwd", bootstrap=False)
     return target(cwd_run_dir, project_cwd, "cwd", derived=True)
+
+
+def _managed_session_target(source: Mapping[str, str], project: Path) -> dict[str, Any] | None:
+    """Select owned runtime storage before capture without moving prior origins.
+
+The Core installation supplies GHOST_ALICE_GHOST_ROOT. Business cwd remains
+context; it need not be writable. Explicit targets bypass this derived policy.
+Only exact current-owner legacy targets are retained, without adopting another
+session's state or silently choosing between two previously bound targets.
+"""
+    ghost = Path(source["GHOST_ALICE_GHOST_ROOT"]).expanduser()
+    if not ghost.is_absolute():
+        raise ValueError("GHOST_ALICE_GHOST_ROOT must be an absolute trusted runtime root")
+    if source.get("GHOST_ALICE_AUTOPILOT_CWD") and not Path(source["GHOST_ALICE_AUTOPILOT_CWD"]).is_absolute():
+        raise ValueError("GHOST_ALICE_AUTOPILOT_CWD must be an absolute path")
+    platform = str(source.get("GHOST_ALICE_PLATFORM") or "").strip().lower()
+    session = str(source.get("GHOST_ALICE_SESSION_ID") or "").strip()
+    if platform not in {"codex", "claude"} or not session:
+        return None
+    if Path(session).name != session or session in {".", ".."} or "\\" in session:
+        raise ValueError("session id must be a single path component")
+    legacy_base = project / ".autopilot"
+    runtime_base = ghost / "autopilot"
+    runtime_target = runtime_base / "sessions" / platform / session
+    # Check all known default pause locations before reading Core state.
+    legacy_session = legacy_base / "sessions" / platform / session
+    paused_target = next((path for path in (legacy_session, runtime_target) if run_is_paused(path)), None)
+    current = dict(source) if paused_target else with_discovered_session_root(source, project)
+    if paused_target:
+        return dict(run_dir=paused_target, project_cwd=project, reason="paused-session-target",
+            derived_run_dir=True, bootstrap=True, source=current, project_pause_root=legacy_base)
+    owned = []
+    from autopilot_storage import bound_completion_targets
+    bound_targets = bound_completion_targets(current)
+    for reference in bound_targets:
+        candidate = Path(reference['path'])
+        owner = run_owner_hint(candidate)
+        if owner is None or not run_owner_matches(owner, current):
+            raise SessionAuthorityError("previously bound completion target descriptor is missing or changed; preserve its original locator")
+        owned.append(candidate)
+    for candidate in (legacy_base, legacy_session, runtime_target):
+        owner = run_owner_hint(candidate)
+        if owner is not None and run_owner_matches(owner, current):
+            owned.append(candidate)
+        elif candidate == runtime_target and owner is not None:
+            raise SessionAuthorityError("owned runtime target belongs to another session or ledger authority")
+    # Bound receipt locators precede equivalent discovered defaults.
+    distinct = {}
+    for path in owned:
+        distinct.setdefault(str(path.resolve()), path)
+    if len(distinct) > 1:
+        raise SessionAuthorityError("multiple existing current-session targets require an explicit bound target")
+    selected = next(iter(distinct.values()), runtime_target)
+    bound_reference = next((r for r in bound_targets if r['path'] == str(selected)), None)
+    return dict(run_dir=selected, project_cwd=project,
+        reason="explicit-run-dir" if bound_reference and bound_reference['selection_origin'] == 'explicit' else
+            "owned-session-runtime" if selected == runtime_target else "existing-project-session",
+        derived_run_dir=not (bound_reference and bound_reference['selection_origin'] == 'explicit'),
+        bootstrap=True, source=current, project_pause_root=legacy_base)
+
+
+def core_recovery_delivery(hook_input=None, source=None, *, claims_changed=None):
+    """Pass supplied hook feedback and host metadata to Core's delivery observer.
+
+    Environment identity selects the host context; it does not prove that the
+    host displayed a response to the user.
+    """
+    import importlib.util
+    current = dict(os.environ if source is None else source)
+    explicit_root=current.get('GHOST_ALICE_CORE_ROOT') or os.environ.get('GHOST_ALICE_CORE_ROOT')
+    provider_path=Path(explicit_root)/'_shared/response_delivery.py' if explicit_root and Path(explicit_root).is_absolute() else None
+    if explicit_root and (provider_path is None or not provider_path.is_file()):
+        raise ValueError("Explicit Core recovery delivery provider unavailable")
+    if provider_path is None or not provider_path.is_file():
+        locator = Path(current.get('GHOST_ALICE_SESSION_INTENT_ROOT') or '/unbound') / 'intent-state.json'
+        core = _load_core_ledger_module(locator, current)
+        if core is None:
+            raise ValueError('Core recovery delivery provider unavailable')
+        provider_path = Path(core.__file__).resolve().parents[2] / '_shared/response_delivery.py'
+    spec = importlib.util.spec_from_file_location('ap_core_response_delivery', provider_path)
+    provider = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(provider)
+    observed = dict(hook_input or {})
+    if claims_changed is not None:
+        observed['claims_changed'] = claims_changed
+    text = next((observed[k] for k in ('last_assistant_message', 'lastAssistantMessage', 'prompt_response', 'promptResponse')
+                 if isinstance(observed.get(k), str) and observed[k].strip()), '')
+    return provider.observe_recovery_delivery(observed, platform=current.get('GHOST_ALICE_PLATFORM'),
+        entrypoint=current.get('CLAUDE_CODE_ENTRYPOINT', ''), final_text=text, repair_target='runtime_records')

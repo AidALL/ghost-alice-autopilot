@@ -1,9 +1,17 @@
 #!/usr/bin/env python3
-"""Build candidate-first autopilot governance signals.
+"""Build diagnostic candidates and promoted actions for approved queue work.
 
-This script intentionally separates diagnostic/candidate outputs from
-adapter-consumable action files. The adapter still consumes only promoted
-`consistency-decision.json` and approved `conduct-plan.json` files.
+For explicitly approved queue work, the current-session assistant requests
+this CLI through the native host shell tool. Candidate commands read the supplied
+original JSON artifacts and write --out diagnostic candidates. promote-decision
+reads --candidate and the selected --run-dir authority, validates approval and
+loop state, and writes --out consistency-decision.json. promote-conduct-plan
+requires the actual --approval-evidence-json and writes --out conduct-plan.json.
+Exit 0 means a file was written; exit 3 means no eligible result was produced.
+The Stop adapter consumes promoted/approved action inboxes; diagnostic candidate
+files alone trigger no action. Native managed v2 completion instead consumes
+Ghost-ALICE's authenticated review at Stop and requires no queue action files
+or separate assistant publication command.
 
 Dependencies: Python 3.11+ standard library plus the sibling work-item adapter contract.
 """
@@ -36,7 +44,7 @@ REOPEN_DECISION_BY_FOCUS = {
     "micro": "reopen_micro",
     "meso": "reopen_meso",
     "macro": "reopen_macro",
-    "meta": "ask_user_meta",
+    "meta": "reopen_meta",
 }
 REOPEN_VERDICT_MARKERS = {
     "reopen_focus",
@@ -532,14 +540,16 @@ def promote_candidate_to_action(
     loop_key = loop_guard.get("loop_key")
     prior = set(prior_loop_keys or [])
     decision = candidate["decision"]
+    # A repeated state or local attempt cap just suspends this branch. Neither
+    # observation establishes a missing human decision or a useful repair.
     if isinstance(loop_key, str) and loop_key in prior:
-        decision = "ask_user_meta"
+        decision = "park"
         evidence = [*evidence, "loop-guard: repeated decision/state"]
     max_retry_attempts = loop_guard.get("max_retry_attempts", DEFAULT_RETRY_ATTEMPT_CAP)
     if not isinstance(max_retry_attempts, int) or isinstance(max_retry_attempts, bool):
         max_retry_attempts = DEFAULT_RETRY_ATTEMPT_CAP
     if candidate["decision"] == "retry_same_unit" and current_attempt >= max_retry_attempts:
-        decision = "ask_user_meta"
+        decision = "park"
         evidence = [*evidence, f"loop-guard: retry attempt cap {max_retry_attempts} reached"]
 
     if work_item_status is not None:
@@ -649,18 +659,18 @@ def conduct_plan_candidate_from_governance(
                     "id": f"conduct-{feedback_id}",
                     "depends_on": [],
                     "focus_layer": "meta",
-                    "prompt": "Investigate the repeated conduct mismatch, propose a bounded fix, and preserve the candidate/action-file boundary.",
+                    "prompt": "After approval of the proposed task, the current-session assistant investigates the conduct_feedback identified in the proposal evidence and proposes a bounded correction within allowed_surface. The current-session assistant retains governance output as a candidate until the required promotion or approval.",
                     "acceptance_criteria": [
-                        "Bind the conduct mismatch to session-intent or governance evidence.",
-                        "Keep governance outputs as candidates until promotion or approval.",
-                        "Attach a read-only observer before implementation.",
+                        "The current-session assistant identifies session-intent or governance evidence for the selected conduct mismatch.",
+                        "The current-session assistant retains governance output as a candidate until promotion or approval.",
+                        "The current-session assistant delegates the explicitly approved read-only observer subtask before implementing the approved correction.",
                     ],
                     "allowed_surface": [plan_path],
                 },
                 "observer_agent_required": True,
                 "observer_contract": {
                     "mode": "read_only",
-                    "purpose": "watch main-process logical consistency, focus shifts, and loop-risk signals",
+                    "purpose": "The delegated assistant reports contradictions in current-session-assistant reasoning, focus shifts and repeated attempts without modifying the proposed correction.",
                     "prohibited_actions": [
                         "modify files",
                         "write adapter-consumable action files",

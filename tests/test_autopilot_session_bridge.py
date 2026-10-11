@@ -1,4 +1,4 @@
-"""TDD for session-intent ledger to autopilot run-state bootstrap.
+"""Session-intent ledger to Autopilot run-state bootstrap.
 
 Run: /opt/homebrew/bin/python3 -m pytest tests/test_autopilot_session_bridge.py -q
 """
@@ -50,7 +50,6 @@ def update_criteria(path, criteria):
         expected_input_event_id=state["latest_input_event_id"])
 
 
-
 def _adapter_fixture_environment(root: Path, intent_root: Path) -> dict[str, str]:
     """Bind the subprocess to the fixture ledger rather than the host session."""
     env = {
@@ -63,6 +62,30 @@ def _adapter_fixture_environment(root: Path, intent_root: Path) -> dict[str, str
                GHOST_ALICE_SESSION_ID="session-1",
                GHOST_ALICE_SESSION_INTENT_ROOT=str(intent_root))
     return env
+
+
+def _ready_bridge_fixture(intent_root: Path, *, platform="codex", session_id="session-1") -> None:
+    """Simulation: select the fixture through owning public APIs.
+
+    Import the JSON fixture explicitly and supply synthetic canonical intake.
+    Incomplete intake cannot establish current readiness. This is source
+    simulation, not native host evidence.
+    """
+    import autopilot_work_items
+    from response_route_fixture import register_route
+    path=intent_root/platform/session_id/"intent-state.json"
+    core=autopilot_work_items._load_core_ledger_module(path, os.environ)
+    core.migrate_session(root=intent_root,platform=platform,session_id=session_id)
+    state=core.read_session_state(root=intent_root,platform=platform,session_id=session_id)
+    rows=[dict(row,work_unit_id="current",contract_revision=1,admitted=True,status="unmet")
+          for row in state["acceptance_criteria"]]
+    raw="Synthetic ready-bridge fixture input; no native-host proof."
+    observation=core.build_input_observation(platform=platform,session_id=session_id,raw_user_input=raw)
+    observation["input_event_id"]="fixture-native-input"
+    core.record_turn(root=intent_root,platform=platform,session_id=session_id,
+        raw_user_input=raw,observation=observation,expected_input_event_id=state["latest_input_event_id"],
+        intent_delta={"acceptance_criteria":rows})
+    register_route(core,intent_root,platform,session_id)
 
 
 def _write_current_session_ledger(
@@ -146,36 +169,6 @@ def _write_current_session_ledger(
 
 
 class AutopilotSessionBridgeTest(unittest.TestCase):
-    def test_bridge_and_adapter_share_session_intent_material_helpers(self):
-        shared = (
-            REPO_ROOT
-            / "addons"
-            / "autopilot-mode"
-            / "skill"
-            / "scripts"
-            / "autopilot_session_material.py"
-        )
-        adapter = REPO_ROOT / "addons" / "autopilot-mode" / "skill" / "adapters" / "autopilot_state.py"
-        bridge_text = BRIDGE_SCRIPT.read_text(encoding="utf-8")
-        skill_bridge_text = SKILL_BRIDGE_SCRIPT.read_text(encoding="utf-8")
-        adapter_text = adapter.read_text(encoding="utf-8")
-
-        self.assertTrue(shared.is_file())
-        self.assertTrue(SKILL_BRIDGE_SCRIPT.is_file())
-        self.assertIn("autopilot_session_bridge.py", bridge_text)
-        self.assertIn("autopilot_session_material.py", skill_bridge_text)
-        self.assertIn("autopilot_session_material.py", adapter_text)
-        duplicated_session_material_defs = (
-            "def _run_summary(",
-            "def _acceptance_criteria_from_intent(",
-            "def _session_intent_task(",
-            "def _build_approved_run(",
-        )
-        for marker in duplicated_session_material_defs:
-            with self.subTest(marker=marker):
-                self.assertNotIn(marker, bridge_text)
-                self.assertNotIn(marker, skill_bridge_text)
-                self.assertNotIn(marker, adapter_text)
 
     def test_skill_local_bridge_script_runs_standalone(self):
         result = subprocess.run(
@@ -188,11 +181,12 @@ class AutopilotSessionBridgeTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--intent-root", result.stdout)
 
-    def test_bridge_creates_approved_run_from_current_session_and_adapter_continues(self):
+    def test_bridge_preserves_approved_business_task_despite_conduct_feedback(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             intent_root = root / "session-intent"
             state_path = _write_current_session_ledger(intent_root)
+            _ready_bridge_fixture(intent_root)
             run_dir = root / ".autopilot"
             plan_path = ".tmp/implementation-plans/local-autopilot-semantic-e2e-test-plan.md"
 
@@ -210,10 +204,11 @@ class AutopilotSessionBridgeTest(unittest.TestCase):
                     "current",
                     "--plan-path",
                     plan_path,
-                    "--input-event-id", "event-1",
+                    "--input-event-id", "fixture-native-input",
                     "--approval-evidence-json",
                     '{"decision":"GO","source":"unit-test"}',
                 ],
+                env=_adapter_fixture_environment(root, intent_root),
                 capture_output=True,
                 text=True,
                 check=False,
@@ -222,26 +217,28 @@ class AutopilotSessionBridgeTest(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stderr)
             summary = json.loads(result.stdout)
             self.assertEqual(summary["state_path"], str(state_path.resolve()))
-            self.assertEqual(summary["event_count"], 2)
-            self.assertEqual(summary["latest_event"]["delta_keys"], ["conduct_feedback", "acceptance_criteria"])
+            self.assertEqual(summary["event_count"], 4)
+            self.assertEqual(summary["latest_event"]["event"], "response-route-recorded")
             self.assertEqual(summary["latest_input_event"]["event"], "user-input-observed")
             self.assertEqual(summary["latest_intent_update_event"]["event"], "intent-updated")
             self.assertTrue(aps_storage.exists(run_dir / "approved-run.json"))
-            self.assertTrue(aps_storage.exists(run_dir / "conduct-plan.json"))
+            self.assertFalse(aps_storage.exists(run_dir / "conduct-plan.json"))
+            self.assertEqual(summary["mode"], "session-intent-task")
 
             approved_run = read_authority(run_dir / "approved-run.json")
             session_intent = approved_run["approval_evidence"]["session_intent"]
             self.assertEqual(session_intent["state_path"], str(state_path.resolve()))
-            self.assertEqual(session_intent["latest_event"]["event"], "intent-updated")
-            self.assertEqual(session_intent["latest_input_event"]["event_id"], "event-1")
-            self.assertEqual(session_intent["latest_intent_update_event"]["event_id"], "event-2")
-            self.assertEqual(session_intent["latest_intent_update_event"]["correlation_id"], "corr-bridge-1")
-            self.assertEqual(session_intent["latest_intent_update_event"]["tool_stage"], "PostToolUse")
+            self.assertEqual(session_intent["latest_event"]["event"], "response-route-recorded")
+            self.assertEqual(session_intent["latest_input_event"]["event_id"], "fixture-native-input")
+            historical = next(row for row in session_intent["recent_events"] if row["event_id"] == "event-2")
+            self.assertEqual(historical["delta_keys"], ["conduct_feedback", "acceptance_criteria"])
+            self.assertEqual(historical["correlation_id"], "corr-bridge-1")
+            self.assertEqual(historical["tool_stage"], "PostToolUse")
             self.assertEqual(
-                session_intent["latest_intent_update_event"]["metadata"]["next_action"],
+                historical["metadata"]["next_action"],
                 "continue",
             )
-            self.assertEqual(len(session_intent["recent_events"]), 2)
+            self.assertEqual(len(session_intent["recent_events"]), 4)
 
             env = _adapter_fixture_environment(root, intent_root)
             env["GHOST_ALICE_AUTOPILOT_RUN_DIR"] = str(run_dir)
@@ -258,14 +255,15 @@ class AutopilotSessionBridgeTest(unittest.TestCase):
             self.assertEqual(adapter.returncode, 0, adapter.stderr)
             self.assertTrue(payload["continue"])
             self.assertIn("[autopilot]", payload["systemMessage"])
-            self.assertIn("work-item: conduct-active-control", payload["systemMessage"])
-            self.assertEqual([item["id"] for item in items], ["conduct-active-control"])
+            self.assertIn("work-item: session-intent-session-1", payload["systemMessage"])
+            self.assertEqual([item["id"] for item in items], ["session-intent-session-1"])
 
     def test_bridge_creates_ready_task_when_current_session_has_no_repeated_conduct_feedback(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             intent_root = root / "session-intent"
             state_path = _write_current_session_ledger(intent_root, repeated_conduct_feedback=False)
+            _ready_bridge_fixture(intent_root)
             run_dir = root / ".autopilot"
 
             result = subprocess.run(
@@ -282,10 +280,11 @@ class AutopilotSessionBridgeTest(unittest.TestCase):
                     "current",
                     "--plan-path",
                     ".tmp/implementation-plans/bridge.md",
-                    "--input-event-id", "event-1",
+                    "--input-event-id", "fixture-native-input",
                     "--approval-evidence-json",
                     '{"decision":"GO","source":"unit-test"}',
                 ],
+                env=_adapter_fixture_environment(root, intent_root),
                 capture_output=True,
                 text=True,
                 check=False,
@@ -333,6 +332,7 @@ class AutopilotSessionBridgeTest(unittest.TestCase):
                 }
             ]
             state_path.write_text(json.dumps(state), encoding="utf-8")
+            _ready_bridge_fixture(intent_root)
             run_dir = root / ".autopilot"
 
             result = subprocess.run(
@@ -349,10 +349,11 @@ class AutopilotSessionBridgeTest(unittest.TestCase):
                     "current",
                     "--plan-path",
                     ".tmp/implementation-plans/bridge.md",
-                    "--input-event-id", "event-1",
+                    "--input-event-id", "fixture-native-input",
                     "--approval-evidence-json",
                     '{"decision":"GO","source":"unit-test"}',
                 ],
+                env=_adapter_fixture_environment(root, intent_root),
                 capture_output=True,
                 text=True,
                 check=False,
@@ -402,6 +403,7 @@ class AutopilotSessionBridgeTest(unittest.TestCase):
                 session_id="claude-session-1",
                 repeated_conduct_feedback=False,
             )
+            _ready_bridge_fixture(intent_root, platform="claude", session_id="claude-session-1")
             run_dir = root / ".autopilot"
 
             result = subprocess.run(
@@ -418,10 +420,11 @@ class AutopilotSessionBridgeTest(unittest.TestCase):
                     "current",
                     "--plan-path",
                     ".tmp/implementation-plans/bridge.md",
-                    "--input-event-id", "event-1",
+                    "--input-event-id", "fixture-native-input",
                     "--approval-evidence-json",
                     '{"decision":"GO","source":"unit-test"}',
                 ],
+                env=dict(_adapter_fixture_environment(root, intent_root), GHOST_ALICE_PLATFORM="claude", GHOST_ALICE_SESSION_ID="claude-session-1"),
                 capture_output=True,
                 text=True,
                 check=False,
@@ -434,7 +437,7 @@ class AutopilotSessionBridgeTest(unittest.TestCase):
             approved_run = read_authority(run_dir / "approved-run.json")
             self.assertEqual(approved_run["approval_evidence"]["session_intent"]["platform"], "claude")
             self.assertEqual(
-                approved_run["approval_evidence"]["session_intent"]["latest_event"]["delta_keys"],
+                next(row for row in approved_run["approval_evidence"]["session_intent"]["recent_events"] if row["event_id"] == "event-2")["delta_keys"],
                 ["conduct_feedback", "acceptance_criteria"],
             )
             self.assertEqual(
