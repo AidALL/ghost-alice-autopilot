@@ -388,10 +388,11 @@ class AutopilotSessionBridgeTest(unittest.TestCase):
             payload["systemMessage"],
         )
         self.assertNotIn(str(run_dir.parent).replace("\\", "/"), payload["systemMessage"])
-        self.assertIn("decision-context:", payload["systemMessage"])
-        self.assertIn("run-in-place: Apply the approved cleanup", payload["systemMessage"])
-        self.assertIn("open-questions:", payload["systemMessage"])
-        self.assertIn("release-scope: Full release is blocked", payload["systemMessage"])
+        self.assertIn('task-record: tasks.jsonl; id=' + items[0]['id'], payload['systemMessage'])
+        self.assertIn('context-fields: decision_context, open_questions', payload['systemMessage'])
+        self.assertIn('Approved queue API', payload['systemMessage'])
+        self.assertNotIn('run-in-place: Apply the approved cleanup', payload['systemMessage'])
+        self.assertNotIn('release-scope: Full release is blocked', payload['systemMessage'])
 
     def test_bridge_accepts_claude_platform_current_session_pointer(self):
         with tempfile.TemporaryDirectory() as tmp:

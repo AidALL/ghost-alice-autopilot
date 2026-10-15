@@ -70,12 +70,6 @@ def compact_governance_candidate(candidate: Mapping[str, Any] | None) -> dict[st
     return {key: value for key, value in compact.items() if value not in (None, [], "")}
 
 
-def completion_recovery_guidance(host_input=None, source=None, *, claims_changed=None) -> str:
-    """Return Core delivery guidance for the host observation; preserve original business proof."""
-    from autopilot_runtime_context import core_recovery_delivery
-    return core_recovery_delivery(host_input, source, claims_changed=claims_changed)['guidance']
-
-
 
 def completion_command(contract, run_dir, *arguments, target_receipt=None, source=None):
     """Bind commands to immutable receipts, never a caller-asserted origin flag."""
@@ -134,8 +128,6 @@ def build_continuation_message(
     governance_candidate: Mapping[str, Any] | None = None,
     base_path: str | None = None,
     home_path: str | None = None,
-    host_input: Mapping[str, Any] | None = None,
-    source: Mapping[str, str] | None = None,
 ) -> str:
     if run.get("completion_origin_gap"):
         return "[autopilot]\nprospective-origin: stale\nGhost-ALICE Autopilot recording code rejected completion recording because the original provenance does not match the current input or contract. The current-session assistant retains the supported business answer and original proof/source/time. The current-session assistant following verification-before-completion may verify changed criteria or scope after a new pretool capture; a provenance mismatch alone does not justify replaying business work or relabelling earlier proof."
@@ -155,7 +147,6 @@ def build_continuation_message(
                 "approval-generation-origin: autopilot-runtime",
                 "Ghost-ALICE Autopilot has no accepted publication under this receipt. The current-session assistant follows installed verification-before-completion/references/autopilot-publication.md, section Explicit v1 callers, for a required publication using original proof and time.",
                 completion_command(receipt["contract"], receipt["run_dir"], "publish", "--receipt-token", publication["receipt_token"], "--verified-at", "ORIGINAL_ISO_TIME", "--completion-file", "-"),
-                "recovery-and-final-answer:", completion_recovery_guidance(host_input, source),
             ])
     lines = [
         "[autopilot]",
@@ -170,8 +161,7 @@ def build_continuation_message(
         lines.append("approval-generation-source: previous-tool")
         lines.append("approval-generation-origin: autopilot-runtime")
     if io_trace_rows:
-        lines.append("io-trace:")
-        lines.extend(format_io_trace_rows(io_trace_rows, base_path=base_path, home_path=home_path))
+        lines.append(f"io-trace-count: {len(io_trace_rows)}")
     compact_candidate = compact_governance_candidate(governance_candidate)
     if compact_candidate:
         lines.append("governance-signal:")
@@ -188,30 +178,17 @@ def build_continuation_message(
     source_locator = item.get("source_locator")
     if isinstance(source_locator, str) and source_locator.strip():
         lines.append(f"source-locator: {_portable_path(source_locator.strip(), base_path, home_path)}")
-    decision_context = item.get("decision_context")
-    if isinstance(decision_context, list) and any(isinstance(value, str) and value for value in decision_context):
-        lines.append("decision-context:")
-        lines.extend(f"- {value}" for value in decision_context if isinstance(value, str) and value)
-    open_questions = item.get("open_questions")
-    if isinstance(open_questions, list) and any(isinstance(value, str) and value for value in open_questions):
-        lines.append("open-questions:")
-        lines.extend(f"- {value}" for value in open_questions if isinstance(value, str) and value)
+    context_fields = [key for key in ('decision_context', 'open_questions',
+        'contextual_protections', 'constraints', 'non_goals') if item.get(key)]
+    if context_fields:
+        lines.append(f"task-record: tasks.jsonl; id={item['id']}")
+        lines.append('context-fields: ' + ', '.join(context_fields))
+        lines.append('The current-session assistant uses the Approved queue API to read these fields '
+            'from this run and task before dependent work; the reference does not remove their constraints.')
     lines.append("allowed-surface:")
     lines.extend(f"- {_portable_path(str(surface), base_path, home_path)}" for surface in item["allowed_surface"])
     lines.append("acceptance-criteria:")
     lines.extend(f"- {criterion}" for criterion in item["acceptance_criteria"])
-    for key, label in (("contextual_protections", "contextual-protections"),
-                       ("constraints", "accumulated-constraints"), ("non_goals", "accumulated-non-goals")):
-        values = item.get(key)
-        if isinstance(values, list) and values:
-            lines.append(f"{label}:")
-            lines.extend(f"- {value}" for value in values if isinstance(value, str) and value)
-    if any(item.get(key) for key in ("contextual_protections", "constraints", "non_goals")):
-        lines.extend([
-            "context-use:",
-            "- The current-session assistant uses contextual protections as boundary checks and auxiliary evidence; only Core-admitted criterion IDs can receive applied proof.",
-            "- The current-session assistant applies the current goal and newer explicit decisions to accumulated context; superseded scope remains inactive and protections remain binding unless the user authorized an exception.",
-        ])
     reopen_target = item.get("completion", {}).get("reopen_target")
     if isinstance(reopen_target, str) and reopen_target:
         lines.append(f"reopen-target: {reopen_target}")
@@ -233,7 +210,7 @@ def build_continuation_message(
         "- For a resolved queue action, follow the Approved queue API section of installed Ghost-ALICE Autopilot SKILL.md. That procedure owns promotion and the consistency-decision.json in the selected run directory, including original approval_generation and evidence bindings.",
         "- Core verification-before-completion owns claim review; task-router selects judgment focus and verification depth; boundary-contract and systematic-debugging own authority and incident limits.",
     ])
-    lines.extend(["recovery-and-final-answer:", completion_recovery_guidance(host_input, source), "prompt:", item["prompt"]])
+    lines.extend(["prompt:", item["prompt"]])
     return "\n".join(lines)
 
 

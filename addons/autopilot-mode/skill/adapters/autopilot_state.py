@@ -22,7 +22,6 @@ from autopilot_messages import (
     build_meta_intervention_message,
 )
 from autopilot_intent_recovery import (
-    semantic_delta_starvation_event,
     project_queue_session_material as project_session_material,
     admission_preflight,
 )
@@ -209,6 +208,9 @@ def _read_io_trace_rows(
     session_id: str | None = None,
     limit: int = 8,
 ) -> list[dict[str, Any]]:
+    platform = source.get("GHOST_ALICE_PLATFORM")
+    if platform not in {"codex", "claude"} or not isinstance(session_id, str) or not session_id.strip():
+        return []
     path = _io_trace_path(source)
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
@@ -222,11 +224,18 @@ def _read_io_trace_rows(
             continue
         if not isinstance(row, dict):
             continue
-        if session_id and row.get("session") != session_id:
+        # Audit diagnostics are not tool activity. Older rows without an exact
+        # platform remain on disk, but cannot authenticate a continuation.
+        if row.get("session") != session_id or row.get("platform") != platform:
+            continue
+        tool = row.get("tool")
+        if not isinstance(tool, str) or not tool.strip() or tool.strip().lower() in {"unknown", "n/a"}:
+            continue
+        if row.get("event") not in (None, "PostToolUse", "AfterTool"):
             continue
         compact = {
             key: row[key]
-            for key in ("ts", "session", "tool", "path", "pattern", "op")
+            for key in ("ts", "platform", "session", "tool", "path", "pattern", "op")
             if isinstance(row.get(key), str)
         }
         if compact:
@@ -809,9 +818,6 @@ def _advance_approved_run_locked(
 
     items = read_work_items(tasks_path) if storage.exists(tasks_path) else []
     current_intent = _current_intent_for_source(source, project_cwd, run_platform, hook_input=hook_input)
-    starvation_event = semantic_delta_starvation_event(current_intent)
-    if starvation_event is not None:
-        _append_event(root, starvation_event)
     binding_event = session_binding_mismatch_event(run, items, current_intent, source)
     if binding_event is not None:
         _append_event(root, binding_event)
@@ -865,7 +871,6 @@ def _advance_approved_run_locked(
                                 io_trace_rows=io_trace_rows,
                                 base_path=signal_base,
                                 home_path=signal_home,
-                                host_input=hook_input, source=source,
                             ),
                         }
                     evidence = (
@@ -912,7 +917,6 @@ def _advance_approved_run_locked(
                         io_trace_rows=io_trace_rows,
                         base_path=signal_base,
                         home_path=signal_home,
-                        host_input=hook_input, source=source,
                     ),
                 }
         _append_event(
@@ -957,7 +961,6 @@ def _advance_approved_run_locked(
             io_trace_rows=io_trace_rows,
             base_path=signal_base,
             home_path=signal_home,
-            host_input=hook_input, source=source,
         ),
     }
 

@@ -21,6 +21,11 @@ import test_completion_continuation as continuation_tests
 
 class ClaimReportRoutingTest(v2._CompletionV2Fixture):
     native_stop = v2.ResponsePurposeV2Test.native_stop
+    feedback = continuation_tests.CompletionContinuationTest.feedback
+
+    def assert_core_stop(self, payload, **expectation):
+        from test_completion_skill_evidence import assert_stop_observation
+        return assert_stop_observation(self, payload, **expectation)
 
     def setUp(self):
         super().setUp()
@@ -146,7 +151,12 @@ class ClaimReportRoutingTest(v2._CompletionV2Fixture):
         original_publications = publications()
         result = self.native_stop(self.report())
         self.assertEqual(result.get('continuation', {}).get('task_id'), 'independent', result)
-        self.assertEqual(result['continuation']['status'], 'dispatched')
+        self.assertEqual(result['continuation']['status'], 'pending')
+        self.assertTrue(result['continuation']['request_emitted'])
+        with self.helper.storage.transaction(self.run_dir, self.source, migrate_legacy=False) as store:
+            request = store.continuation_plan()['delivery_requests']['independent']
+        self.assertEqual(request['host_receipt'], 'unknown')
+        self.assertEqual(request['execution'], 'unknown')
         self.assertEqual(self.read_state()['acceptance_criteria'], before)
         self.assertEqual(publications(), original_publications)
 
@@ -282,7 +292,7 @@ class ClaimReportRoutingTest(v2._CompletionV2Fixture):
         before = self.snapshot()
         core = self.core_stop(report)
         ap = self.native_stop(report)
-        self.assertNotEqual(core.get('decision'), 'block', core)
+        self.assert_core_stop(core)
         self.assertTrue(ap['completion_recording']['units'][0]['application_reused'])
         self.assertEqual(self.snapshot(), before)
 
@@ -291,8 +301,7 @@ class ClaimReportRoutingTest(v2._CompletionV2Fixture):
         before = self.snapshot()
         core = self.core_stop(report)
         ap = self.native_stop(report)
-        self.assertEqual(core.get('decision'), 'block', core)
-        self.assertIn('claim-evidence', core.get('reason', ''))
+        self.assert_core_stop(core, issue='claim-evidence', repair_target='completion_metadata')
         self.assertEqual(ap['completion_recording']['reason'], 'claim-evidence-invalid')
         self.assertEqual(self.snapshot(), before)
 
@@ -303,8 +312,7 @@ class ClaimReportRoutingTest(v2._CompletionV2Fixture):
         before = self.snapshot()
         core = self.core_stop(report)
         ap = self.native_stop(report)
-        self.assertEqual(core.get('decision'), 'block', core)
-        self.assertIn('native-activity-unavailable', core.get('reason', ''))
+        self.assert_core_stop(core, issue='native-activity-unavailable', repair_target='response_route')
         self.assertEqual(ap['completion_recording']['reason'], 'completion-body-invalid')
         self.assertEqual(ap['completion_recording']['completion_route']['route_binding'], 'stale')
         self.assertEqual(self.snapshot(), before)
@@ -317,7 +325,7 @@ class ClaimReportRoutingTest(v2._CompletionV2Fixture):
         core = self.core_stop(text)
         self.assertTrue(ap['completion_recording']['units'][0]['application_reused'])
         self.assertTrue(self.projection(text)['completion_route']['report_only'])
-        self.assertNotEqual(core.get('decision'), 'block', core)
+        self.assert_core_stop(core)
         self.assertEqual(self.snapshot(), before)
 
     def test_plain_original_claim_with_current_review_needs_no_new_publication(self):
@@ -330,7 +338,7 @@ class ClaimReportRoutingTest(v2._CompletionV2Fixture):
         ap = self.native_stop(text)
         core = self.core_stop(text)
         self.assertTrue(ap['completion_recording']['units'][0]['application_reused'])
-        self.assertNotEqual(core.get('decision'), 'block', core)
+        self.assert_core_stop(core)
         self.assertEqual(self.snapshot(), before)
 
     def test_plain_widened_claim_is_not_automatically_reused(self):
@@ -342,7 +350,7 @@ class ClaimReportRoutingTest(v2._CompletionV2Fixture):
         core = self.core_stop(text)
         self.assertEqual(ap['completion_recording']['reason'], 'completion-body-invalid')
         self.assertEqual(ap['completion_recording']['completion_route']['route_binding'], 'stale')
-        self.assertEqual(core.get('decision'), 'block', core)
+        self.assert_core_stop(core, issue='native-activity-unavailable', repair_target='response_route')
         self.assertEqual(self.snapshot(), before)
 
 

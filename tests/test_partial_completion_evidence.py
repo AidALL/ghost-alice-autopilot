@@ -7,6 +7,7 @@ from unittest import mock
 
 from test_completion_contract_v2 import _CompletionV2Fixture
 import test_completion_publication as fixture
+import test_completion_continuation as continuation_tests
 import autopilot_completion_contract as contract
 from autopilot_work_items import _parse_completion_evidence, _validate_continue_next_evidence
 
@@ -174,6 +175,8 @@ class PartialEvidenceV2Test(_CompletionV2Fixture):
 
 
 class ZeroCoverageResponseTest(_CompletionV2Fixture):
+    feedback = continuation_tests.CompletionContinuationTest.feedback
+
     def test_zero_coverage_report_applies_existing_publication_without_a_plan(self):
         from test_completion_continuation import CompletionContinuationTest
         CompletionContinuationTest.partial(self)  # report proof accepted, not yet applied
@@ -195,9 +198,11 @@ class ZeroCoverageResponseTest(_CompletionV2Fixture):
         from test_completion_continuation import CompletionContinuationTest
         from native_completion import assess_native_completion
         self.prepare()
-        # Preserve a real prior prepared diagnostic: a final report must not
-        # inherit its request to publish when Core finds no passing criteria.
-        self.assertIn('completion-recording: prepared', self.stop()['systemMessage'])
+        # Preparation creates no native output request. A final report with no
+        # passing criteria cannot infer a new publication or task from it.
+        prepared = self.stop()
+        self.assertEqual(prepared['systemMessage'], '')
+        self.assertEqual(prepared['completion_recording'], dict(status='v2-unit-state', units=[]))
         self.proof()
         self.completion = self.completion.replace('[completion-check]', '[partial-check]\n- scope: partial')
         self.completion = self.completion.replace('- unverified: none',
@@ -220,7 +225,8 @@ class ZeroCoverageResponseTest(_CompletionV2Fixture):
         self.assertEqual(output['continuation']['task_id'], 'independent')
         self.assertNotIn('Publish existing supported proof', output['systemMessage'])
         output = fixture.adapter.adapter_payload_from_env(self.source, hook_input=host)
-        self.assertEqual(output['continuation']['status'], 'parked')
+        self.assertEqual(output['continuation']['status'], 'pending')
+        self.assertFalse(output['continuation']['request_emitted'])
         self.assertEqual(output['systemMessage'], '')
         self.assertEqual({c['status'] for c in self.read_state()['acceptance_criteria']}, {'unmet'})
 

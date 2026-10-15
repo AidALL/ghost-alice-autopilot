@@ -224,25 +224,31 @@ class IntentProjectionTest(unittest.TestCase):
         self.assertIn("source: user-explicit", task["acceptance_criteria"][0])
         self.assertIn("admitted: true", task["acceptance_criteria"][0])
 
-    def test_unadmitted_protection_is_visible_with_provenance(self):
+    def test_unadmitted_protection_is_retrievable_with_provenance(self):
         task = self.task(self.state())
         rendered = messages.build_continuation_message({"run_id": "r"}, task)
-        self.assertIn("contextual-protections:", rendered)
-        protection = next(line for line in rendered.splitlines() if "personal:" in line)
+        self.assertIn('contextual_protections', rendered)
+        self.assertIn('task-record: tasks.jsonl; id=' + task['id'], rendered)
+        self.assertIn('Approved queue API', rendered)
+        protection = next(line for line in task['contextual_protections'] if 'personal:' in line)
         self.assertIn("source: inferred", protection)
         self.assertIn("admitted: false", protection)
-        self.assertIn("auxiliary evidence", rendered)
+        self.assertNotIn(protection, rendered)
 
     def test_context_retains_constraints_without_reviving_superseded_scope(self):
         state = self.state()
         original = copy.deepcopy(state)
-        rendered = messages.build_continuation_message({"run_id": "r"}, self.task(state))
-        self.assertIn("Preserve all existing personal edits", rendered)
-        self.assertIn("Do not change the shared report", rendered)
-        self.assertIn("Explicit current exception permits publishing", rendered)
+        task = self.task(state)
+        rendered = messages.build_continuation_message({"run_id": "r"}, task)
+        self.assertEqual(task['constraints'], ['Preserve all existing personal edits'])
+        self.assertEqual(task['non_goals'], ['Do not change the shared report'])
+        self.assertTrue(any('Explicit current exception permits publishing' in value
+                            for value in task['decision_context']))
+        self.assertFalse(any('Edit personal only' in value for value in task['decision_context']))
+        self.assertIn('context-fields: decision_context, contextual_protections, constraints, non_goals', rendered)
+        self.assertIn('Approved queue API', rendered)
+        self.assertNotIn('Preserve all existing personal edits', rendered)
         self.assertNotIn("Edit personal only", rendered)
-        self.assertIn("newer explicit decisions", rendered)
-        self.assertIn("superseded scope remains inactive", rendered)
         self.assertEqual(state, original)
 
     def test_no_admitted_criteria_does_not_invent_completion_obligation(self):
@@ -259,29 +265,13 @@ class IntentProjectionTest(unittest.TestCase):
 
 
 class ContinuationRecoveryTest(unittest.TestCase):
-    def test_ap_record_repair_does_not_request_a_second_answer_or_control_block(self):
-        text = messages.completion_recovery_guidance(
-            {'last_assistant_message': 'Saved the report.\n' + VALID,
-             'host_context': {'delivery_surface': 'visible_transcript'}},
-            {'GHOST_ALICE_CORE_ROOT': os.environ['GHOST_ALICE_CORE_ROOT'], 'GHOST_ALICE_PLATFORM': 'codex'})
-        self.assertIn('delivery-route: preserve_answer_and_patch_metadata', text)
-        self.assertIn('without repeating that answer', text)
-        self.assertIn('no new completion controls', text)
-        self.assertNotIn('Reply with only the missing or corrected control blocks', text)
-        self.assertNotIn('deliver a corrected complete answer', text)
-
-    def assert_recovery_proof_handoff(self, text):
-        # Contract placement only: these assertions do not measure model compliance.
-        self.assertIn("repair-target: runtime_records", text)
-        self.assertIn("delivery-route:", text)
-        self.assertIn("no new completion controls", text)
-        self.assertNotIn("claim-evidence-map", text)
-        self.assertNotIn("Keep internal recovery subordinate", text)
-
-    def test_continuation_places_conditional_proof_handoff_in_recovery_section(self):
-        text = messages.build_continuation_message({"run_id": "r"}, item())
-        recovery = text.split("recovery-and-final-answer:\n", 1)[1].split("\nprompt:", 1)[0]
-        self.assert_recovery_proof_handoff(recovery)
+    def test_continuation_retains_task_without_delivery_provider(self):
+        from unittest.mock import patch
+        with patch.dict(os.environ, {'GHOST_ALICE_CORE_ROOT': '/missing-core-delivery-provider'}):
+            text = messages.build_continuation_message({"run_id": "r"}, item())
+        self.assertTrue(text.endswith("prompt:\n" + item()["prompt"]))
+        self.assertNotIn("recovery-and-final-answer:", text)
+        self.assertNotIn("delivery-route:", text)
 
     def test_observation_candidate_is_not_suggested_for_promotion(self):
         candidate = {"schema_version": "autopilot-consistency-decision-candidate.v1", "promotion_state": "candidate", "action_file_allowed": False, "candidate_id": "seen", "source": "observation_signal", "work_item_id": "report", "decision": "reopen_micro", "evidence": ["readback observed"]}
@@ -295,9 +285,9 @@ class ContinuationRecoveryTest(unittest.TestCase):
 
     def test_continuation_preserves_substantive_result_and_runtime_provenance(self):
         text = messages.build_continuation_message({"run_id": "r"}, item())
-        self.assertIn("repair-target: runtime_records", text)
-        self.assertIn("no new completion controls", text)
         self.assertIn("Core verification-before-completion owns claim review", text)
+        self.assertIn("allowed-surface:\n- personal/report.md", text)
+        self.assertIn("acceptance-criteria:\n- report", text)
 
     def test_real_adapter_error_preserves_original_goal_and_answer(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -384,14 +374,17 @@ if __name__ == "__main__":
 
 
 class NativeRecordingDeliveryRepairTest(unittest.TestCase):
-    def test_actual_prepared_publication_branch_uses_core_host_delivery(self):
+    def test_prepared_publication_retains_receipt_without_delivery_provider(self):
+        from unittest.mock import patch
         receipt=dict(contract=dict(intent_root='/intent',platform='codex',session_id='s'),run_dir='/target',work_item_id='item',prepared_at='old',criterion_ids=['report'])
         run=dict(run_id='run',completion_publication=dict(status='prepared',receipt=receipt,receipt_token='token'))
-        task=dict(id='item')
-        for surface, changed, phrase in [('visible_transcript',False,'without repeating that answer'),('final_only',False,'one final response'),('unknown',False,'determines answer visibility from supplied conversation'),('visible_transcript',True,'complete answer with the changed claim')]:
-            with self.subTest(surface=surface,changed=changed):
-                text=messages.build_continuation_message(run,task,host_input=dict(host_context=dict(delivery_surface=surface),prior_answer_ref='host-ref',claims_changed=changed))
-                self.assertIn(phrase,text)
+        with patch.dict(os.environ, {'GHOST_ALICE_CORE_ROOT': '/missing-core-delivery-provider'}):
+            text=messages.build_continuation_message(run,dict(id='item'))
+        self.assertIn('receipt-token: token',text)
+        self.assertIn('--receipt-token token',text)
+        self.assertIn('original proof and time',text)
+        self.assertNotIn('recovery-and-final-answer:',text)
+        self.assertNotIn('delivery-route:',text)
 
     def test_parked_stop_diagnostic_is_not_promoted_to_block(self):
         import autopilot_mode

@@ -336,33 +336,3 @@ session's state or silently choosing between two previously bound targets.
             "owned-session-runtime" if selected == runtime_target else "existing-project-session",
         derived_run_dir=not (bound_reference and bound_reference['selection_origin'] == 'explicit'),
         bootstrap=True, source=current, project_pause_root=legacy_base)
-
-
-def core_recovery_delivery(hook_input=None, source=None, *, claims_changed=None):
-    """Pass supplied hook feedback and host metadata to Core's delivery observer.
-
-    Environment identity selects the host context; it does not prove that the
-    host displayed a response to the user.
-    """
-    import importlib.util
-    current = dict(os.environ if source is None else source)
-    explicit_root=current.get('GHOST_ALICE_CORE_ROOT') or os.environ.get('GHOST_ALICE_CORE_ROOT')
-    provider_path=Path(explicit_root)/'_shared/response_delivery.py' if explicit_root and Path(explicit_root).is_absolute() else None
-    if explicit_root and (provider_path is None or not provider_path.is_file()):
-        raise ValueError("Explicit Core recovery delivery provider unavailable")
-    if provider_path is None or not provider_path.is_file():
-        locator = Path(current.get('GHOST_ALICE_SESSION_INTENT_ROOT') or '/unbound') / 'intent-state.json'
-        core = _load_core_ledger_module(locator, current)
-        if core is None:
-            raise ValueError('Core recovery delivery provider unavailable')
-        provider_path = Path(core.__file__).resolve().parents[2] / '_shared/response_delivery.py'
-    spec = importlib.util.spec_from_file_location('ap_core_response_delivery', provider_path)
-    provider = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(provider)
-    observed = dict(hook_input or {})
-    if claims_changed is not None:
-        observed['claims_changed'] = claims_changed
-    text = next((observed[k] for k in ('last_assistant_message', 'lastAssistantMessage', 'prompt_response', 'promptResponse')
-                 if isinstance(observed.get(k), str) and observed[k].strip()), '')
-    return provider.observe_recovery_delivery(observed, platform=current.get('GHOST_ALICE_PLATFORM'),
-        entrypoint=current.get('CLAUDE_CODE_ENTRYPOINT', ''), final_text=text, repair_target='runtime_records')

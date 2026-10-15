@@ -3,7 +3,7 @@ from pathlib import Path
 
 
 def register_route(core, root, platform="codex", session="session-1", *, selected=None,
-                   kind="execution", mode="normal", purpose=None):
+                   kind="execution", mode="normal", purpose=None, continuation_feedback=None):
     state = core.read_session_state(root=root, platform=platform, session_id=session)
     owned = [c for c in state["acceptance_criteria"] if "work_unit_id" in c]
     latest = {}
@@ -24,6 +24,7 @@ def register_route(core, root, platform="codex", session="session-1", *, selecte
     return core.record_response_route(root=root, platform=platform, session_id=session,
         expected_input_event_id=state["latest_input_event_id"], boundary_ref="test-boundary" if mode == "normal" else None,
         candidate=dict(**({"response_purpose":purpose} if purpose is not None else {}),
+                       **({"continuation_feedback":continuation_feedback} if continuation_feedback is not None else {}),
                        schema_version="response-route.v1", routing_surface=surface, work_units=units,
                        selected_work_unit_ids=ids, selected_criteria=criteria))
 

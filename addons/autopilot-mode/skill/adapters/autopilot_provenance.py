@@ -317,14 +317,14 @@ def reapproval_payload(run_dir, run, source):
     origin = _head(store.connection, _key(snapshot))
     if not snapshot["criterion_ids"] or origin is None or origin["contract"] != snapshot:
         return None
-    from autopilot_messages import completion_command, completion_recovery_guidance
+    from autopilot_messages import completion_command
     command = completion_command(snapshot, str(Path(run_dir).resolve()), "prepare", "--reapprove-current-input",
         "--intent-root", snapshot["intent_root"], "--platform", snapshot["platform"],
         "--session-id", snapshot["session_id"], "--input-event-id", snapshot["input_event_id"])
     return {"continue": True, "systemMessage": "\n".join([
         "[autopilot]", "completion-admission: required", f"prospective-captured-at: {origin['captured_at']}",
         "The Core admission record contains execution criteria for the current input with original prospective provenance; Ghost-ALICE Autopilot adapter code parked the previous run. The current-session assistant uses the displayed admission command for the admitted work, then publishes unchanged original proof with the returned receipt. The command archives the previous generation under existing authority. The current-session assistant neither requests duplicate approval nor repeats business checks for admission; Ghost-ALICE Autopilot publication code still rejects proof older than the original capture.",
-        command, completion_recovery_guidance()])}
+        command])}
 
 
 def default_intent_root(source, project_cwd):

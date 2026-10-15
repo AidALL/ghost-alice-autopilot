@@ -404,14 +404,15 @@ def _v2_run_is_paused(source):
 
 
 def _v2_claim_scope(hook_input):
-    """Supply actual final text to Core; absent legacy bodies keep capture policy."""
-    observed=hook_input or {}
-    text=next((observed[k] for k in ('last_assistant_message','lastAssistantMessage','prompt_response','promptResponse')
-        if isinstance(observed.get(k),str) and observed[k].strip()),'')
-    return dict(text=text,phase='final' if text else 'before_tool',native_input=observed)
+    """Core owns native phase and response selection for both Stop consumers."""
+    from autopilot_work_items import _load_core_policy_module
+    native = _load_core_policy_module('native_transcript.py', 'autopilot_core_native_transcript')
+    if native is None or not hasattr(native, 'completion_scope'):
+        raise CompletionRecordingError('provider-capability-missing', 'Core native response selection is unavailable')
+    return native.completion_scope(hook_input)
 
 
-def _v2_material(source, *, expected_input=None, transaction=None, claim_scope=None):
+def _v2_material(source, *, expected_input=None, transaction=None, claim_scope=None, require_input=True):
     """Current Core selection is authority; protocol dispatch supplies none."""
     current = _source(source)
     intent_root = Path(current['GHOST_ALICE_SESSION_INTENT_ROOT']).expanduser()
@@ -425,7 +426,7 @@ def _v2_material(source, *, expected_input=None, transaction=None, claim_scope=N
     target = dict(target, logical_run_dir=str(logical_root))
     material = adapter.read_session_material(Path(current['GHOST_ALICE_SESSION_INTENT_ROOT']),
         current['GHOST_ALICE_PLATFORM'], current['GHOST_ALICE_SESSION_ID'], source=current,
-        require_input=True, expected_input_event_id=expected_input, recover_audit=False)
+        require_input=require_input, expected_input_event_id=expected_input, recover_audit=False)
     if transaction is not None:
         from autopilot_work_items import _load_core_ledger_module
         core = _load_core_ledger_module(material['state_path'], current)
@@ -634,7 +635,7 @@ def _prepare_completion_v2(*, intent_root, platform, session_id, input_event_id,
 
 @_with_core_policy_source
 def v2_preflight_result(result, source):
-    """One notice per current owned receipt, while tools stay usable."""
+    """Keep current receipts; expose guidance when the selected work changes."""
     if _v2_run_is_paused(source):
         return dict(status='skipped', reason='autopilot-off')
     current,root,target,_,_ = _v2_material(source)
@@ -644,7 +645,9 @@ def v2_preflight_result(result, source):
         if store is None:
             return dict(status='recording-unavailable',reason='derived-target-unwritable')
         for row in rows:
-            marker = dict(receipt_token=row['receipt_token'],kind='preflight')
+            marker = dict(kind='preflight-work', work_unit_id=row['work_unit_id'],
+                contract_revision=row['contract_revision'], criterion_ids=sorted(row['criterion_ids']),
+                target_reference=row['target_reference'])
             try:
                 store.completion_read('notice',_digest(marker))
             except FileNotFoundError:
@@ -654,7 +657,7 @@ def v2_preflight_result(result, source):
                     'publication: native Stop consumes the Core-reviewed response']))
     if notices:
         guidance = ['[autopilot]', 'completion-preflight: prepared',
-            'Ghost-ALICE Autopilot has prepared provenance for the displayed work units. Before submitting a supported answer, follow verification-before-completion/references/autopilot-publication.md in the current runtime skill directory, section Prepare and record the response review, with the complete draft and original source/time. Native Stop handles publication of authenticated supported proof; retain the original results and do not repeat preparation.']
+            'For completion or partial-completion claims, follow verification-before-completion/references/autopilot-publication.md, section Prepare and record the response review. Native Stop handles publication of authenticated supported proof. Preparation and original results remain available; do not repeat them for routine explanations.']
         return dict(result, additional_context='\n'.join(guidance + notices))
     return result
 
@@ -1030,7 +1033,8 @@ def _core_dependency_assessment(record, evidence_reference, criterion_id):
     return _core_evidence_policy().assess_criterion_dependencies(record, evidence_reference, criterion_id)
 
 
-def _retained_met_evidence(store, state, current, root, target, material, *, expected_unit, invalidate):
+def _retained_met_evidence(store, state, current, root, target, material, *, expected_unit, invalidate,
+                           criterion_keys=None):
     """Check actual met-proof backing, never reuse historical input authority."""
     import autopilot_completion_contract as contract
     from autopilot_work_items import _load_core_ledger_module
@@ -1096,7 +1100,8 @@ def _retained_met_evidence(store, state, current, root, target, material, *, exp
     outcomes=[]
     for row in sorted(material['intent_state']['acceptance_criteria'],key=contract.criterion_key):
         row_key=contract.criterion_key(row)
-        if row_key not in definitions or row.get('status')!='met':
+        if (row_key not in definitions or row.get('status')!='met'
+                or (criterion_keys is not None and row_key not in criterion_keys)):
             continue
         proof=row.get('met_completion_check_digest','').removeprefix('sha256:')
         matches={ref:r for ref,r in backing.get(row_key,{}).items() if r['proof_digest'].removeprefix('sha256:')==proof}
@@ -1259,8 +1264,7 @@ def _bounded_v2_recovery(current, root, target, material, results, hook_input=No
          or _v2_unresolved_invalidations(material,r['work_unit_id']))]
     if not pending:
         return dict(_noop_payload(),completion_recording=dict(status='v2-unit-state',units=results))
-    fingerprints=[]; lines=[]; any_new=False; changed=False; retained_answer_ref=None
-    observed_delivery=runtime.core_recovery_delivery(hook_input,current)
+    fingerprints=[]; lines=[]; any_new=False; changed=False
     def preflight(connection):
         _,_,_,locked,selected = _v2_material(current,transaction=connection,claim_scope=_v2_claim_scope(hook_input))
         acceptable={'no-current-unmet-criteria'} | ({'response-no-publication'} if apply_existing_only else set())
@@ -1273,7 +1277,6 @@ def _bounded_v2_recovery(current, root, target, material, results, hook_input=No
         for row in pending:
             unit=row['work_unit_id']; state=store.completion_unit(unit)
             head=store.completion_recovery_head(unit) or {}
-            retained_answer_ref=observed_delivery.get('prior_answer_ref') or head.get('prior_answer_ref') or retained_answer_ref
             marker,state,unit_changed=_v2_recovery_observation(store,current,reference,material,unit,row,by_unit[unit],root=root,target=target,
                 claim_scope=_v2_claim_scope(hook_input))
             changed=changed or unit_changed
@@ -1283,25 +1286,17 @@ def _bounded_v2_recovery(current, root, target, material, results, hook_input=No
                 store.completion_put('recovery-diagnostic',marker)
                 any_new=True
             partial_reference=store.completion_put('recovery-partial',row)
-            store.completion_set_recovery_head(unit,dict(fingerprint=fingerprint,prior_answer_ref=retained_answer_ref,partial_reference=partial_reference,
+            store.completion_set_recovery_head(unit,dict(head,fingerprint=fingerprint,partial_reference=partial_reference,
                 partial_retry_pending=(row.get('reason')=='dependency-mutated' and unit_changed and head.get('fingerprint')!=fingerprint)))
             lines.extend(['work-unit: '+unit,'completion-recording: '+row.get('reason',row['status'])])
             if row.get('detail'): lines.append('recording-detail: '+row['detail'])
     changed=changed or any(r.get('reason') in {'dependency-mutated','dependency-mismatch'} for r in pending)
-    observed=dict(hook_input or {})
-    if not observed.get('prior_answer_ref') and retained_answer_ref:
-        observed['prior_answer_ref']=retained_answer_ref
-    delivery=runtime.core_recovery_delivery(observed,current,claims_changed=True if changed else None)
     status='diagnostic' if any_new else 'parked'
     lines.append('recovery-status: '+status)
-    if changed and any_new:
-        lines.append(delivery['guidance'])
-    else:
-        lines.append('Ghost-ALICE Autopilot retains the recording error and original proof; dependent application waits for a relevant state change. No answer resubmission is requested.')
-    return dict({'continue':True},systemMessage='\n'.join(['[autopilot]',*lines]),
+    lines.append('Ghost-ALICE Autopilot retains the recording error and original proof; dependent application waits for a relevant state change.')
+    return dict({'continue':True},systemMessage='\n'.join(['[autopilot]',*lines]) if any_new else '',
         completion_recording=dict(status='v2-unit-state',units=results),
-        recovery=dict(status=status,fingerprints=fingerprints,delivery_route=delivery['delivery_route'],
-            claims_changed=changed))
+        recovery=dict(status=status,fingerprints=fingerprints,claims_changed=changed))
 
 
 @_with_core_policy_source
@@ -1416,7 +1411,9 @@ def apply_completion_v2(source, *, hook_input=None, apply_existing_only=False):
     if _v2_run_is_paused(source):
         return _noop_payload()
     claim_scope=_v2_claim_scope(hook_input)
-    current,root,target,material,selection=_v2_material(source,claim_scope=claim_scope)
+    # Native observation can precede human admission. Core classifies that
+    # snapshot before any publication/application storage is acquired.
+    current,root,target,material,selection=_v2_material(source,claim_scope=claim_scope,require_input=False)
     # Reporting without new completion coverage still permits applying an
     # existing authenticated publication. That obligation is independent of
     # whether the user approved any subsequent task plan.
@@ -1477,6 +1474,15 @@ def apply_completion_v2(source, *, hook_input=None, apply_existing_only=False):
                 retained.require_backing()
                 publication=store.completion_read('publication',state['publication_reference'])
                 if apply_existing_only and state.get('status')=='applied':
+                    # Reusing a committed application does not make its own
+                    # unavailable criterion dependencies readable. An older
+                    # independent criterion still reports its separate error
+                    # through the whole-unit outcome without masking this one.
+                    publication_keys={(row['work_unit_id'],row['contract_revision'],row['criterion_id'])
+                        for row in publication['request']['selected_criteria']}
+                    for outcome in retained.outcomes:
+                        if outcome.key in publication_keys and isinstance(outcome.error,OSError):
+                            raise outcome.error
                     # Historical application is already a committed result, not
                     # a pending request to bind to today's explanatory input.
                     # Retained proof above still checks owner, meaning, source
@@ -1548,7 +1554,7 @@ def apply_completion_v2(source, *, hook_input=None, apply_existing_only=False):
                 try:
                     with storage.transaction(root,current,authority=_v2_authority(current),migrate_legacy=False) as recovery:
                         _,_,_,live,selection=_v2_material(current,transaction=recovery.connection,claim_scope=claim_scope)
-                        if selection['status']!='selected' and selection.get('reason')!='no-current-unmet-criteria':
+                        if selection['status']!='selected' and selection.get('reason') not in acceptable:
                             raise CompletionRecordingError(selection['reason'],'Retained proof recovery route is unavailable')
                         queued=recovery.completion_unit(unit['work_unit_id'])
                         # Retained invalidation has its own current receipt,

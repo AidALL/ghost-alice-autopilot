@@ -63,6 +63,19 @@ class FormatIoTraceRowsTest(unittest.TestCase):
 
 
 class BuildContinuationMessageNeutralityTest(unittest.TestCase):
+    def test_task_context_and_tool_bodies_are_referenced_not_repeated(self):
+        item = self._item()
+        for key in ('constraints', 'non_goals', 'decision_context', 'open_questions', 'contextual_protections'):
+            item[key] = ['LARGE_CONTEXT_BODY' * 200]
+        msg = msgs.build_continuation_message({'run_id':'r'}, item,
+            io_trace_rows=[dict(tool='Bash', path='/source', pattern='LONG_TOOL_BODY' * 200)])
+        self.assertNotIn('LARGE_CONTEXT_BODY', msg)
+        self.assertNotIn('LONG_TOOL_BODY', msg)
+        self.assertIn('task-record: tasks.jsonl; id=current', msg)
+        self.assertIn('context-fields: decision_context, open_questions, contextual_protections, constraints, non_goals', msg)
+        self.assertIn('io-trace-count: 1', msg)
+        self.assertEqual(item['constraints'], ['LARGE_CONTEXT_BODY' * 200])
+
     def _item(self):
         return {
             "id": "current",
@@ -128,11 +141,12 @@ class InstructionOwnershipTest(unittest.TestCase):
         from unittest.mock import patch
         item = {"id": "task-7", "focus_layer": "micro", "allowed_surface": ["src"],
                 "acceptance_criteria": ["ac-7"], "prompt": "Implement approved task-7."}
-        with patch.object(msgs, "completion_recovery_guidance", return_value="CORE_DELIVERY_GUIDANCE"):
+        with patch.dict("os.environ", {"GHOST_ALICE_CORE_ROOT": "/missing-core-delivery-provider"}):
             text = msgs.build_continuation_message({"run_id": "run-3"}, item)
         self.assertIn("consistency-decision.json in the selected run directory", text)
         self.assertIn("tool-trace presence supplies no semantic mismatch or focus decision", text)
-        self.assertIn("recovery-and-final-answer:\nCORE_DELIVERY_GUIDANCE", text)
+        self.assertNotIn("recovery-and-final-answer:", text)
+        self.assertTrue(text.endswith("prompt:\nImplement approved task-7."))
         self.assertNotIn(".autopilot/consistency-decision.json", text)
         self.assertNotIn("without tools", text)
 

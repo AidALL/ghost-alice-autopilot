@@ -248,6 +248,70 @@ class CompletionRouteFixture(unittest.TestCase):
 
 
 class CompletionRouteE2ETest(CompletionRouteFixture):
+    def assert_core_stop(self, payload, **expectation):
+        from test_completion_skill_evidence import assert_stop_observation
+        return assert_stop_observation(self, payload, **expectation)
+
+    def native_handoff(self, text):
+        # The responding model owns the recorded review. Independent native
+        # Stop consumers inspect it without a host-side review model or loop.
+        guard = self.executable_hook(self.pair['core'] / '_shared/claude_stop_verification_hook.py',
+            dict(session_id=self.session, last_assistant_message=text), extra=('--platform', self.platform))
+        self.assert_core_stop(guard)
+        return self.stop(body=text)
+
+    def test_native_stop_publishes_and_applies_model_reviewed_completion(self):
+        for platform in ('codex', 'claude'):
+            with self.subTest(platform=platform):
+                self.initialize(label='native-host-handoff', platform=platform)
+                self.select_consumer_control(['october-test-current'])
+                self.prepare()
+                proof, verified, _, _ = self.isolated_business_proof()
+                self.review(proof, verified)
+                audit = self.native_handoff(proof)
+                recording = audit.get('completion_recording') or {}
+                self.assertEqual(recording.get('status'), 'v2-unit-state', audit)
+                unit = recording['units'][0]
+                self.assertEqual(unit['status'], 'applied', unit)
+                self.assertTrue(unit['application_reference'])
+                self.assertEqual(self.state()['acceptance_criteria'][0]['status'], 'met')
+                with self.storage.transaction(self.run_dir, self.source, migrate_legacy=False) as store:
+                    stored = store.completion_unit(unit['work_unit_id'])
+                    publication = store.completion_read('publication', stored['publication_reference'])
+                    application = store.completion_read('application', unit['application_reference'])
+                    self.assertEqual(publication['result']['verified_at'], verified)
+                    self.assertEqual(application['publication_reference'], stored['publication_reference'])
+                self.assertEqual(self.business_count, 1 if platform == 'codex' else 2)
+
+    def test_reviewed_explanation_does_not_certify_completion(self):
+        import completion_assessment as assessment
+        for platform in ('codex', 'claude'):
+            with self.subTest(platform=platform):
+                self.initialize(label='native-explanation-only', platform=platform)
+                self.select_consumer_control(['october-test-current'], purpose='explanation')
+                self.prepare()
+                self.isolated_business_proof()
+                response = 'The fixture source records an isolated observation; completion is unresolved.'
+                paths = [str(self.root / 'business-result.txt')]
+                scope = assessment.prepare_response_scope(self.source,
+                    expected_input_event_id=self.state()['latest_input_event_id'], source_paths=paths)
+                candidate = assessment.prepare_response_review(self.source, response_text=response,
+                    source_paths=paths, claim_statements=[response], scope_reference=scope['scope_reference'])
+                ids = [row['source_id'] for row in candidate['sources']]
+                assessment.record_response_review(self.source, candidate['candidate_reference'], {
+                    'claims': [dict(binding_id=row['binding_id'], verdict='supported', source_ids=ids,
+                        rationale='The source records only the fixture observation, with no completion judgment.')
+                        for row in candidate['bindings']],
+                    'response': dict(binding_id=candidate['response_binding']['binding_id'],
+                        verdict='supported', source_ids=ids, rationale='The explanation retains unresolved completion.')})
+                output = self.native_handoff(response)
+                recording = output.get('completion_recording') or {}
+                self.assertTrue(recording, output)
+                self.assertNotIn('response_text', output)
+                self.assertTrue(all(unit.get('status') != 'applied' for unit in recording.get('units', [])))
+                self.assertEqual(self.state()['acceptance_criteria'][0]['status'], 'unmet')
+                self.assertFalse(self.run_dir.exists())
+
     def test_core_review_and_native_publication_do_not_replay_business_work(self):
         self.initialize(label='visible-stop-owner')
         self.select_consumer_control(['october-test-current'])
@@ -256,12 +320,11 @@ class CompletionRouteE2ETest(CompletionRouteFixture):
         guard = self.pair['core'] / '_shared/claude_stop_verification_hook.py'
         rejected = self.executable_hook(guard, dict(session_id=self.session,
             last_assistant_message=proof), extra=('--platform', 'codex'))
-        self.assertEqual(rejected['decision'], 'block')
-        self.assertIn('assessment-required', rejected['reason'])
+        self.assert_core_stop(rejected, issue='assessment-required', repair_target='completion_metadata')
         self.review(proof, verified)
         accepted = self.executable_hook(guard, dict(session_id=self.session,
             last_assistant_message=proof), extra=('--platform', 'codex'))
-        self.assertEqual(accepted, {'continue': True})
+        self.assert_core_stop(accepted)
         resolved = self.stop(body=proof)
         self.assertEqual(resolved['systemMessage'], '')
         self.assertEqual(resolved['completion_recording']['units'][0]['unit_status'], 'complete')
@@ -294,9 +357,9 @@ class CompletionRouteE2ETest(CompletionRouteFixture):
         self.assertEqual(current["criterion_ids"], ["design-quality-only"])
         self.assertEqual(next(c for c in self.state()["acceptance_criteria"] if c["id"] == "old")["status"], "unmet")
         unsupported = self.executable_hook(self.pair["core"] / "_shared/claude_stop_verification_hook.py",
-            dict(last_assistant_message="The read-only fixture review is complete.", stop_hook_active=False),
+            dict(session_id=self.session, last_assistant_message="The read-only fixture review is complete.", stop_hook_active=False),
             extra=("--platform", self.platform))
-        self.assertEqual(unsupported.get("decision"), "block")
+        self.assert_core_stop(unsupported, issue='[completion-check]', repair_target='completion_metadata')
 
     def test_case02_sanitized_current_body_publication_only_two_actual_adapter_stops(self):
         self.initialize(label="case02")
@@ -316,11 +379,11 @@ class CompletionRouteE2ETest(CompletionRouteFixture):
         self.assertEqual(self.business_count, 1)
         self.assertEqual((self.root / "business-result.txt").read_text(), body)
 
-    def test_case02_delivery_final_only_unknown_and_changed_claim_twins(self):
-        for surface, changed, expected, has_prior in (("final_only", False, "assembled_complete_payload", True),
-                ("unknown", False, "resolve_host_delivery", True),
-                ("visible_transcript", False, "assembled_complete_payload", False),
-                ("visible_transcript", True, "corrected_complete_answer", True)):
+    def test_case02_host_visibility_does_not_select_answer_replay(self):
+        for surface, changed, has_prior in (("final_only", False, True),
+                ("unknown", False, True),
+                ("visible_transcript", False, False),
+                ("visible_transcript", True, True)):
             with self.subTest(surface=surface, changed=changed):
                 # Each twin has its own authority and no previous diagnostic to park.
                 twin = self.root / (surface + "-" + str(changed)); twin.mkdir()
@@ -331,12 +394,10 @@ class CompletionRouteE2ETest(CompletionRouteFixture):
                     self.prepare()
                     body = self.case_data["current_fixture_body"] if has_prior else ""
                     result = self.stop(body=body, surface=surface, changed=changed)
-                    delivery = load_module("fixture_delivery", self.pair["core"] / "_shared/response_delivery.py")
-                    decision = delivery.observe_recovery_delivery(dict(host_context=dict(delivery_surface=surface),
-                        claims_changed=changed), platform=self.platform, final_text=body, repair_target="runtime_records")
-                    self.assertEqual(decision["delivery_route"], expected)
-                    if observed := result.get("recovery", {}).get("delivery_route"):
-                        self.assertEqual(observed, expected)
+                    self.assertTrue(result['continue'])
+                    self.assertNotIn('decision', result)
+                    self.assertNotIn('delivery_route', result.get('recovery', {}))
+                    self.assertNotIn('delivery-route:', result.get('systemMessage', ''))
                 finally:
                     self.root = previous_root
 
@@ -447,9 +508,7 @@ class CompletionRouteE2ETest(CompletionRouteFixture):
                             payload = self.executable_hook(self.pair["core"] / "_shared/claude_stop_verification_hook.py",
                                 dict(session_id=self.session, last_assistant_message=text, stop_hook_active=retry),
                                 extra=("--platform", platform))
-                            self.assertEqual(payload.get("decision"), expected)
-                            if expected is None:
-                                self.assertEqual(payload, {"continue": True})
+                            self.assert_core_stop(payload, issue='[completion-check]' if expected else None)
                         finally:
                             self.root = previous
 
@@ -542,17 +601,16 @@ class CompletionRouteE2ETest(CompletionRouteFixture):
                     self.assertNotEqual(repair.get("hookSpecificOutput", {}).get("permissionDecision"), "deny")
                     first = self.stop()
                     second = self.stop()
-                    # The native adapter's defensive fallback projects the typed
-                    # acquisition/selection error into its per-unit envelope.
-                    unit = first["completion_recording"]["units"][0]
-                    self.assertEqual(first["completion_recording"]["status"], "v2-unit-state")
-                    self.assertEqual(unit["status"], "recording-error")
-                    self.assertEqual(unit["reason"], "approval-projection-invalid")
-                    self.assertEqual(unit["error_type"], "CompletionRecordingError")
-                    self.assertNotIn("permissionDecision", first.get("hookSpecificOutput", {}))
-                    self.assertNotIn("permissionDecision", second.get("hookSpecificOutput", {}))
-                    self.assertEqual(second.get("recovery", {}).get("status"), "parked")
-                    self.assertNotIn("decision", second)
+                    # Core rejects this unreviewed closing input before
+                    # dependent publication. Earlier acquisition checks still
+                    # retain the qualified approval defect as their diagnostic.
+                    self.assertEqual(capture['reason'], 'approval-projection-invalid')
+                    for output in (first, second):
+                        self.assertEqual(output['completion_recording']['status'], 'recording-unavailable')
+                        self.assertEqual(output['completion_recording']['reason'], 'completion-body-invalid')
+                        self.assertNotIn('permissionDecision', output.get('hookSpecificOutput', {}))
+                        self.assertNotIn('decision', output)
+                        self.assertEqual(output['systemMessage'], '')
                     self.assertEqual(before, self.state())
                 finally:
                     self.root = previous_root

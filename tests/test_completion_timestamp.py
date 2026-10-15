@@ -173,7 +173,8 @@ class CompletionTimestampTest(unittest.TestCase):
     def test_generated_recovery_command_accepts_original_untimed_stdin(self):
         self.prepare(); original = self.untimed()
         message = self.stop()['systemMessage']
-        self.assertIn('once', message)
+        self.assertIn('section Explicit v1 callers', message)
+        self.assertIn('using original proof and time', message)
         command = next(line for line in message.splitlines() if 'autopilot_completion.py publish' in line)
         argv = [self.verified_at if value == 'ORIGINAL_ISO_TIME' else value for value in shlex.split(command)]
         self.assert_original_committed(original, self.cli(argv, original))

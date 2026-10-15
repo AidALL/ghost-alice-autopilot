@@ -6,7 +6,6 @@ import pytest
 from unittest.mock import patch
 sys.path.insert(0,str(Path(__file__).resolve().parents[1]/'addons/autopilot-mode/skill/adapters'))
 from autopilot_work_items import _load_core_ledger_module
-from autopilot_runtime_context import core_recovery_delivery
 
 
 @pytest.mark.parametrize('root_kind',('absolute','relative','broken'))
@@ -22,8 +21,6 @@ def test_invalid_inherited_core_does_not_reuse_warm_provider_or_ancestor(tmp_pat
         invalid=str(root)
     with patch.dict(os.environ,{'GHOST_ALICE_CORE_ROOT':invalid}):
         assert _load_core_ledger_module(locator,{}) is None
-        with pytest.raises(ValueError,match='unavailable'):
-            core_recovery_delivery({}, {'GHOST_ALICE_SESSION_INTENT_ROOT':str(locator.parent.parent.parent)})
 
 
 @pytest.mark.parametrize('root_kind',('missing','whitespace'))
@@ -60,8 +57,6 @@ def test_nonempty_whitespace_root_is_unavailable_after_warm_provider(tmp_path,se
     inherited=str(core/'.tmp/missing-location-provider') if selection=='source' else raw
     with patch.dict(os.environ,{'GHOST_ALICE_CORE_ROOT':inherited}):
         assert _load_core_ledger_module(locator,supplied) is None
-        with pytest.raises(ValueError,match='unavailable'):
-            core_recovery_delivery({},supplied)
 
 
 def test_ordinary_root_precedence_and_empty_clear_discovery_are_preserved(tmp_path):
@@ -86,16 +81,6 @@ def test_ordinary_root_precedence_and_empty_clear_discovery_are_preserved(tmp_pa
 def test_invalid_explicit_core_does_not_fallback_from_ledger_ancestor():
     core = Path(os.environ['GHOST_ALICE_CORE_ROOT'])
     assert _load_core_ledger_module(core/'.tmp/location-red/intent-state.json',{'GHOST_ALICE_CORE_ROOT':str(core/'missing')}) is None
-
-
-def test_invalid_explicit_delivery_provider_is_unavailable():
-    core = Path(os.environ['GHOST_ALICE_CORE_ROOT'])
-    try:
-        core_recovery_delivery({}, {'GHOST_ALICE_CORE_ROOT':str(core/'missing'),'GHOST_ALICE_SESSION_INTENT_ROOT':str(core/'.tmp/location-red')})
-    except ValueError as error:
-        assert 'unavailable' in str(error)
-    else:
-        assert False, 'invalid explicit Core was replaced by another provider'
 
 
 def test_ap_descriptor_write_rejects_escape_before_creating_parent(tmp_path):

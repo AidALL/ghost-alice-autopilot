@@ -233,6 +233,43 @@ class RunStore:
             (self.key, kind, identity, _json(value)))
         return identity
 
+    def completion_records(self, kind):
+        """Read authenticated originals for one record kind in this owned run."""
+        rows = self.connection.execute('SELECT identity FROM ap_completion_v2_records WHERE run_key=? AND kind=?',
+            (self.key, kind)).fetchall()
+        return [(identity, self.completion_read(kind, identity)) for (identity,) in rows]
+
+    def continuation_action(self, *, plan_id, task_id, request_id, action_id):
+        """Read an attempt from immutable records, independent of its projection.
+
+        The caller holds the run's BEGIN IMMEDIATE transaction through both
+        this lookup and durable start insertion before invoking the callback.
+        Existing records need no migration or mutable action-map reconstruction.
+        """
+        rows = self.connection.execute("""SELECT kind,identity FROM ap_completion_v2_records
+            WHERE run_key=? AND kind IN ('continuation-action-started','continuation-action-finished')
+            AND json_extract(body_json,'$.plan_id')=? AND json_extract(body_json,'$.task_id')=?
+            AND json_extract(body_json,'$.request_id')=? AND json_extract(body_json,'$.action_id')=?""",
+            (self.key, plan_id, task_id, request_id, action_id)).fetchall()
+        records = {}
+        for kind, identity in rows:
+            phase = kind.rsplit('-', 1)[1]
+            if phase in records:
+                raise ValueError('action identity has ambiguous immutable attempts')
+            records[phase] = (identity, self.completion_read(kind, identity))
+        if not records:
+            return None
+        if 'started' not in records:
+            raise ValueError('immutable action start is unavailable')
+        _, start = records['started']
+        if start.get('schema_version') != 'autopilot-task-action.v1' or start.get('outcome') != 'started':
+            raise ValueError('immutable action start is incompatible')
+        identity, value = records.get('finished', records['started'])
+        if 'finished' in records and (value.get('outcome') not in {'returned', 'raised'}
+                or any(value.get(key) != expected for key, expected in start.items() if key != 'outcome')):
+            raise ValueError('immutable action finish differs from its start')
+        return dict(value, evidence_ref=identity)
+
     def completion_unit(self, unit_id):
         row = self.connection.execute("SELECT body_json FROM ap_completion_v2_units WHERE run_key=? AND work_unit_id=?",
             (self.key, unit_id)).fetchone()

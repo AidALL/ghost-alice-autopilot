@@ -84,8 +84,19 @@ class _CompletionV2Fixture(unittest.TestCase):
         if args.get("completion_check") is not None:
             self.review(args["completion_check"],args["verified_at"],getattr(self,"review_verdicts",None),
                 work_unit_id=receipt.get("work_unit_id"))
-        candidate = self.review_records.get(receipt.get('work_unit_id'), {})
-        capture = candidate.get('capture_binding') or {}
+        capture = {}
+        if args.get('completion_check') is not None:
+            import completion_assessment
+            try:
+                assessment = completion_assessment.lookup_current_proof(args['source'],
+                    completion_assessment.extract_original_proof(args['completion_check']),
+                    work_unit_id=receipt.get('work_unit_id'))
+                original = assessment.candidate
+                capture = completion_assessment.assessment_capture_binding(assessment,
+                    original['contract'], original['proof'], original['verified_at']) or {}
+            except ValueError:
+                # Invalid review fixtures still exercise the real publication rejection.
+                pass
         if (args.get('completion_check') is not None and not args.get('origin_receipt_token')
                 and capture.get('receipt_token') not in (None, receipt['receipt_token'])
                 and (args.get('dependencies') or args.get('criterion_dependencies') is not None)):
@@ -119,6 +130,29 @@ class _CompletionV2Fixture(unittest.TestCase):
 
 
 class PreparedPretoolV2Test(_CompletionV2Fixture):
+    def test_pending_native_input_waits_without_capture_or_failure_context(self):
+        from unittest import mock
+        import autopilot_pretool as pretool
+        helper=pretool._helper()
+        pending={'intent_state':{'intake_status':'pending-native-origin'},
+                 'latest_input_event':{}}
+        with mock.patch.object(helper.adapter,'read_session_material',return_value=pending), \
+                mock.patch.object(pretool,'capture_origin') as capture:
+            result=pretool.capture_before_tool(self.source,
+                dict(hook_event_name='PreToolUse',session_id='session-1',cwd=str(self.root)),preflight=True)
+        capture.assert_not_called()
+        self.assertEqual(result,{'status':'skipped','reason':'pending-native-origin'})
+        self.assertFalse((self.run_dir/'authority.json').exists())
+
+    def test_native_input_reader_errors_are_not_treated_as_waiting(self):
+        from unittest import mock
+        import autopilot_pretool as pretool
+        with mock.patch.object(pretool._helper().adapter,'read_session_material',
+                side_effect=ValueError('current session identity mismatch')):
+            with self.assertRaisesRegex(ValueError,'identity mismatch'):
+                pretool.capture_before_tool(self.source,
+                    dict(hook_event_name='PreToolUse',session_id='session-1',cwd=str(self.root)),preflight=True)
+
     def reviewed_answer(self, verified_at=None):
         import completion_assessment
         skills = self.root / 'skills'
@@ -147,7 +181,11 @@ class PreparedPretoolV2Test(_CompletionV2Fixture):
         self.followup()
         current = self.prepare()
         candidate = self.reviewed_answer(verified)
-        self.assertEqual(candidate['capture_binding']['origin_token'], original['origin_token'])
+        import completion_assessment
+        reviewed = completion_assessment.lookup_current_response(self.source, self.completion)
+        capture = completion_assessment.assessment_capture_binding(reviewed,
+            reviewed.candidate['contract'], reviewed.candidate['proof'], verified)
+        self.assertEqual(capture['origin_token'], original['origin_token'])
         with self.assertRaises(ValueError):
             self.helper.publish_completion(receipt_token=original['receipt_token'],
                 completion_check=self.completion, verified_at=verified, source=self.source, schema_version='v2')
@@ -213,7 +251,7 @@ class PreparedPretoolV2Test(_CompletionV2Fixture):
                 store.completion_unit(applied['work_unit_id'])['publication_reference'])
             self.assertEqual(publication['result']['verified_at'], candidate['verified_at'])
             self.assertEqual(publication['result']['original_evidence'][0]['proof_digest'],
-                candidate['proof_digest'])
+                candidate['response_binding']['proof_digest'])
         again = publication_fixture.adapter.adapter_payload_from_env(self.source, hook_input=host)
         self.assertEqual(again['completion_recording']['units'][0]['application_reference'],
             applied['application_reference'])
@@ -265,7 +303,22 @@ class PreparedPretoolV2Test(_CompletionV2Fixture):
         self.followup()
         later=capture_before_tool(self.source,host,preflight=True)
         self.assertNotEqual(later['receipt_token'],first['receipt_token'])
-        self.assertNotIn(later['publish_command'],later['additional_context'])
+        self.assertNotIn('additional_context',later)
+        self.assertEqual(later['input_event_id'],self.read_state()['latest_input_event_id'])
+
+    def test_changed_criteria_reannounce_without_reusing_input_authority(self):
+        from autopilot_pretool import capture_before_tool
+        host=dict(hook_event_name='PreToolUse',session_id='session-1',cwd=str(self.root))
+        first=capture_before_tool(self.source,host,preflight=True)
+        criteria=copy.deepcopy(self.read_state()['acceptance_criteria'])
+        criteria[0]['summary']+=' and its updated requirement'
+        self.change_intent({'acceptance_criteria':criteria},new_input=True)
+        later=capture_before_tool(self.source,host,preflight=True)
+        self.assertNotEqual(later['receipt_token'],first['receipt_token'])
+        self.assertGreater(later['contract_revision'],first['contract_revision'])
+        self.assertIn('additional_context',later)
+        again=capture_before_tool(self.source,host,preflight=True)
+        self.assertNotIn('additional_context',again)
 
     def test_locked_selection_cannot_write_through_another_store_target(self):
         from contextlib import contextmanager
@@ -365,6 +418,62 @@ class InactiveCompletionV2Test(_CompletionV2Fixture):
 
 
 class ResponsePurposeV2Test(_CompletionV2Fixture):
+    def test_sdk_pending_input_is_observed_without_completion_writes(self):
+        from unittest.mock import patch
+        import autopilot_completion_service as service
+        # Exact prompt and native origin from the observed Claude SDK replay;
+        # transport reception is retained without inventing human admission.
+        prompt = '이메일인가애 있었던 거 같음\n'
+        session = 'ff7dead7-10a5-4fef-bd7a-2cffdcf815d0'
+        prompt_id = '6fc7d895-0b7c-470e-a86e-61f3f958dcb9'
+        root = self.root / 'pending-intent'
+        transcript = self.root / 'pending-native.jsonl'
+        coords = dict(root=root, platform='claude', session_id=session)
+        self.core.stage_native_input(**coords, raw_input=prompt, prompt_id=prompt_id,
+            transcript_path=str(transcript))
+        transcript.write_text(json.dumps(dict(type='user', sessionId=session,
+            promptId=prompt_id, promptSource='sdk', turnOrigin='sdk', entrypoint='sdk-cli',
+            message=dict(role='user', content=prompt))) + '\n')
+        before = self.core.read_session_state(**coords)
+        source = dict(self.source, GHOST_ALICE_PLATFORM='claude', GHOST_ALICE_SESSION_ID=session,
+            GHOST_ALICE_SESSION_INTENT_ROOT=str(root))
+        host = dict(hook_event_name='Stop', session_id=session, transcript_path=str(transcript))
+        with patch.object(service, '_v2_recording_transaction') as recording:
+            result = publication_fixture.adapter.adapter_payload_from_env(source, hook_input=host)
+            recording.assert_not_called()
+        self.assertEqual(result.get('systemMessage'), '')
+        self.assertEqual(result['completion_recording']['status'], 'recording-unavailable')
+        self.assertEqual(result['completion_recording']['reason'], 'input-not-admitted')
+        self.assertEqual(result['completion_recording']['intake_status'], 'pending-native-origin')
+        self.assertNotIn('decision', result)
+        self.assertEqual(self.core.read_session_state(**coords), before)
+        self.assertFalse((self.root / '.autopilot').exists())
+        # Explicit preflight/publication still cannot use an absent anchor.
+        with self.assertRaises(ValueError):
+            service.v2_preflight_result({'status': 'prepared'}, source)
+        import autopilot_intent_recovery as recovery
+        material = publication_fixture.adapter.read_session_material(root, 'claude', session,
+            source=source, require_input=False)
+        original = recovery._core_native_assessor(self.core)(source, phase='before_tool')
+        # Only the two absent sentinels normalize; invalid scalar identities
+        # and unavailable authority never become an unadmitted-input result.
+        for value in (False, 0, 'foreign-input'):
+            with self.subTest(input_event_id=value), patch.object(recovery, '_core_native_assessor',
+                    return_value=lambda *args, **kwargs: dict(original, input_event_id=value)):
+                selection = recovery.current_execution_projection(material, source, self.run_dir)
+                self.assertEqual(selection['reason'], 'core-assessment-incompatible')
+        with patch.object(recovery, '_core_native_assessor', return_value=lambda *args, **kwargs:
+                dict(original, context_status='unavailable', context_issue='unreadable authority')):
+            selection = recovery.current_execution_projection(material, source, self.run_dir)
+            self.assertEqual(selection['reason'], 'core-authority-unavailable')
+        valid_material = publication_fixture.adapter.read_session_material(self.root / 'intent',
+            'codex', 'session-1', source=self.source, require_input=True)
+        valid = recovery._core_native_assessor(self.core)(self.source, phase='before_tool')
+        with patch.object(recovery, '_core_native_assessor', return_value=lambda *args, **kwargs:
+                dict(valid, input_event_id='different-nonempty-input')):
+            selection = recovery.current_execution_projection(valid_material, self.source, self.run_dir)
+            self.assertEqual(selection['reason'], 'core-assessment-incompatible')
+
     def native_stop(self,text,alias='last_assistant_message'):
         import os,subprocess
         host=dict(hook_event_name='Stop',session_id='session-1',cwd=str(self.root),**{alias:text})
@@ -461,7 +570,8 @@ class ResponsePurposeV2Test(_CompletionV2Fixture):
             session_id='session-1',cwd=str(self.root)),preflight=True)
         guidance=captured['additional_context']
         self.assertIn('publication: native Stop consumes the Core-reviewed response',guidance)
-        self.assertIn('complete draft and original source/time',guidance)
+        self.assertIn('For completion or partial-completion claims',guidance)
+        self.assertIn('do not repeat them for routine explanations',guidance)
         self.assertNotIn(captured['publish_command'],guidance)
         self.assertNotIn('before the first final response',guidance)
 
@@ -534,7 +644,7 @@ class CompletionContractV2Test(_CompletionV2Fixture):
                 verdict='supported', source_ids=[s['source_id'] for s in draft['sources']],
                 rationale='The complete answer retains only the report and protected-file observations.')))
         published = self.helper.publish_completion(receipt_token=receipt['receipt_token'],
-            completion_check=reviewed['response_text'], verified_at=self.verified_at,
+            completion_check=body, verified_at=self.verified_at,
             evidence_source=self.evidence_source, source=self.source, schema_version='v2')
         # A later recording-only instruction needs Core's context review, not new business proof.
         self.change_intent({'constraints': ['Do not rerun the report; apply its retained proof.']}, new_input=True)
@@ -1275,15 +1385,18 @@ class NativeRecordingRecoveryV2Test(_CompletionV2Fixture):
         receipt=self.prepare()
         with self.assertRaisesRegex(ValueError,'Verification must follow ORIGINAL capture'):
             self.publish(receipt)
-        first=self.stop()
+        host=dict(hook_event_name='Stop',session_id='session-1',last_assistant_message=original_proof)
+        def stop_original():
+            return publication_fixture.adapter.adapter_payload_from_env(self.source,hook_input=host)
+        first=stop_original()
         self.assertEqual(first['recovery']['status'],'diagnostic')
         self.assertNotIn(receipt['publish_command'],first['systemMessage'])
-        parked=self.stop()
+        parked=stop_original()
         self.assertEqual(parked['recovery']['status'],'parked')
         self.assertNotIn(receipt['publish_command'],parked['systemMessage'])
         self.assertNotIn('Publish existing supported proof',parked['systemMessage'])
         self.followup();current=self.prepare()
-        later=self.stop()
+        later=stop_original()
         self.assertEqual(later['recovery']['status'],'parked')
         self.assertNotIn(current['publish_command'],later['systemMessage'])
         self.assertNotIn('Publish existing supported proof',later['systemMessage'])
@@ -1291,14 +1404,15 @@ class NativeRecordingRecoveryV2Test(_CompletionV2Fixture):
         self.assertEqual(self.completion,original_proof)
         self.assertEqual({c['status'] for c in self.read_state()['acceptance_criteria']},{'unmet'})
 
-    def test_v2_stop_publication_dependency_error_uses_changed_claim_shape_once(self):
+    def test_v2_stop_dependency_change_invalidates_coverage_without_requesting_an_answer(self):
         artifact=self.root/'report.txt';artifact.write_text('8')
         receipt=self.prepare();self.proof();self.publish(receipt,dependencies=[str(artifact)])
         artifact.write_text('9')
         host=dict(hook_event_name='Stop',session_id='session-1',host_context=dict(delivery_surface='visible_transcript'),last_assistant_message='Saved requested report')
         failed=publication_fixture.adapter.adapter_payload_from_env(self.source,hook_input=host)
-        self.assertEqual(failed['recovery']['delivery_route'],'corrected_complete_answer')
-        self.assertIn('preserves the other supported claims',failed['systemMessage'])
+        self.assertTrue(failed['recovery']['claims_changed'])
+        self.assertNotIn('delivery_route',failed['recovery'])
+        self.assertNotIn('decision',__import__('autopilot_mode')._format_payload_for_hook(failed,host))
         self.assertEqual(failed['recovery']['status'],'diagnostic')
         self.assertEqual(publication_fixture.adapter.adapter_payload_from_env(self.source,hook_input=host)['recovery']['status'],'parked')
         artifact.write_text('8')
@@ -1429,11 +1543,12 @@ class AcquisitionPhaseBoundaryV2Test(_CompletionV2Fixture):
 class RetainedProofRecoveryDeliveryV2Test(_CompletionV2Fixture):
     partials=CompletionV2HistoryRegressionTest.partials
 
-    def test_retained_partial_invalidation_selects_genuine_correction_not_metadata_patch(self):
+    def test_retained_partial_invalidation_preserves_independent_coverage(self):
         self.partials();self.report.write_text('changed A')
         host=dict(hook_event_name='Stop',session_id='session-1',host_context=dict(delivery_surface='visible_transcript'),last_assistant_message='Saved report and protected file')
         result=publication_fixture.adapter.adapter_payload_from_env(self.source,hook_input=host)
-        self.assertEqual(result['recovery']['delivery_route'],'corrected_complete_answer')
+        self.assertTrue(result['recovery']['claims_changed'])
+        self.assertNotIn('delivery_route',result['recovery'])
         self.assertEqual({c['id']:c['status'] for c in self.read_state()['acceptance_criteria']},{'report':'unmet','protected':'met'})
 
     def test_malformed_metadata_retry_is_rejected_by_core_without_recovery(self):
@@ -1477,8 +1592,11 @@ class DependentAdvancementBoundV2Test(_CompletionV2Fixture):
     def test_identical_denied_acquisition_does_not_reacquire_without_actual_delta(self):
         import autopilot_storage as storage
         from unittest import mock
+        self.proof()
+        host=dict(hook_event_name='Stop',session_id='session-1',last_assistant_message=self.completion)
         with mock.patch.object(storage,'_atomic',side_effect=PermissionError('known acquisition failure')) as atomic:
-            self.stop();second=self.stop()
+            publication_fixture.adapter.adapter_payload_from_env(self.source,hook_input=host)
+            second=publication_fixture.adapter.adapter_payload_from_env(self.source,hook_input=host)
             self.assertEqual(atomic.call_count,1)
             self.assertEqual(second['recovery']['status'],'parked')
 
@@ -1584,7 +1702,8 @@ class ParkedRetainedMetDependencyV2Test(_CompletionV2Fixture):
             changed=self.stop()
             self.assertEqual(apply.call_count,2)
             self.assertEqual({c['id']:c['status'] for c in self.read_state()['acceptance_criteria']},{'report':'unmet','protected':'met'})
-            self.assertEqual(changed['recovery']['delivery_route'],'corrected_complete_answer')
+            self.assertTrue(changed['recovery']['claims_changed'])
+            self.assertNotIn('delivery_route',changed['recovery'])
         with self.helper.storage.transaction(self.run_dir,self.source,migrate_legacy=False) as store:
             retained=store.completion_read('evidence',first['evidence_references'][0])
         self.assertEqual(retained,original)
@@ -1754,7 +1873,8 @@ class RetainedSiblingReadErrorV2Test(_CompletionV2Fixture):
         self.addCleanup(self.protected.chmod,0o600)
         failure=publication_fixture.adapter.adapter_payload_from_env(self.source,hook_input=host)
         parked=publication_fixture.adapter.adapter_payload_from_env(self.source,hook_input=host)
-        self.assertEqual(failure['recovery']['delivery_route'],'preserve_answer_and_patch_metadata')
+        self.assertFalse(failure['recovery']['claims_changed'])
+        self.assertNotIn('delivery_route',failure['recovery'])
         self.assertEqual(parked['recovery']['status'],'parked')
         self.assertEqual(self.read_state()['acceptance_criteria'],before)
         self.protected.chmod(0o600)

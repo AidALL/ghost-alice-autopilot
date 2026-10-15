@@ -280,7 +280,7 @@ if __name__=='__main__':unittest.main()
 
 
 class RetainedObservationSnapshotTests(unittest.TestCase):
-    def test_authenticated_correction_uses_original_bytes_after_log_change_or_deletion(self):
+    def test_missing_original_blocks_new_claim_but_preserves_authenticated_history(self):
         for mutation in ('changed', 'deleted'):
             with self.subTest(mutation=mutation):
                 owner = CompletionCorrectionTest()
@@ -304,21 +304,18 @@ class RetainedObservationSnapshotTests(unittest.TestCase):
                         verified_at=record['verified_at'], source_paths=[], reuse_evidence=evidence_reference)
                     self.assertEqual(candidate['sources'], original.candidate['sources'])
                     self.assertEqual(candidate['verified_at'], record['verified_at'])
-                    try:
+                    with self.assertRaises(completion_assessment.CompletionAssessmentError) as unavailable:
                         completion_assessment.record_assessment(owner.source, candidate['candidate_reference'],
                             [dict(binding_id=b['binding_id'], verdict='supported',
                                 source_ids=[s['source_id'] for s in candidate['sources']],
-                                rationale='Retained original observation supports this historical statement.')
+                                rationale='A changed claim requires readable original evidence.')
                              for b in candidate['bindings']])
-                    except completion_assessment.CompletionAssessmentError as exc:
-                        self.fail('Retained original bytes must remain reviewable: ' + str(exc))
-                    reviewed = completion_assessment.lookup_assessment(owner.source, candidate['contract'], proof,
-                        candidate['verified_at'])
-                    self.assertEqual(reviewed.source_issues, {})
-                    self.assertTrue(completion_assessment.authorize_correction(owner.source,
-                        criterion=dict(work_unit_id='report-unit', contract_revision=1, criterion_id='report'),
-                        contract=candidate['contract'], proof=proof, verified_at=candidate['verified_at'],
-                        original_evidence_reference=evidence_reference))
+                    self.assertEqual(unavailable.exception.reason,
+                        'source-changed' if mutation == 'changed' else 'source-unavailable')
+                    historical = completion_assessment.lookup_assessment(owner.source, record['contract'],
+                        record['proof'], record['verified_at'], historical=True)
+                    self.assertEqual(historical.reference, original.reference)
+                    self.assertEqual(historical.candidate['verified_at'], record['verified_at'])
                     if mutation == 'deleted': self.assertFalse(log.exists())
                     else: self.assertEqual(log.read_text(), 'Later unrelated observation bytes')
                 finally:

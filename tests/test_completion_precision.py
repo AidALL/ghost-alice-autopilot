@@ -122,16 +122,28 @@ class CompletionPrecisionTest(_CompletionV2Fixture):
     @mock.patch("completion_assessment._capture_binding", return_value=None)
     def test_ambiguous_publication_parks_native_stop_without_resubmission(self, _legacy_capture):
         receipt = self.capture()
-        original = self.proof(self.coarse)
+        self.proof(self.coarse)
+        # Native publication derives its source from the submitted original;
+        # isolate clock ambiguity after providing that required evidence field.
+        self.completion += '- evidence: ' + self.evidence_source + '\n'
+        original = self.completion
         with self.assertRaises(contract.CompletionContractError):
             self.publish(receipt)
-        first = self.stop()
-        second = self.stop()
+        import test_completion_publication as fixture
+        host = dict(hook_event_name='Stop', session_id='session-1', cwd=str(self.root),
+                    last_assistant_message=original)
+        first = fixture.adapter.adapter_payload_from_env(self.source, hook_input=host)
+        second = fixture.adapter.adapter_payload_from_env(self.source, hook_input=host)
+        self.assertEqual(first['recovery']['status'], 'diagnostic')
+        self.assertIn('time-order-ambiguous', first['systemMessage'])
+        self.assertEqual(second['recovery']['status'], 'parked')
+        self.assertEqual(second['systemMessage'], '')
         for result in (first, second):
-            self.assertEqual(result['recovery']['status'], 'parked')
+            self.assertIs(result['continue'], True)
+            self.assertNotIn('decision', result)
             self.assertNotIn('Publish existing supported proof', result['systemMessage'])
             self.assertNotIn('--receipt-token', result['systemMessage'])
-            self.assertIn('time-order-ambiguous', result['systemMessage'])
+            self.assertEqual(result['completion_recording']['units'][0]['reason'], 'time-order-ambiguous')
         self.assertEqual(self.completion, original)
         self.assertEqual({r['status'] for r in self.read_state()['acceptance_criteria']}, {'unmet'})
 

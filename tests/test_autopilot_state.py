@@ -296,6 +296,7 @@ def _write_io_trace(
     path.parent.mkdir(parents=True, exist_ok=True)
     row = {
         "ts": "fixture-timestamp",
+        "platform": "codex",
         "session": session_id,
         "tool": "Bash",
         "path": path_value,
@@ -583,6 +584,46 @@ def _conduct_plan(task_id: str = "conduct-scope-drift") -> dict:
 
 
 class AutopilotStateTest(unittest.TestCase):
+    def test_iotrace_requires_tool_and_exact_platform_and_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            path=root/'io-trace.jsonl'
+            valid=dict(ts='fixture',platform='codex',session='s-run',tool='Bash',path='n/a',pattern='work')
+            rejected=[dict(valid,tool=''),dict(valid,tool='unknown'),
+                dict(valid,platform='claude'),dict(valid,session='another'),
+                {k:v for k,v in valid.items() if k!='platform'},
+                dict(ts='fixture',platform='codex',session='s-run',event='governance-warning'),
+                dict(valid,event='governance-warning')]
+            source={'GHOST_ALICE_IO_TRACE_FILE':str(path),'GHOST_ALICE_PLATFORM':'codex'}
+            for row in rejected:
+                with self.subTest(row=row):
+                    path.write_text(json.dumps(row)+'\n')
+                    self.assertEqual(aps._read_io_trace_rows(source,session_id='s-run'),[])
+            path.write_text(json.dumps(valid)+'\n')
+            self.assertEqual(len(aps._read_io_trace_rows(source,session_id='s-run')),1)
+            self.assertEqual(aps._read_io_trace_rows(source,session_id=None),[])
+            self.assertEqual(aps._read_io_trace_rows({'GHOST_ALICE_IO_TRACE_FILE':str(path)},session_id='s-run'),[])
+
+    def test_legacy_audit_diagnostics_cannot_resume_running_item(self):
+        for trace in [dict(event='governance-warning',platform='codex'),
+                      dict(tool='Bash',platform='claude'),dict(tool='Bash')]:
+            with self.subTest(trace=trace), tempfile.TemporaryDirectory() as tmp:
+                root=Path(tmp); run_dir=root/'run'
+                _write_run(run_dir,[_item('current',status='running')])
+                _fixture_write_text(run_dir/'events.jsonl',json.dumps(dict(
+                    schema_version='autopilot-event.v1',event='resume_running_item_without_decision',
+                    run_id='run-1',work_item_id='current'))+'\n',encoding='utf-8')
+                path=root/'.ghost-alice/io-trace.jsonl';path.parent.mkdir()
+                original=json.dumps(dict(ts='fixture',session='s-run',**trace))+'\n'
+                path.write_text(original)
+                result=aps.adapter_payload_from_env(_core_env(dict(HOME=str(root),
+                    GHOST_ALICE_PLATFORM='codex',GHOST_ALICE_SESSION_ID='s-run',
+                    GHOST_ALICE_AUTOPILOT_RUN_DIR=str(run_dir))))
+                self.assertEqual(result['completion_recording']['status'],'parked')
+                events=[json.loads(row) for row in _fixture_read_text(run_dir/'events.jsonl',encoding='utf-8').splitlines()]
+                self.assertNotIn('resume_running_item_from_iotrace',[row['event'] for row in events])
+                self.assertEqual(path.read_text(),original)
+
     def setUp(self):
         isolated_home=tempfile.TemporaryDirectory()
         self.addCleanup(isolated_home.cleanup)
@@ -862,7 +903,9 @@ class AutopilotStateTest(unittest.TestCase):
 
         payload = json.loads(stdout.getvalue())
         self.assertEqual(return_code, 0)
-        self.assertIn("work-item: next", payload["reason"])
+        self.assertIs(payload["continue"], True)
+        self.assertNotIn("decision", payload)
+        self.assertIn("work-item: next", payload["systemMessage"])
 
     def test_relative_claude_project_dir_falls_back_to_absolute_hook_cwd(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -894,7 +937,9 @@ class AutopilotStateTest(unittest.TestCase):
 
         payload = json.loads(stdout.getvalue())
         self.assertEqual(return_code, 0)
-        self.assertIn("work-item: next", payload["reason"])
+        self.assertIs(payload["continue"], True)
+        self.assertNotIn("decision", payload)
+        self.assertIn("work-item: next", payload["systemMessage"])
         self.assertFalse(_fixture_exists(launcher / ".autopilot"))
 
     def test_tilde_claude_project_dir_falls_back_to_absolute_hook_cwd(self):
@@ -929,7 +974,9 @@ class AutopilotStateTest(unittest.TestCase):
 
         payload = json.loads(stdout.getvalue())
         self.assertEqual(return_code, 0)
-        self.assertIn("work-item: next", payload["reason"])
+        self.assertIs(payload["continue"], True)
+        self.assertNotIn("decision", payload)
+        self.assertIn("work-item: next", payload["systemMessage"])
         self.assertFalse(_fixture_exists(home / ".autopilot"))
 
     def test_unknown_user_tilde_project_dir_falls_back_to_absolute_hook_cwd(self):
@@ -962,7 +1009,9 @@ class AutopilotStateTest(unittest.TestCase):
 
         payload = json.loads(stdout.getvalue())
         self.assertEqual(return_code, 0)
-        self.assertIn("work-item: next", payload["reason"])
+        self.assertIs(payload["continue"], True)
+        self.assertNotIn("decision", payload)
+        self.assertIn("work-item: next", payload["systemMessage"])
 
     def test_relative_explicit_project_cwd_is_rejected(self):
         with self.assertRaisesRegex(ValueError, "absolute path"):
@@ -2747,6 +2796,7 @@ class AutopilotStateTest(unittest.TestCase):
             payload = aps.adapter_payload_from_env(_core_env({
                 "HOME": str(root),
                 "GHOST_ALICE_SESSION_ID": "s-run",
+                "GHOST_ALICE_PLATFORM": "codex",
                 "GHOST_ALICE_AUTOPILOT_RUN_DIR": str(run_dir),
             }))
             items = aps.read_work_items(run_dir / "tasks.jsonl")
@@ -2757,7 +2807,7 @@ class AutopilotStateTest(unittest.TestCase):
 
         self.assertTrue(payload["continue"])
         self.assertIn("pending-decision: missing", payload["systemMessage"])
-        self.assertIn("io-trace:", payload["systemMessage"])
+        self.assertIn("io-trace-count: 1", payload["systemMessage"])
         self.assertNotIn("governance-signal:", payload["systemMessage"])
         self.assertNotIn("- decision: reopen_", payload["systemMessage"])
         self.assertNotIn("decision: ask_user_meta", payload["systemMessage"])
@@ -2765,7 +2815,7 @@ class AutopilotStateTest(unittest.TestCase):
         self.assertEqual(events[-1]["event"], "resume_running_item_from_iotrace")
         self.assertFalse(any(key.startswith("governance_candidate") for key in events[-1]))
 
-    def test_iotrace_continuation_preserves_structured_bash_op_to_signal(self):
+    def test_iotrace_continuation_keeps_tool_body_outside_signal(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             run_dir = root / "run"
@@ -2790,10 +2840,12 @@ class AutopilotStateTest(unittest.TestCase):
             payload = aps.adapter_payload_from_env(_core_env({
                 "HOME": str(root),
                 "GHOST_ALICE_SESSION_ID": "s-run",
+                "GHOST_ALICE_PLATFORM": "codex",
                 "GHOST_ALICE_AUTOPILOT_RUN_DIR": str(run_dir),
             }))
 
-        self.assertIn("- read ./src/x.py", payload["systemMessage"])
+        self.assertIn("io-trace-count: 1", payload["systemMessage"])
+        self.assertNotIn("./src/x.py", payload["systemMessage"])
         self.assertNotIn("Get-Content", payload["systemMessage"])
 
     def test_iotrace_resume_limit_parks_even_with_iotrace_present(self):
@@ -2828,6 +2880,7 @@ class AutopilotStateTest(unittest.TestCase):
             payload = aps.adapter_payload_from_env(_core_env({
                 "HOME": str(root),
                 "GHOST_ALICE_SESSION_ID": "s-run",
+                "GHOST_ALICE_PLATFORM": "codex",
                 "GHOST_ALICE_AUTOPILOT_RUN_DIR": str(run_dir),
                 "GHOST_ALICE_AUTOPILOT_IOTRACE_RESUME_LIMIT": "2",
             }))
@@ -2881,6 +2934,7 @@ class AutopilotStateTest(unittest.TestCase):
             env = {
                 "HOME": str(root),
                 "GHOST_ALICE_SESSION_ID": "s-run",
+                "GHOST_ALICE_PLATFORM": "codex",
                 "GHOST_ALICE_AUTOPILOT_RUN_DIR": str(run_dir),
                 "GHOST_ALICE_AUTOPILOT_IOTRACE_RESUME_LIMIT": "1",
             }
@@ -2898,7 +2952,7 @@ class AutopilotStateTest(unittest.TestCase):
             items_after_second = aps.read_work_items(run_dir / "tasks.jsonl")
 
         self.assertTrue(first["continue"])
-        self.assertIn("io-trace:", first["systemMessage"])
+        self.assertIn("io-trace-count: 1", first["systemMessage"])
         self.assertNotIn("decision: ask_user_meta", first["systemMessage"])
         self.assertTrue(any(
             e["event"] == "resume_budget_replenished" and e.get("intent_events_seen") == 2
@@ -2946,6 +3000,7 @@ class AutopilotStateTest(unittest.TestCase):
             payload = aps.adapter_payload_from_env(_core_env({
                 "HOME": str(root),
                 "GHOST_ALICE_SESSION_ID": "s-run",
+                "GHOST_ALICE_PLATFORM": "codex",
                 "GHOST_ALICE_AUTOPILOT_RUN_DIR": str(run_dir),
                 "GHOST_ALICE_AUTOPILOT_IOTRACE_RESUME_LIMIT": "1",
             }))
@@ -3154,6 +3209,7 @@ class AutopilotStateTest(unittest.TestCase):
             payload = aps.adapter_payload_from_env(_core_env({
                 "HOME": str(root),
                 "GHOST_ALICE_SESSION_ID": "session-1",
+                "GHOST_ALICE_PLATFORM": "codex",
                 "GHOST_ALICE_AUTOPILOT_RUN_DIR": str(run_dir),
             }))
             events = [
@@ -3164,7 +3220,7 @@ class AutopilotStateTest(unittest.TestCase):
         self.assertTrue(payload["continue"])
         self.assertEqual(events[-1]["event"], "continue_next_item")
         self.assertFalse(any(key.startswith("governance_candidate") for key in events[-1]))
-        self.assertIn("io-trace:", payload["systemMessage"])
+        self.assertIn("io-trace-count: 1", payload["systemMessage"])
         self.assertIn("focus-layer: meso", payload["systemMessage"])
         self.assertNotIn("governance-signal:", payload["systemMessage"])
 
@@ -3184,7 +3240,7 @@ class AutopilotStateTest(unittest.TestCase):
         self.assertNotIn("decision: reopen_macro", payload["systemMessage"])
         self.assertNotIn("record the current goal", payload["systemMessage"])
         self.assertEqual(items[0]["status"], "running")
-        self.assertTrue(any(e["event"] == "semantic_delta_starvation" for e in events))
+        self.assertFalse(any(e["event"] == "semantic_delta_starvation" for e in events))
 
     def test_parallel_advance_claims_ready_item_once(self):
         with tempfile.TemporaryDirectory() as tmp:

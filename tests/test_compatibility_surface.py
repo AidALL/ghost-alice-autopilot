@@ -132,32 +132,38 @@ class CompatibilitySurfaceTest(unittest.TestCase):
         for rel in ("README.md", "README_ko.md", "addons/autopilot-mode/skill/SKILL.md"):
             text = (REPO_ROOT / rel).read_text()
             self.assertIn("compatibility-matrix.json", text)
-            self.assertIn("not-run", text)
+        for rel, phrase in {"README.md": "untested targets remain unverified",
+                            "README_ko.md": "검사하지 않은 대상은 미확인",
+                            "addons/autopilot-mode/skill/SKILL.md": "A not-run target remains unverified"}.items():
+            self.assertTrue(phrase in (REPO_ROOT / rel).read_text(), rel)
         self.assertTrue(any(t["status"] == "not-run" and t["full_compatibility_blocker"] for t in _compatibility_matrix()["targets"]))
 
     def test_docs_state_evidence_scope_for_compatibility(self) -> None:
-        expected = {"README.md": "source checks establish neither installation nor native host adoption", "README_ko.md": "source 검사만으로 설치나 native host 적용을 입증할 수 없습니다", "addons/autopilot-mode/skill/SKILL.md": "source tests establish neither installed adoption nor live host behavior"}
+        expected = {
+            "README.md": "Source modification, checks, installation, native adoption and applied criteria are distinct observations",
+            "README_ko.md": "소스 수정·검사·설치·네이티브 적용·기준 반영은 별개의 관찰",
+            "addons/autopilot-mode/skill/SKILL.md": "source tests establish neither installed adoption nor live host behavior",
+        }
         for rel, phrase in expected.items():
-            self.assertIn(phrase, (REPO_ROOT / rel).read_text())
+            self.assertTrue(phrase in (REPO_ROOT / rel).read_text(), rel)
 
 
     def test_install_docs_lead_with_official_addon_alias(self) -> None:
         for rel in ("README.md", "README_ko.md", "addons/autopilot-mode/skill/SKILL.md"):
             text = (REPO_ROOT / rel).read_text(encoding="utf-8")
             with self.subTest(rel=rel):
-                self.assertIn("bash install.sh --addon autopilot", text)
+                commands = re.findall(r"^bash install\.sh[^\n]*", text, re.MULTILINE)
+                self.assertTrue(commands and "--addon autopilot" in commands[0], rel)
                 self.assertNotIn("--addon-source https://github.com/AidALL/ghost-alice-autopilot.git", text)
 
     def test_install_docs_state_commands_run_from_core_checkout(self) -> None:
         expected = {
-            "README.md": "runs the Ghost-ALICE Core installer from the Ghost-ALICE Core checkout",
-            "README_ko.md": "Ghost-ALICE Core checkout에서 Ghost-ALICE Core 설치 프로그램을 실행합니다",
+            "README.md": "Run the Core installer from the Core checkout",
+            "README_ko.md": "Core 체크아웃에서 Core 설치기를 실행",
             "addons/autopilot-mode/skill/SKILL.md": "from the Ghost-ALICE Core checkout",
         }
         for rel, phrase in expected.items():
-            text = (REPO_ROOT / rel).read_text(encoding="utf-8")
-            with self.subTest(rel=rel):
-                self.assertIn(phrase, text)
+            self.assertTrue(phrase in (REPO_ROOT / rel).read_text(encoding="utf-8"), rel)
 
 
     def test_install_docs_keep_codex_as_first_class_target(self) -> None:
@@ -171,16 +177,17 @@ class CompatibilitySurfaceTest(unittest.TestCase):
 
 
     def test_user_docs_state_current_core_floor_and_hook_requirement(self) -> None:
+        floor = _addon_manifest()["min_core_version"]
         for rel in ("README.md", "README_ko.md"):
             text = (REPO_ROOT / rel).read_text(encoding="utf-8")
             with self.subTest(rel=rel):
-                self.assertIn("Ghost-ALICE Core 0.5.1", text)
-                self.assertIn("SQLite", text)
-                self.assertIn("Claude", text)
+                self.assertTrue("Ghost-ALICE Core " + floor in text, rel)
+                self.assertTrue("native hooks" in text if rel == "README.md" else "네이티브 훅" in text, rel)
+                self.assertIn("--platform claude", text)
                 self.assertIn("--platform codex", text)
-                self.assertIn("The Ghost-ALICE Core installer registers Ghost-ALICE Autopilot adapters" if rel == "README.md" else "Ghost-ALICE Core 설치 프로그램은 Ghost-ALICE Autopilot adapter를 등록", text)
+                self.assertTrue("The Core installer registers the adapters" in text if rel == "README.md" else "Core 설치기는 어댑터를 등록" in text, rel)
         skill = (REPO_ROOT / "addons/autopilot-mode/skill/SKILL.md").read_text(encoding="utf-8")
-        self.assertIn("Ghost-ALICE Core 0.5.1+", skill)
+        self.assertIn("Ghost-ALICE Core " + floor + "+", skill)
         self.assertIn("shared SQLite APIs", skill)
 
     def test_public_docs_do_not_describe_io_trace_as_bootstrap_condition(self) -> None:
@@ -196,8 +203,8 @@ class CompatibilitySurfaceTest(unittest.TestCase):
                     self.assertNotIn(phrase, text)
             with self.subTest(rel=rel, contract="current-selection"):
                 expected = {
-                    "README.md": ("task-router", "Core", "prepare-response", "record-response", "response_text"),
-                    "README_ko.md": ("task-router", "Core", "prepare-response", "record-response", "response_text"),
+                    "README.md": ("Core architecture", "authenticated review", "approved plan", "follow-up input"),
+                    "README_ko.md": ("Core 아키텍처", "인증된 검토", "승인된 계획", "후속 입력"),
                     "addons/autopilot-mode/skill/SKILL.md": ("Ghost-ALICE Core completion service's publication_route", "Ghost-ALICE Autopilot adapter code does not classify final prose"),
                 }
                 for phrase in expected[rel]:
@@ -221,8 +228,8 @@ class CompatibilitySurfaceTest(unittest.TestCase):
             text = (REPO_ROOT / rel).read_text()
             self.assertIn("./addons/autopilot-mode/skill/SKILL.md#consistency-decisions", text)
             self.assertIn("./addons/autopilot-mode/skill/references/continuation.md#register-the-approved-plan", text)
-            for token in ("prepare-response", "record-response", "response_text", "completion_recording", "register_continuation_plan", "advance_continuation"):
-                self.assertIn(token, text)
+            for token in ("prepare-response", "record-response", "response_text", "register_continuation_plan", "advance_continuation"):
+                self.assertNotIn(token, text)
 
     def test_approved_queue_describes_candidate_boundary(self) -> None:
         skill = (REPO_ROOT / "addons/autopilot-mode/skill/SKILL.md").read_text()
@@ -244,9 +251,11 @@ class CompatibilitySurfaceTest(unittest.TestCase):
             self.assertTrue((REPO_ROOT / "addons/autopilot-mode/skill/scripts" / name).is_file())
         for rel in ("README.md", "README_ko.md"):
             text = (REPO_ROOT / rel).read_text()
-            for directory in ("addons/autopilot-mode/skill/adapters/", "addons/autopilot-mode/skill/scripts/"):
-                self.assertIn(directory, text)
-                self.assertTrue((REPO_ROOT / directory).is_dir())
+            for target in re.findall(r"\]\((\./addons/[^)]+)\)", text):
+                path = target.split("#", 1)[0]
+                self.assertTrue((REPO_ROOT / path).is_file(), target)
+            self.assertIn("./addons/autopilot-mode/skill/SKILL.md#consistency-decisions", text)
+            self.assertIn("./addons/autopilot-mode/skill/references/continuation.md#register-the-approved-plan", text)
 
     def test_queue_bridge_uses_exact_receipt_and_storage_authority(self) -> None:
         skill = (REPO_ROOT / "addons/autopilot-mode/skill/SKILL.md").read_text()

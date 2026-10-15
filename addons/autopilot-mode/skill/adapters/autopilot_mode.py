@@ -60,10 +60,10 @@ def _first_absolute_path_text(*values: object) -> str:
 
 def _format_payload_for_hook(payload: dict, hook_input: dict) -> dict:
     message = payload.get("systemMessage")
-    recovery = payload.get("recovery", {})
-    recording_only = bool(recovery) and recovery.get("claims_changed") is not True
-    task_dispatched = payload.get("continuation", {}).get("status") == "dispatched"
-    if not message or not _stop_hook_input(hook_input) or ((recording_only or recovery.get('status') == 'parked') and not task_dispatched):
+    continuation = payload.get("continuation", {})
+    task_requested = (continuation.get("status") == "dispatched" or
+        (continuation.get("status") == "pending" and continuation.get("request_emitted") is True))
+    if not message or not _stop_hook_input(hook_input) or not task_requested:
         return payload
     formatted = dict(payload)
     formatted["decision"] = "block"

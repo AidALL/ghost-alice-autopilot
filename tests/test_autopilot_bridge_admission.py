@@ -46,7 +46,6 @@ def update_criteria(path, criteria, *, reroute=False):
     if reroute:
         register_route(core, path.parent.parent.parent, path.parent.parent.name, path.parent.name)
 
-from autopilot_intent_recovery import semantic_delta_starvation_event  # noqa: E402
 from test_autopilot_state import _decision_action, VALID_COMPLETION_EVIDENCE  # noqa: E402
 from response_route_fixture import native_ledger, register_route
 
@@ -212,7 +211,11 @@ class BridgeAdmissionBoundaryTest(unittest.TestCase):
                 input=json.dumps({"hook_event_name": "Stop", "session_id": "session-1", "cwd": str(root)}),
                 capture_output=True, text=True)
             self.assertEqual(stopped.returncode, 0, stopped.stderr)
-            self.assertEqual(json.loads(stopped.stdout)["decision"], "block")
+            payload = json.loads(stopped.stdout)
+            self.assertIs(payload['continue'], True)
+            self.assertNotIn('decision', payload)
+            tasks = aps_storage.read(Path(target['run_dir']) / 'tasks.jsonl')
+            self.assertIn('work-item: ' + tasks[0]['id'], payload['systemMessage'])
 
     def test_expected_input_event_rejects_stale_approval(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -270,9 +273,6 @@ class BridgeAdmissionBoundaryTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp); events = root / "events.jsonl"
             events.write_text("\n".join(json.dumps({"event": "user-input-observed", "session_id": "foreign"}) for _ in range(3)))
-            current = {"platform": "codex", "session_id": "session-1", "events_path": events,
-                       "intent_state": {"last_semantic_delta_status": "not-provided"}, "events": []}
-            self.assertIsNone(semantic_delta_starvation_event(current))
             run = {"approval_evidence": {"session_intent": {"session_id": "session-1", "platform": "codex"}},
                    "intent_source": {"events_path": str(events)}, "budget": {"intent_watermark": 0}}
             self.assertFalse(state_adapter._maybe_replenish_resume_budget(root / "run", run, "task"))

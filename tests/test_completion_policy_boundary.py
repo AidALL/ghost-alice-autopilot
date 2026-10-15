@@ -6,6 +6,33 @@ from test_completion_contract_v2 import _CompletionV2Fixture
 
 
 class CompletionPolicyBoundaryTest(_CompletionV2Fixture):
+    def test_native_stop_without_inline_body_still_requests_final_core_assessment(self):
+        import autopilot_completion_service as service
+        scope = service._v2_claim_scope(dict(hook_event_name='Stop',
+            session_id='current', transcript_path='/retained/native-transcript.jsonl'))
+        self.assertEqual(scope['phase'], 'final')
+
+    def test_transcript_only_stop_uses_the_same_review_for_publication_and_application(self):
+        import json
+        import autopilot_completion_service as service
+        from test_completion_contract_v2 import PreparedPretoolV2Test
+        self.prepare()
+        PreparedPretoolV2Test.reviewed_answer(self)
+        session = self.source['GHOST_ALICE_SESSION_ID']
+        transcript = self.root / 'native-stop.jsonl'
+        transcript.write_text('\n'.join(json.dumps(row) for row in [
+            dict(type='session_meta', payload=dict(id=session)),
+            dict(type='turn_context', payload=dict(turn_id='observed-turn')),
+            dict(type='response_item', payload=dict(type='message', role='assistant',
+                internal_chat_message_metadata_passthrough=dict(turn_id='observed-turn'),
+                content=[dict(type='output_text', text=self.completion)]))]))
+        result = service.apply_completion_v2(self.source, hook_input=dict(
+            hook_event_name='Stop', session_id=session, turn_id='observed-turn',
+            transcript_path=str(transcript)))
+        self.assertEqual(result['completion_recording']['units'][0]['status'], 'applied', result)
+        self.assertEqual({row['id']: row['status'] for row in self.read_state()['acceptance_criteria']},
+            {'report': 'met', 'protected': 'met'})
+
     def accepted(self):
         self.artifact = self.root / 'checked.txt'
         self.artifact.write_text('original')

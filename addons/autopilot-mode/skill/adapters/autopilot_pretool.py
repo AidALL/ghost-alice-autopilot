@@ -27,6 +27,7 @@ def capture_before_tool(source, hook_input, *, preflight=False):
         return {"status": "skipped"}
     if _helper()._v2_run_is_paused(current):
         return {"status": "skipped", "reason": "autopilot-off"}
+    material = None
     if not current.get("GHOST_ALICE_SESSION_INTENT_ROOT"):
         helper = _helper()
         candidates = helper.adapter._session_intent_root_candidates(current, helper.adapter._project_cwd_from_env(current))
@@ -34,15 +35,24 @@ def capture_before_tool(source, hook_input, *, preflight=False):
             if not (root / "ghost-state.sqlite3").is_file():
                 continue
             try:
-                helper.adapter.read_session_material(root, current["GHOST_ALICE_PLATFORM"],
+                material = helper.adapter.read_session_material(root, current["GHOST_ALICE_PLATFORM"],
                     current["GHOST_ALICE_SESSION_ID"], source=current,
-                    require_input=True, recover_audit=False)
+                    require_input=False, recover_audit=False)
             except FileNotFoundError:
                 continue
             current["GHOST_ALICE_SESSION_INTENT_ROOT"] = str(root.resolve())
             break
         else:
             return {"status": "skipped"}
+    if material is None:
+        material = _helper().adapter.read_session_material(
+            Path(current["GHOST_ALICE_SESSION_INTENT_ROOT"]), current["GHOST_ALICE_PLATFORM"],
+            current["GHOST_ALICE_SESSION_ID"], source=current,
+            require_input=False, recover_audit=False)
+    if material['intent_state'].get('intake_status') == 'pending-native-origin':
+        # Core supplies the pending receipt. It grants no capture authority and
+        # needs no duplicate failure notice from this adapter.
+        return {"status": "skipped", "reason": "pending-native-origin"}
     try:
         return capture_origin(current, preflight=preflight)
     except _helper().CompletionRecordingError as exc:
@@ -95,7 +105,10 @@ def main():
         # Core retry guidance and native tool permission retain their owners.
         captured = {"status": "recording-unavailable", "reason": "capture-failure", "detail": str(exc)}
         payload = {"continue": True}
-    repeated = _repeated_notice(captured, os.environ, hook_input)
+    # A successful preparation closes the previous failure notice. Record that
+    # transition so the same failure recurring later is shown again.
+    repeated = (captured.get("status") in {"recording-unavailable", "prepared"}
+                and _repeated_notice(captured, os.environ, hook_input))
     payload['completion_recording'] = captured  # The strict hook audit receives the full capture diagnostics.
     if captured.get("status") == "recording-unavailable" and not repeated:
         lines = ["[autopilot]", "completion-recording: unavailable", "recording-reason: " + captured.get("reason", "unknown"),

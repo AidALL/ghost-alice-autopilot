@@ -14,7 +14,6 @@ from typing import Any, Mapping
 
 
 MET_CRITERION_STATUSES = frozenset({"met", "done", "satisfied", "pass", "passed", "complete", "completed", "resolved", "closed"})
-SEMANTIC_DELTA_STARVATION_THRESHOLD = 3
 
 
 def _core_native_assessor(core):
@@ -24,6 +23,71 @@ def _core_native_assessor(core):
     if module is None:
         raise ImportError("Core native completion assessment unavailable")
     return module.assess_native_completion
+
+
+def _input_anchor(value):
+    """Core None and an empty ledger string both mean no admitted input."""
+    return None if value is None or (type(value) is str and value == '') else value
+
+
+def _continuation_feedback_shape_valid(route):
+    """Check the authenticated optional Core projection, without judging necessity."""
+    if 'continuation_feedback' not in route:
+        return True
+    feedback = route['continuation_feedback']
+    if (not isinstance(feedback, dict)
+            or set(feedback) != {'schema_version', 'control', 'required_unprocessed'}
+            or feedback['schema_version'] != 'continuation-feedback.v1'
+            or not isinstance(feedback['control'], str) or feedback['control'] not in {'active', 'human-stop'}
+            or not isinstance(feedback['required_unprocessed'], list)):
+        return False
+    selected = {(c['work_unit_id'], c['contract_revision'], c['criterion_id'])
+        for c in route['selected_criteria']}
+    seen = set()
+    for row in feedback['required_unprocessed']:
+        if (not isinstance(row, dict)
+                or set(row) != {'criterion_refs', 'reason', 'next_information', 'source_refs', 'prerequisite'}
+                or not isinstance(row['prerequisite'], str) or row['prerequisite'] not in {'ready', 'missing'}
+                or not all(isinstance(row[k], str) and row[k].strip() for k in ('reason', 'next_information'))
+                or not isinstance(row['criterion_refs'], list) or not row['criterion_refs']
+                or not isinstance(row['source_refs'], list)):
+            return False
+        for ref in row['criterion_refs']:
+            if (not isinstance(ref, dict)
+                    or set(ref) != {'work_unit_id', 'contract_revision', 'criterion_id'}
+                    or type(ref['contract_revision']) is not int or ref['contract_revision'] < 1
+                    or not all(isinstance(ref[k], str) and ref[k].strip() for k in ('work_unit_id', 'criterion_id'))):
+                return False
+            key = (ref['work_unit_id'], ref['contract_revision'], ref['criterion_id'])
+            if key not in selected or key in seen:
+                return False
+            seen.add(key)
+        source_selectors = set()
+        for ref in row['source_refs']:
+            if (not isinstance(ref, dict) or set(ref) != {'candidate_reference', 'source_id', 'source'}
+                    or not all(isinstance(ref[k], str) and ref[k].strip() for k in ('candidate_reference', 'source_id'))
+                    or (ref['candidate_reference'], ref['source_id']) in source_selectors or not isinstance(ref['source'], dict)):
+                return False
+            source_selectors.add((ref['candidate_reference'], ref['source_id']))
+            original = ref['source']
+            storage = original.get('storage')
+            fields = ({'storage', 'locator', 'digest', 'byte_length', 'appendable', 'source_id'}
+                if storage == 'source-reference.v1' else
+                {'storage', 'intent_root', 'owner', 'candidate_reference', 'source_id', 'locator', 'digest'}
+                if storage == 'core-source-reference.v1' else None)
+            if (fields is None or set(original) != fields or original.get('source_id') != ref['source_id']
+                    or not all(isinstance(original.get(k), str) and original[k].strip()
+                        for k in ('source_id', 'locator', 'digest'))):
+                return False
+            if storage == 'source-reference.v1':
+                if (not Path(original['locator']).is_absolute() or type(original['byte_length']) is not int
+                        or original['byte_length'] < 0 or type(original['appendable']) is not bool):
+                    return False
+            elif (original['owner'] != {'platform': route['platform'], 'session_id': route['session_id']}
+                    or not isinstance(original['intent_root'], str) or not Path(original['intent_root']).is_absolute()
+                    or not isinstance(original['candidate_reference'], str) or not original['candidate_reference'].strip()):
+                return False
+    return True
 
 
 def _selection_shape_valid(route, selected, platform, session, input_event_id):
@@ -47,7 +111,8 @@ def _selection_shape_valid(route, selected, platform, session, input_event_id):
         return False
     surface = route.get("routing_surface")
     if (not isinstance(surface, dict) or surface.get("response_mode") not in ("normal", "direct-response", "clarification-only")
-            or surface.get("verification_complexity") not in ("level-1", "level-2", "level-3")
+            or ("verification_complexity" in surface
+                and surface["verification_complexity"] not in ("level-1", "level-2", "level-3"))
             or surface.get("boundary_contract") not in ("required", "n/a")
             or (surface["boundary_contract"] == "required" and
                 (not isinstance(route.get("boundary_ref"), str) or not route["boundary_ref"].strip()))):
@@ -125,7 +190,7 @@ def current_execution_projection(material, source, run_dir, *, transaction=None,
         if (not isinstance(assessment, dict) or assessment.get("schema_version") != "native-completion.v1"
                 or assessment.get("platform") != platform or assessment.get("session_id") != session
                 or assessment.get("phase") != phase
-                or assessment.get("input_event_id") != state.get("latest_input_event_id")
+                or _input_anchor(assessment.get("input_event_id")) != _input_anchor(state.get("latest_input_event_id"))
                 or assessment.get("body_digest") != "sha256:" + hashlib.sha256(text.encode()).hexdigest()
                 or "body_issue" not in assessment
                 or not isinstance(assessment["body_issue"], (str, type(None)))
@@ -143,6 +208,14 @@ def current_execution_projection(material, source, run_dir, *, transaction=None,
         return {"status": "recording-unavailable", "reason": "core-route-incompatible"}
     result.update(completion_route=selected, response_route=route,
                   selected_criteria=copy.deepcopy(selected["selected_criteria"]))
+    if _input_anchor(assessment.get('input_event_id')) is None:
+        if assessment.get('context_status') != 'available':
+            return dict(result, status='recording-unavailable', reason='core-authority-unavailable',
+                detail=assessment.get('context_issue'))
+        # This is a read-only Core authority result, not actor inference or a
+        # failed recording attempt. No selected execution can be admitted yet.
+        return dict(result, status='recording-unavailable', reason='input-not-admitted',
+            intake_status=state.get('intake_status'))
     if selected.get("claim_report_issue"):
         return dict(result, status="recording-unavailable", reason="claim-evidence-invalid",
                     detail=selected["claim_report_issue"])
@@ -207,47 +280,3 @@ def admission_preflight(material, source, run_dir, *, queue=False):
 def _criterion_is_unmet(criterion: Mapping[str, Any]) -> bool:
     status = str(criterion.get("status") or "unmet").strip().lower()
     return status not in MET_CRITERION_STATUSES
-
-
-def semantic_delta_starvation_event(current_intent: Mapping[str, Any] | None) -> dict[str, Any] | None:
-    if not current_intent:
-        return None
-    intent_state = current_intent.get("intent_state")
-    if not isinstance(intent_state, Mapping):
-        return None
-    if str(intent_state.get("current_goal") or intent_state.get("user_intent_summary") or "").strip():
-        return None
-    if intent_state.get("last_semantic_delta_status") != "not-provided":
-        return None
-    events_path_value = current_intent.get("events_path")
-    if not events_path_value:
-        return None
-    events = current_intent.get("events")
-    if not isinstance(events, list):
-        return None
-    recent = events[-SEMANTIC_DELTA_STARVATION_THRESHOLD:]
-    if len(recent) < SEMANTIC_DELTA_STARVATION_THRESHOLD:
-        return None
-    if any(
-        event.get("event") != "user-input-observed"
-        or event.get("intent_delta_status", "not-provided") != "not-provided"
-        for event in recent
-    ):
-        return None
-    digest_only_count = sum(
-        1 for event in events
-        if event.get("event") == "user-input-observed"
-        and event.get("intent_delta_status", "not-provided") == "not-provided"
-    )
-    latest = recent[-1]
-    return {
-        "schema_version": "autopilot-event.v1",
-        "event": "semantic_delta_starvation",
-        "platform": current_intent.get("platform"),
-        "session_id": current_intent.get("session_id") or intent_state.get("session_id"),
-        "state_path": str(current_intent.get("state_path") or ""),
-        "events_path": str(events_path_value),
-        "digest_only_count": digest_only_count,
-        "latest_event_id": latest.get("event_id") or latest.get("input_digest") or "",
-        "reason": "current session has repeated digest-only user inputs and no semantic intent delta",
-    }

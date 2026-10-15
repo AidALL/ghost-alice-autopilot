@@ -198,6 +198,18 @@ class CurrentResponseRouteTest(unittest.TestCase):
                 self.assertEqual(result["reason"], "core-route-incompatible")
         self.assert_no_projection_writes(before)
 
+    def test_projection_accepts_omitted_verification_label_without_relaxing_supplied_values(self):
+        import autopilot_intent_recovery as recovery
+        assessment = recovery._core_native_assessor(self.core)(self.source)
+        route = copy.deepcopy(assessment["response_route"])
+        selected = assessment["completion_route"]
+        route["routing_surface"] = dict(response_mode="normal", boundary_contract="required")
+        self.assertTrue(recovery._selection_shape_valid(route, selected, "codex", "session-1", "event-1"))
+        for value in (None, [], "unbounded"):
+            with self.subTest(value=value):
+                route["routing_surface"]["verification_complexity"] = value
+                self.assertFalse(recovery._selection_shape_valid(route, selected, "codex", "session-1", "event-1"))
+
     def test_projection_does_not_mask_unexpected_programming_errors(self):
         import autopilot_intent_recovery as recovery
         with mock.patch.object(recovery, "_core_native_assessor", side_effect=RuntimeError("unexpected implementation failure")):

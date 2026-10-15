@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import closing
 import errno
 import json
 import os
@@ -37,7 +38,7 @@ class AutopilotSQLiteTest(unittest.TestCase):
             aps.advance_approved_run(run_dir, {"GHOST_ALICE_CORE_ROOT": os.environ["GHOST_ALICE_CORE_ROOT"]})
             database = run_dir / "ghost-state.sqlite3"
             self.assertTrue(database.is_file(), "validated run state must be in SQLite")
-            with sqlite3.connect(database) as conn:
+            with closing(sqlite3.connect(database)) as conn, conn:
                 self.assertEqual(conn.execute("SELECT count(*) FROM ap_runs").fetchone()[0], 1)
             (run_dir / "tasks.jsonl").write_text("not authoritative JSON\n")
             (run_dir / "approved-run.json").unlink()
@@ -150,7 +151,7 @@ class AutopilotSQLiteTest(unittest.TestCase):
             aps.advance_approved_run(run_dir, {"GHOST_ALICE_CORE_ROOT": os.environ["GHOST_ALICE_CORE_ROOT"]})
             aps.advance_approved_run(run_dir, {"GHOST_ALICE_CORE_ROOT": os.environ["GHOST_ALICE_CORE_ROOT"]})
             self.assertEqual({name: (run_dir / name).read_bytes() for name in originals}, originals)
-            with sqlite3.connect(run_dir / "ghost-state.sqlite3") as conn:
+            with closing(sqlite3.connect(run_dir / "ghost-state.sqlite3")) as conn, conn:
                 self.assertEqual(conn.execute("SELECT count(*) FROM ap_migrations").fetchone()[0], 1)
                 self.assertEqual(conn.execute("SELECT count(*) FROM ap_generations").fetchone()[0], 1)
 
@@ -218,7 +219,7 @@ with storage.transaction(root) as store:
             aps.advance_approved_run(run_dir, {"GHOST_ALICE_CORE_ROOT": os.environ["GHOST_ALICE_CORE_ROOT"]})
             events = aps.storage.read(run_dir / "events.jsonl")
             self.assertEqual(sum(row.get("event") == "consistency_decision_applied" for row in events), 1)
-            with sqlite3.connect(run_dir / "ghost-state.sqlite3") as conn:
+            with closing(sqlite3.connect(run_dir / "ghost-state.sqlite3")) as conn, conn:
                 self.assertEqual(conn.execute("SELECT count(*) FROM ap_receipts").fetchone()[0], 1)
             self.assertTrue(path.exists(), "producer-owned inbox is never removed")
             self.assertFalse(aps.storage.pending(path))
