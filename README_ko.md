@@ -66,7 +66,7 @@ flowchart TD
 
 완료 판단의 책임은 [Ghost-ALICE Core 구조](https://github.com/AidALL/ghost-alice/blob/main/architecture.md)에, Ghost-ALICE Autopilot 명령·기록 스키마·대상 선택은 [운영 스킬](./addons/autopilot-mode/skill/SKILL.md)에 정의되어 있습니다.
 
-현재 세션 assistant는 [대조 그림](https://github.com/AidALL/ghost-alice/wiki/design-philosophy-floor-not-ceiling_ko#대조와-피드백)과 [판단 범위 그림](https://github.com/AidALL/ghost-alice/wiki/operating-model-fallback-and-escalation_ko#판단-범위와-검증-부담)에 따라 남은 작업을 판단합니다. Assistant는 사용자에게 질문하지 않고도 작업의 필요성이나 전제를 재검토할 수 있습니다. 다음 행동에 사용자만 내릴 수 있는 결정이 필요하고 그 결정이 아직 없을 때 사용자에게 질문합니다. 목적과 필수 의존 관계에 영향이 없는 미해결 사항 때문에 복구 작업을 만들지는 않습니다. 근거가 없는 필수 조건은 미해결로 유지합니다. Ghost-ALICE Autopilot은 Ghost-ALICE Core 결과와 저장된 승인 계획을 사용하며 주장의 의미 검토를 반복하거나 새 권한을 만들지 않습니다. 위 실행 구조 그림은 Stop 전 계획 등록과 Stop에서의 결정적 선택을 구분합니다. Stop은 없는 계획을 만들도록 모델을 호출하지 않습니다. 판단 범위와 검증 부담은 서로 독립적입니다.
+현재 세션 assistant는 [대조 그림](https://github.com/AidALL/ghost-alice/wiki/설계-원칙#대조와-피드백)과 [판단 범위 그림](https://github.com/AidALL/ghost-alice/wiki/판단-범위와-복구#판단-범위와-검증-부담)에 따라 남은 작업을 판단합니다. Assistant는 사용자에게 질문하지 않고도 작업의 필요성이나 전제를 재검토할 수 있습니다. 다음 행동에 사용자만 내릴 수 있는 결정이 필요하고 그 결정이 아직 없을 때 사용자에게 질문합니다. 목적과 필수 의존 관계에 영향이 없는 미해결 사항 때문에 복구 작업을 만들지는 않습니다. 근거가 없는 필수 조건은 미해결로 유지합니다. Ghost-ALICE Autopilot은 Ghost-ALICE Core 결과와 저장된 승인 계획을 사용하며 주장의 의미 검토를 반복하거나 새 권한을 만들지 않습니다. 위 실행 구조 그림은 Stop 전 계획 등록과 Stop에서의 결정적 선택을 구분합니다. Stop은 없는 계획을 만들도록 모델을 호출하지 않습니다. 판단 범위와 검증 부담은 서로 독립적입니다.
 
 Core는 검토 기록을 저장하고 Ghost-ALICE Autopilot은 publication·계획·dispatch 기록을 별도로 저장합니다. Native host는 완료 guard와 Ghost-ALICE Autopilot Stop 훅을 각각 호출하며 두 경로는 공유된 Ghost-ALICE Core 평가를 사용합니다. 어느 코드 경로도 assistant의 업무를 직접 수행하지 않습니다. Hook receipt는 대화를 식별합니다. Host가 그 대화에 안내를 전달하면 해당 대화의 다음 응답을 생성하는 모델이 이를 받으며, 동일한 모델 프로세스의 재개를 보장하지는 않습니다.
 
